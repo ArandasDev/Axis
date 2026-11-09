@@ -12,3 +12,5 @@ thiserror = "2"
 toml = "0.8"
 proptest = "1"
 criterion = "0.5"
+hidapi = "2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Input_XboxController", "Win32_Devices_DeviceAndDriverInstallation"] }

@@ -1,0 +1,11 @@
+[package]
+name = "axis-devices"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axis-core = { path = "../axis-core" }
+hidapi.workspace = true
+thiserror.workspace = true
+windows-sys.workspace = true

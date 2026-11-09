@@ -1,0 +1,316 @@
+//! Decodificação dos reports de entrada do DualShock 4 (USB e Bluetooth).
+
+use crate::crc::crc32_bt_output;
+use crate::is_usable_mac;
+use crate::{DeviceStatus, OutputState, Report, Transport};
+use axis_core::{Button, Buttons, InputState, Vec2};
+
+/// Ler este feature report coloca o DS4 no modo completo `0x11` no Bluetooth.
+pub const FEATURE_ENABLE_FULL_BT: u8 = 0x05;
+
+/// Converte um eixo de 0..=255 para -1.0..=1.0 (centro em 127.5).
+pub(crate) fn axis_u8(v: u8, invert: bool) -> f32 {
+    let a = ((v as f32 - 127.5) / 127.5).clamp(-1.0, 1.0);
+    if invert { -a } else { a }
+}
+
+/// Converte um gatilho de 0..=255 para 0.0..=1.0.
+pub(crate) fn trigger_u8(v: u8) -> f32 {
+    v as f32 / 255.0
+}
+
+/// Decodifica o nibble do d-pad (0 = cima, sentido horário; 8+ = solto) em botões.
+pub(crate) fn dpad_buttons(nibble: u8, buttons: &mut Buttons) {
+    let (up, right, down, left) = match nibble {
+        0 => (true, false, false, false),
+        1 => (true, true, false, false),
+        2 => (false, true, false, false),
+        3 => (false, true, true, false),
+        4 => (false, false, true, false),
+        5 => (false, false, true, true),
+        6 => (false, false, false, true),
+        7 => (true, false, false, true),
+        _ => (false, false, false, false),
+    };
+    buttons.set(Button::DpadUp, up);
+    buttons.set(Button::DpadRight, right);
+    buttons.set(Button::DpadDown, down);
+    buttons.set(Button::DpadLeft, left);
+}
+
+/// Decodifica um report de entrada (`0x01` USB/BT reduzido, `0x11` BT completo).
+pub fn parse(buf: &[u8]) -> Option<Report> {
+    let (d, has_battery) = match *buf.first()? {
+        0x01 if buf.len() >= 10 => (&buf[1..], buf.len() >= 31),
+        0x11 if buf.len() >= 33 => (&buf[3..], true),
+        _ => return None,
+    };
+
+    let mut buttons = Buttons::default();
+    dpad_buttons(d[4] & 0x0F, &mut buttons);
+    for (mask, b) in [
+        (0x10, Button::West),
+        (0x20, Button::South),
+        (0x40, Button::East),
+        (0x80, Button::North),
+    ] {
+        buttons.set(b, d[4] & mask != 0);
+    }
+    for (mask, b) in [
+        (0x01, Button::L1),
+        (0x02, Button::R1),
+        (0x10, Button::Select),
+        (0x20, Button::Start),
+        (0x40, Button::L3),
+        (0x80, Button::R3),
+    ] {
+        buttons.set(b, d[5] & mask != 0);
+    }
+    buttons.set(Button::Guide, d[6] & 0x01 != 0);
+    buttons.set(Button::Touchpad, d[6] & 0x02 != 0);
+
+    let input = InputState {
+        left: Vec2 {
+            x: axis_u8(d[0], false),
+            y: axis_u8(d[1], true),
+        },
+        right: Vec2 {
+            x: axis_u8(d[2], false),
+            y: axis_u8(d[3], true),
+        },
+        l2: trigger_u8(d[7]),
+        r2: trigger_u8(d[8]),
+        buttons,
+    };
+
+    let status = if has_battery {
+        let level = d[29] & 0x0F;
+        let cable = d[29] & 0x10 != 0;
+        DeviceStatus {
+            battery_percent: Some((level * 10).min(100)),
+            charging: cable && level < 11,
+        }
+    } else {
+        DeviceStatus::default()
+    };
+
+    Some(Report { input, status })
+}
+
+/// MAC (ordem de exibição) a partir do feature report `0x12`; `None` se inválido ou MAC inutilizável.
+pub fn mac_from_feature_0x12(buf: &[u8]) -> Option<[u8; 6]> {
+    if buf.len() < 7 || buf[0] != 0x12 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, b) in buf[1..7].iter().rev().enumerate() {
+        mac[i] = *b;
+    }
+    is_usable_mac(&mac).then_some(mac)
+}
+
+/// Monta o report de saída (lightbar e vibração). O DS4 não tem LEDs de jogador: `player` é ignorado.
+pub fn output_report(transport: Transport, out: &OutputState) -> Vec<u8> {
+    match transport {
+        Transport::Usb => {
+            let mut buf = vec![0u8; 32];
+            buf[0] = 0x05;
+            buf[1] = 0xFF;
+            buf[4] = out.rumble_weak;
+            buf[5] = out.rumble_strong;
+            buf[6..9].copy_from_slice(&out.lightbar);
+            buf
+        }
+        Transport::Bluetooth => {
+            let mut buf = vec![0u8; 78];
+            buf[0] = 0x11;
+            buf[1] = 0x80;
+            buf[3] = 0xFF;
+            buf[6] = out.rumble_weak;
+            buf[7] = out.rumble_strong;
+            buf[8..11].copy_from_slice(&out.lightbar);
+            let crc = crc32_bt_output(0xA2, &buf[..74]);
+            buf[74..78].copy_from_slice(&crc.to_le_bytes());
+            buf
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DeviceStatus;
+    use crate::crc::crc32_bt_output;
+    use axis_core::Button;
+
+    /// Monta um report USB 0x01 de 64 bytes em repouso (sticks 128, d-pad solto).
+    fn usb_rest() -> [u8; 64] {
+        let mut b = [0u8; 64];
+        b[0] = 0x01;
+        b[1] = 128;
+        b[2] = 128;
+        b[3] = 128;
+        b[4] = 128;
+        b[5] = 0x08;
+        b
+    }
+
+    #[test]
+    fn rest_report_is_centered_and_released() {
+        let r = parse(&usb_rest()).unwrap();
+        assert!(r.input.left.x.abs() < 0.01 && r.input.left.y.abs() < 0.01);
+        assert_eq!(r.input.buttons.0, 0);
+        assert_eq!(r.input.l2, 0.0);
+    }
+
+    #[test]
+    fn stick_down_is_negative_y_and_right_is_positive_x() {
+        let mut b = usb_rest();
+        b[1] = 255;
+        b[2] = 255;
+        let r = parse(&b).unwrap();
+        assert_eq!(r.input.left.x, 1.0);
+        assert_eq!(r.input.left.y, -1.0);
+    }
+
+    #[test]
+    fn face_buttons_dpad_and_triggers_map_to_abstract_buttons() {
+        let mut b = usb_rest();
+        b[5] = 0x20 | 0x02; // ✕ + d-pad direita
+        b[6] = 0x01 | 0x20; // L1 + Options
+        b[7] = 0x01 | 0x02; // PS + touchpad
+        b[8] = 255;
+        b[9] = 51; // L2 cheio, R2 20%
+        let r = parse(&b).unwrap();
+        for btn in [
+            Button::South,
+            Button::DpadRight,
+            Button::L1,
+            Button::Start,
+            Button::Guide,
+            Button::Touchpad,
+        ] {
+            assert!(r.input.buttons.is_pressed(btn), "{btn:?}");
+        }
+        assert!(!r.input.buttons.is_pressed(Button::DpadUp));
+        assert_eq!(r.input.l2, 1.0);
+        assert!((r.input.r2 - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn diagonal_dpad_sets_two_directions_and_out_of_range_is_released() {
+        let mut b = usb_rest();
+        b[5] = 0x07; // NO
+        let r = parse(&b).unwrap();
+        assert!(
+            r.input.buttons.is_pressed(Button::DpadUp)
+                && r.input.buttons.is_pressed(Button::DpadLeft)
+        );
+        b[5] = 0x0B; // valor inválido de clone
+        assert_eq!(parse(&b).unwrap().input.buttons.0, 0);
+    }
+
+    #[test]
+    fn battery_and_charging_are_decoded_and_clamped() {
+        let mut b = usb_rest();
+        b[30] = 0x10 | 0x05; // cabo, nível 5
+        let s = parse(&b).unwrap().status;
+        assert_eq!(
+            s,
+            DeviceStatus {
+                battery_percent: Some(50),
+                charging: true
+            }
+        );
+        b[30] = 0x10 | 0x0F; // nível fora da faixa
+        assert_eq!(
+            parse(&b).unwrap().status,
+            DeviceStatus {
+                battery_percent: Some(100),
+                charging: false
+            }
+        );
+    }
+
+    #[test]
+    fn bluetooth_full_report_uses_offset_three() {
+        let mut b = [0u8; 78];
+        b[0] = 0x11;
+        b[3] = 255;
+        b[4] = 0;
+        b[5] = 128;
+        b[6] = 128;
+        b[7] = 0x08;
+        let r = parse(&b).unwrap();
+        assert_eq!(r.input.left.x, 1.0);
+        assert_eq!(r.input.left.y, 1.0);
+    }
+
+    #[test]
+    fn bluetooth_reduced_report_has_no_battery() {
+        let mut b = [0u8; 10];
+        b[0] = 0x01;
+        b[1] = 128;
+        b[2] = 128;
+        b[3] = 128;
+        b[4] = 128;
+        b[5] = 0x08;
+        assert_eq!(parse(&b).unwrap().status.battery_percent, None);
+    }
+
+    #[test]
+    fn short_or_unknown_reports_are_rejected() {
+        assert!(parse(&[]).is_none());
+        assert!(parse(&[0x01, 128, 128]).is_none());
+        assert!(parse(&[0x11; 20]).is_none());
+        let mut b = usb_rest();
+        b[0] = 0x12;
+        assert!(parse(&b).is_none());
+    }
+
+    #[test]
+    fn mac_from_usb_feature_is_reversed() {
+        let mut f = [0u8; 16];
+        f[0] = 0x12;
+        f[1..7].copy_from_slice(&[0xB6, 0x84, 0x00, 0x00, 0x42, 0x41]);
+        assert_eq!(
+            mac_from_feature_0x12(&f),
+            Some([0x41, 0x42, 0x00, 0x00, 0x84, 0xB6])
+        );
+        assert_eq!(mac_from_feature_0x12(&[0x12, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(mac_from_feature_0x12(&[0x12, 1, 2]), None);
+        assert_eq!(
+            mac_from_feature_0x12(&[0x12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            None
+        );
+    }
+
+    #[test]
+    fn usb_output_places_rumble_and_color() {
+        let out = OutputState {
+            lightbar: [95, 179, 122],
+            rumble_strong: 200,
+            rumble_weak: 50,
+            player: Some(2),
+        };
+        let r = output_report(Transport::Usb, &out);
+        assert_eq!(r.len(), 32);
+        assert_eq!(&r[..2], &[0x05, 0xFF]);
+        assert_eq!((r[4], r[5]), (50, 200));
+        assert_eq!(&r[6..9], &[95, 179, 122]);
+    }
+
+    #[test]
+    fn bluetooth_output_has_valid_crc() {
+        let out = OutputState {
+            lightbar: [155, 122, 216],
+            ..Default::default()
+        };
+        let r = output_report(Transport::Bluetooth, &out);
+        assert_eq!(r.len(), 78);
+        assert_eq!((r[0], r[1], r[3]), (0x11, 0x80, 0xFF));
+        assert_eq!(&r[8..11], &[155, 122, 216]);
+        let crc = u32::from_le_bytes(r[74..78].try_into().unwrap());
+        assert_eq!(crc, crc32_bt_output(0xA2, &r[..74]));
+    }
+}
