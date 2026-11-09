@@ -8,6 +8,7 @@ pub mod dualsense;
 mod hid;
 mod identity;
 mod types;
+pub mod xinput;
 
 pub use classify::{HidInfo, classify};
 pub use controller::Controller;
@@ -15,3 +16,4 @@ pub use crc::crc32;
 pub use hid::{HidCandidate, HidController, enumerate_hid};
 pub use identity::{fallback_id, format_mac, parse_serial_mac, resolve_identity};
 pub use types::{DeviceError, DeviceStatus, OutputState, Report, Transport};
+pub use xinput::{XInputController, available_slots};
