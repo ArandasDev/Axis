@@ -178,6 +178,10 @@ mod tests {
         assert!(parse(&[0x01; 10]).is_none());
         assert!(parse(&[0x31; 40]).is_none());
         assert!(parse(&[0x05; 64]).is_none());
+        assert!(parse(&[0x01; 63]).is_none());
+        assert!(parse(&[0x31; 77]).is_none());
+        assert!(parse(&[0x01; 64]).is_some());
+        assert!(parse(&[0x31; 78]).is_some());
     }
 
     #[test]
