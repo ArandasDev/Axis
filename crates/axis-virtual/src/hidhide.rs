@@ -3,6 +3,7 @@
 //! Lists are UTF-16 multi-strings (terminated by two NULs).
 
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
@@ -24,6 +25,9 @@ pub enum HideError {
 
 /// Hides physical devices from other applications.
 pub trait DeviceHider: Send + Sync {
+    /// Hides `instance_id`. On failure the implementation makes a best-effort
+    /// attempt to undo its blacklist change, but callers should record the ID
+    /// BEFORE calling and include it in `unhide_all` regardless of the result.
     fn hide(&self, instance_id: &str) -> Result<(), HideError>;
     fn unhide(&self, instance_id: &str) -> Result<(), HideError>;
     /// Unhides all given IDs; if the blacklist ends up empty, also removes
@@ -188,8 +192,13 @@ fn dos_device_path(path: &Path) -> String {
 }
 
 /// HidHide client. Holds no handle: the device is opened per operation.
+///
+/// Operations are serialized by an internal lock, so concurrent calls on one
+/// instance cannot interleave their read-modify-write cycles. Races with
+/// OTHER HidHide client processes cannot be prevented.
 pub struct HidHide {
     self_image: String,
+    lock: Mutex<()>,
 }
 
 impl HidHide {
@@ -198,8 +207,17 @@ impl HidHide {
         drop(open_device()?);
         Ok(HidHide {
             self_image: dos_device_path(self_exe),
+            lock: Mutex::new(()),
         })
     }
+
+    fn guard(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+fn contains(items: &[String], item: &str) -> bool {
+    items.iter().any(|i| i.eq_ignore_ascii_case(item))
 }
 
 /// Returns `items` without entries equal (case-insensitively) to any of `remove`.
@@ -211,23 +229,68 @@ fn without(items: &[String], remove: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Plans `hide`: returns the new (blacklist, whitelist), without duplicates.
+pub(crate) fn plan_hide(
+    bl: &[String],
+    wl: &[String],
+    id: &str,
+    me: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut bl = bl.to_vec();
+    let mut wl = wl.to_vec();
+    if !contains(&bl, id) {
+        bl.push(id.to_string());
+    }
+    if !contains(&wl, me) {
+        wl.push(me.to_string());
+    }
+    (bl, wl)
+}
+
+/// Plans `unhide_all`: returns the new (blacklist, whitelist, deactivate).
+/// Only the given IDs are removed; `me` leaves the whitelist and HidHide is
+/// deactivated only when the blacklist ends up empty.
+pub(crate) fn plan_unhide_all(
+    bl: &[String],
+    wl: &[String],
+    ids: &[String],
+    me: &str,
+) -> (Vec<String>, Vec<String>, bool) {
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let bl = without(bl, &ids);
+    if bl.is_empty() {
+        (bl, without(wl, &[me]), true)
+    } else {
+        (bl, wl.to_vec(), false)
+    }
+}
+
 impl DeviceHider for HidHide {
     fn hide(&self, instance_id: &str) -> Result<(), HideError> {
+        let _g = self.guard();
         let h = open_device()?;
-        let mut wl = get_list(&h, GET_WHITELIST)?;
-        if !wl.iter().any(|w| w.eq_ignore_ascii_case(&self.self_image)) {
-            wl.push(self.self_image.clone());
+        let old_bl = get_list(&h, GET_BLACKLIST)?;
+        let old_wl = get_list(&h, GET_WHITELIST)?;
+        let (bl, wl) = plan_hide(&old_bl, &old_wl, instance_id, &self.self_image);
+        if wl.len() != old_wl.len() {
             set_list(&h, SET_WHITELIST, &wl)?;
         }
-        let mut bl = get_list(&h, GET_BLACKLIST)?;
-        if !bl.iter().any(|b| b.eq_ignore_ascii_case(instance_id)) {
-            bl.push(instance_id.to_string());
-            set_list(&h, SET_BLACKLIST, &bl)?;
+        if bl.len() == old_bl.len() {
+            return set_active(&h, true);
         }
-        set_active(&h, true)
+        // From the blacklist write on, any failure must not leave the ID hidden.
+        let result = set_list(&h, SET_BLACKLIST, &bl).and_then(|()| set_active(&h, true));
+        if result.is_err() {
+            // Best effort: re-read and drop the ID again; the original error wins.
+            if let Ok(current) = get_list(&h, GET_BLACKLIST) {
+                let _ = set_list(&h, SET_BLACKLIST, &without(&current, &[instance_id]));
+            }
+        }
+        result
     }
 
     fn unhide(&self, instance_id: &str) -> Result<(), HideError> {
+        let _g = self.guard();
         let h = open_device()?;
         let bl = get_list(&h, GET_BLACKLIST)?;
         let kept = without(&bl, &[instance_id]);
@@ -238,19 +301,19 @@ impl DeviceHider for HidHide {
     }
 
     fn unhide_all(&self, instance_ids: &[String]) -> Result<(), HideError> {
+        let _g = self.guard();
         let h = open_device()?;
-        let bl = get_list(&h, GET_BLACKLIST)?;
-        let ids: Vec<&str> = instance_ids.iter().map(String::as_str).collect();
-        let kept = without(&bl, &ids);
-        if kept.len() != bl.len() {
-            set_list(&h, SET_BLACKLIST, &kept)?;
+        let old_bl = get_list(&h, GET_BLACKLIST)?;
+        let old_wl = get_list(&h, GET_WHITELIST)?;
+        let (bl, wl, deactivate) =
+            plan_unhide_all(&old_bl, &old_wl, instance_ids, &self.self_image);
+        if bl.len() != old_bl.len() {
+            set_list(&h, SET_BLACKLIST, &bl)?;
         }
-        if kept.is_empty() {
-            let wl = get_list(&h, GET_WHITELIST)?;
-            let wl_kept = without(&wl, &[self.self_image.as_str()]);
-            if wl_kept.len() != wl.len() {
-                set_list(&h, SET_WHITELIST, &wl_kept)?;
-            }
+        if wl.len() != old_wl.len() {
+            set_list(&h, SET_WHITELIST, &wl)?;
+        }
+        if deactivate {
             set_active(&h, false)?;
         }
         Ok(())
@@ -278,6 +341,51 @@ mod tests {
         assert_eq!(decode_multi_sz(&bytes), items);
         assert_eq!(decode_multi_sz(&encode_multi_sz(&[])), Vec::<String>::new());
         assert_eq!(decode_multi_sz(&[0x41]), Vec::<String>::new());
+    }
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn plan_hide_adds_without_duplicating_case_insensitively() {
+        let (bl, wl) = plan_hide(
+            &v(&["HID\\A"]),
+            &v(&["\\Device\\X\\me.exe"]),
+            "hid\\a",
+            "\\DEVICE\\x\\ME.EXE",
+        );
+        assert_eq!(bl, v(&["HID\\A"]));
+        assert_eq!(wl, v(&["\\Device\\X\\me.exe"]));
+        let (bl, wl) = plan_hide(&v(&["HID\\A"]), &v(&["other"]), "HID\\B", "me");
+        assert_eq!(bl, v(&["HID\\A", "HID\\B"]));
+        assert_eq!(wl, v(&["other", "me"]));
+    }
+
+    #[test]
+    fn plan_unhide_all_removes_only_owned_and_deactivates_when_empty() {
+        let (bl, wl, off) = plan_unhide_all(
+            &v(&["HID\\A", "HID\\B"]),
+            &v(&["other", "me"]),
+            &v(&["hid\\a", "HID\\B"]),
+            "ME",
+        );
+        assert!(bl.is_empty());
+        assert_eq!(wl, v(&["other"]));
+        assert!(off);
+    }
+
+    #[test]
+    fn plan_unhide_all_keeps_foreign_entries_and_stays_active() {
+        let (bl, wl, off) = plan_unhide_all(
+            &v(&["HID\\A", "FOREIGN"]),
+            &v(&["me"]),
+            &v(&["HID\\A"]),
+            "me",
+        );
+        assert_eq!(bl, v(&["FOREIGN"]));
+        assert_eq!(wl, v(&["me"]));
+        assert!(!off);
     }
 
     #[test]
