@@ -16,6 +16,8 @@ use crate::worker::{SharedPad, WorkerCommand, WorkerExit, WorkerStatus, spawn_wo
 
 const NO_VIGEM_NOTICE: &str = "ViGEmBus não encontrado: o Axis só mostra os controles, sem emular.";
 const COLOR_NAMES: [&str; 6] = ["verde", "roxo", "amarelo", "azul", "laranja", "rosa"];
+/// Intervalo mínimo entre duas reaberturas automáticas após erro do mesmo controle.
+const ERROR_REOPEN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum Event {
@@ -71,6 +73,8 @@ struct Session {
     pad: Option<SharedPad>,
     /// Geração da última desconexão (valida o `GraceExpired`).
     generation: u64,
+    /// Quando ocorreu a última reabertura automática após erro.
+    last_error_reopen: Option<std::time::Instant>,
     /// Instance IDs ocultados por esta sessão (estão em `hidden.toml`).
     instances: Vec<String>,
 }
@@ -237,8 +241,16 @@ impl Manager {
         };
         let reopen_path = match &exit {
             WorkerExit::Error(m) => {
-                log::warn!("erro no controle {}: {m}", self.sessions[index].id);
-                Some(self.sessions[index].path.clone())
+                let s = &self.sessions[index];
+                log::warn!("erro no controle {}: {m}", s.id);
+                if s.last_error_reopen
+                    .is_some_and(|t| t.elapsed() < ERROR_REOPEN_COOLDOWN)
+                {
+                    log::warn!("erros repetidos em {}; sem nova reabertura", s.id);
+                    None
+                } else {
+                    Some(s.path.clone())
+                }
             }
             _ => None,
         };
@@ -246,7 +258,7 @@ impl Manager {
         if let Some(path) = reopen_path {
             // Uma única tentativa de reabrir o mesmo path.
             if let Some(c) = self.opener.enumerate().into_iter().find(|c| c.path == path) {
-                self.arrive(&c);
+                self.arrive(&c, true);
             }
         }
     }
@@ -318,7 +330,7 @@ impl Manager {
             {
                 continue;
             }
-            self.arrive(&c);
+            self.arrive(&c, false);
         }
     }
 
@@ -371,7 +383,7 @@ impl Manager {
         Ok(())
     }
 
-    fn arrive(&mut self, c: &HidCandidate) {
+    fn arrive(&mut self, c: &HidCandidate, error_reopen: bool) {
         let controller: Box<dyn Controller> = match self.opener.open(c) {
             Ok(ctl) => ctl,
             Err(e) => {
@@ -501,8 +513,10 @@ impl Manager {
             let _ = tx.send(WorkerCommand::SetPaused(true));
         }
         if grace_index.is_some() {
-            self.notifier
-                .notify("Axis", &format!("{} reconectou", record.owner_name));
+            if !error_reopen {
+                self.notifier
+                    .notify("Axis", &format!("{} reconectou", record.owner_name));
+            }
         } else if let Some(n) = player {
             self.notifier.notify(
                 "Axis",
@@ -525,6 +539,11 @@ impl Manager {
             status,
             pad,
             generation: 0,
+            last_error_reopen: if error_reopen {
+                Some(std::time::Instant::now())
+            } else {
+                grace_index.and_then(|i| self.sessions[i].last_error_reopen)
+            },
             instances,
         };
         match grace_index {
@@ -1051,8 +1070,8 @@ mod tests {
                 format!("hide:{INST1}")
             ]
         );
-        let h = hidden_text(&r);
-        assert!(!h.contains("HID\\\\X") && h.contains(INST1), "{h}");
+        let state: HiddenState = toml::from_str(&hidden_text(&r)).unwrap();
+        assert_eq!(state.ids, vec![INST1.to_string()]);
     }
 
     #[test]
@@ -1133,6 +1152,18 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert!(s[0].connected);
         assert_eq!(plugs(&r), 1);
+    }
+
+    #[test]
+    fn repeated_errors_do_not_loop() {
+        let mut r = one_controller("loop");
+        make_worker_fail(&mut r, P1, DeviceError::Hid("x".to_string()));
+        make_worker_fail(&mut r, P1, DeviceError::Hid("y".to_string()));
+        assert_eq!(r.opener.state.lock().unwrap().opened.len(), 2);
+        let s = r.mgr.sessions();
+        assert_eq!(s.len(), 1);
+        assert!(!s[0].connected);
+        assert!(!messages(&r).iter().any(|m| m.contains("reconectou")));
     }
 
     #[test]
