@@ -2,6 +2,7 @@
 
 mod classify;
 mod crc;
+pub mod ds4;
 mod identity;
 mod types;
 
