@@ -214,10 +214,17 @@ impl VirtualBus for FakeBus {
 pub(crate) struct FakeHider {
     pub log: Log,
     pub fail: bool,
+    /// Arquivo `hidden.toml` consultado no momento de cada `hide`.
+    pub hidden_path: std::path::PathBuf,
+    /// Para cada `hide`: o id já constava em `hidden.toml` naquele instante?
+    pub recorded: Arc<Mutex<Vec<bool>>>,
 }
 
 impl DeviceHider for FakeHider {
     fn hide(&self, instance_id: &str) -> Result<(), HideError> {
+        let present =
+            std::fs::read_to_string(&self.hidden_path).is_ok_and(|t| t.contains(instance_id));
+        self.recorded.lock().unwrap().push(present);
         self.log.lock().unwrap().push(format!("hide:{instance_id}"));
         if self.fail {
             Err(HideError::Win32(5))

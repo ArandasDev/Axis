@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigStore, OWNER_PALETTE};
 use crate::ports::{ControllerOpener, Notifier, Scheduler};
-use crate::store::write_atomic;
+use crate::store::{Loaded, load_toml, write_atomic};
 use crate::worker::{SharedPad, WorkerCommand, WorkerExit, WorkerStatus, spawn_worker};
 
 const NO_VIGEM_NOTICE: &str = "ViGEmBus não encontrado: o Axis só mostra os controles, sem emular.";
@@ -72,7 +72,7 @@ struct Session {
 }
 
 #[derive(Serialize, Deserialize)]
-struct HiddenFile {
+struct HiddenState {
     schema_version: u32,
     ids: Vec<String>,
 }
@@ -88,17 +88,18 @@ pub struct Manager {
     events: Sender<Event>,
     sessions: Vec<Session>,
     hidden: Vec<String>,
+    /// Falso quando o estado de ocultação não pôde ser lido: nada é gravado nem ocultado.
+    hiding_enabled: bool,
     next_session: u64,
     warned_no_vigem: bool,
 }
 
 impl Manager {
     pub fn new(deps: ManagerDeps) -> Manager {
-        let hidden = std::fs::read_to_string(deps.store.paths().hidden_file())
-            .ok()
-            .and_then(|t| toml::from_str::<HiddenFile>(&t).ok())
-            .map(|h| h.ids)
-            .unwrap_or_default();
+        let (hidden, hiding_enabled, notices) = load_hidden(&deps.store);
+        for n in &notices {
+            deps.notifier.notify("Axis", n);
+        }
         Manager {
             opener: deps.opener,
             bus: deps.bus,
@@ -109,6 +110,7 @@ impl Manager {
             events: deps.events,
             sessions: Vec::new(),
             hidden,
+            hiding_enabled,
             next_session: 0,
             warned_no_vigem: false,
         }
@@ -183,21 +185,20 @@ impl Manager {
     }
 
     /// Grava a lista de ocultos ANTES de ocultar (write-ahead).
-    fn remember_hidden(&mut self, instance: &str) {
-        if !self.hidden.iter().any(|i| i == instance) {
-            self.hidden.push(instance.to_string());
+    fn remember_hidden(&mut self, instance: &str) -> Result<(), String> {
+        let mut ids = self.hidden.clone();
+        if !ids.iter().any(|i| i == instance) {
+            ids.push(instance.to_string());
         }
-        let file = HiddenFile {
+        let file = HiddenState {
             schema_version: 1,
-            ids: self.hidden.clone(),
+            ids,
         };
         let path = self.store.paths().hidden_file();
-        let result = toml::to_string_pretty(&file)
-            .map_err(|e| e.to_string())
-            .and_then(|t| write_atomic(&path, t.as_bytes()).map_err(|e| e.to_string()));
-        if let Err(e) = result {
-            log::warn!("não foi possível gravar a lista de ocultos: {e}");
-        }
+        let text = toml::to_string_pretty(&file).map_err(|e| e.to_string())?;
+        write_atomic(&path, text.as_bytes()).map_err(|e| e.to_string())?;
+        self.hidden = file.ids;
+        Ok(())
     }
 
     fn arrive(&mut self, c: &HidCandidate) {
@@ -257,12 +258,26 @@ impl Manager {
             }
         }
         if pad.is_some()
+            && self.hiding_enabled
             && let Some(hider) = self.hider.clone()
         {
             let instance = instance_id_from_path(&c.path);
-            self.remember_hidden(&instance);
-            if let Err(e) = hider.hide(&instance) {
-                log::warn!("não foi possível ocultar {instance}: {e}");
+            match self.remember_hidden(&instance) {
+                Ok(()) => {
+                    if let Err(e) = hider.hide(&instance) {
+                        log::warn!("não foi possível ocultar {instance}: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("não foi possível gravar a lista de ocultos: {e}");
+                    self.notifier.notify(
+                        "Axis",
+                        &format!(
+                            "Não foi possível registrar a ocultação de {}; o controle físico continua visível.",
+                            record.owner_name
+                        ),
+                    );
+                }
             }
         }
         let player = pad.as_ref().map(|p| {
@@ -312,6 +327,46 @@ impl Manager {
             status,
             pad,
         });
+    }
+}
+
+/// Carrega `hidden.toml`: (ids, ocultação habilitada, avisos).
+fn load_hidden(store: &ConfigStore) -> (Vec<String>, bool, Vec<String>) {
+    let path = store.paths().hidden_file();
+    let check = |h: &HiddenState| {
+        if h.schema_version == 0 {
+            Err("schema_version: não pode ser 0".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    match load_toml::<HiddenState>(&path, check) {
+        Loaded::Fresh(h) => (h.ids, true, vec![]),
+        Loaded::FromBackup(h) => (
+            h.ids,
+            true,
+            vec![format!(
+                "Estado de ocultação restaurado do backup: {}",
+                path.display()
+            )],
+        ),
+        Loaded::Missing => (vec![], true, vec![]),
+        Loaded::Corrupt { preserved_as } => (
+            vec![],
+            true,
+            vec![format!(
+                "Arquivo corrompido preservado em {}",
+                preserved_as.display()
+            )],
+        ),
+        Loaded::TooNew { .. } | Loaded::Unreadable { .. } => (
+            vec![],
+            false,
+            vec![
+                "Estado de ocultação ilegível; o Axis não vai ocultar controles nesta execução."
+                    .to_string(),
+            ],
+        ),
     }
 }
 
@@ -366,19 +421,33 @@ mod tests {
         log: Log,
         bus: Option<Arc<FakeBus>>,
         notifier: FakeNotifier,
+        recorded: Arc<Mutex<Vec<bool>>>,
         _rx: Receiver<Event>,
         mgr: Manager,
     }
 
     fn rig(name: &str, with_bus: bool, hide_fails: bool) -> Rig {
+        rig_with(name, with_bus, hide_fails, |_| {})
+    }
+
+    fn rig_with(
+        name: &str,
+        with_bus: bool,
+        hide_fails: bool,
+        setup: impl FnOnce(&AppPaths),
+    ) -> Rig {
         let dir = TempDir::new(name);
         let paths = AppPaths::under(&dir.0);
+        setup(&paths);
+        let recorded = Arc::new(Mutex::new(Vec::new()));
         let opener = FakeOpener::default();
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let bus = with_bus.then(|| Arc::new(FakeBus::new(log.clone())));
         let hider: Arc<dyn DeviceHider> = Arc::new(FakeHider {
             log: log.clone(),
             fail: hide_fails,
+            hidden_path: paths.hidden_file(),
+            recorded: recorded.clone(),
         });
         let notifier = FakeNotifier::default();
         let (tx, rx) = channel();
@@ -398,6 +467,7 @@ mod tests {
             log,
             bus,
             notifier,
+            recorded,
             _rx: rx,
             mgr,
         }
@@ -432,6 +502,7 @@ mod tests {
             *r.log.lock().unwrap(),
             vec!["plug".to_string(), format!("hide:{INST1}")]
         );
+        assert_eq!(*r.recorded.lock().unwrap(), vec![true]);
         let writes = r.opener.writes_of(P1);
         wait_until(|| !writes.lock().unwrap().is_empty());
         let w = writes.lock().unwrap()[0];
@@ -548,6 +619,65 @@ mod tests {
         assert_eq!(r.mgr.sessions().len(), 1);
         assert!(!r.mgr.sessions()[0].view_only);
         let _ = &r.dir;
+    }
+
+    #[test]
+    fn failed_write_ahead_means_no_hide_and_a_notice() {
+        let mut r = rig("wafail", true, false);
+        // Um diretório no lugar do arquivo faz o rename atômico falhar.
+        std::fs::create_dir_all(r.paths.hidden_file()).unwrap();
+        r.opener.add(P1, "aa:01");
+        r.mgr.handle(Event::DeviceArrived(P1.to_string()));
+        assert_eq!(*r.log.lock().unwrap(), vec!["plug".to_string()]);
+        let s = r.mgr.sessions();
+        assert_eq!(s.len(), 1);
+        assert!(!s[0].view_only && s[0].player == Some(1));
+        assert!(
+            messages(&r).contains(
+                &"Não foi possível registrar a ocultação de Controle 1; o controle físico continua visível."
+                    .to_string()
+            ),
+            "{:?}",
+            messages(&r)
+        );
+    }
+
+    #[test]
+    fn corrupt_hidden_state_recovers_ids_from_backup() {
+        let mut r = rig_with("hbak", true, false, |p| {
+            std::fs::create_dir_all(&p.state).unwrap();
+            std::fs::write(
+                p.hidden_file().with_extension("toml.bak"),
+                "schema_version = 1\nids = [\"OLD\\\\ID\"]\n",
+            )
+            .unwrap();
+            std::fs::write(p.hidden_file(), "isto não é toml {{{").unwrap();
+        });
+        r.opener.add(P1, "aa:01");
+        r.mgr.handle(Event::DeviceArrived(P1.to_string()));
+        let text = std::fs::read_to_string(r.paths.hidden_file()).unwrap();
+        assert!(text.contains("OLD") && text.contains(INST1), "{text}");
+        assert!(messages(&r).iter().any(|m| m.contains("backup")));
+    }
+
+    #[test]
+    fn unreadable_hidden_state_disables_hiding_for_the_run() {
+        let mut r = rig_with("hunread", true, false, |p| {
+            std::fs::create_dir_all(p.hidden_file()).unwrap();
+        });
+        r.opener.add(P1, "aa:01");
+        r.mgr.handle(Event::DeviceArrived(P1.to_string()));
+        assert_eq!(*r.log.lock().unwrap(), vec!["plug".to_string()]);
+        assert!(r.paths.hidden_file().is_dir());
+        assert_eq!(r.mgr.sessions().len(), 1);
+        assert!(
+            messages(&r).contains(
+                &"Estado de ocultação ilegível; o Axis não vai ocultar controles nesta execução."
+                    .to_string()
+            ),
+            "{:?}",
+            messages(&r)
+        );
     }
 
     #[test]
