@@ -1,14 +1,17 @@
 //! Ícone na bandeja do Windows: menu de contexto e notificações em balão.
 //!
-//! Uma thread própria é dona de uma janela só de mensagens (`HWND_MESSAGE`) e do
-//! ícone (`Shell_NotifyIconW`). Tudo chega por mensagem de janela: o clique do
-//! ícone, as notificações (`WM_APP + 2`) e o fechamento (`WM_CLOSE`).
+//! Uma thread própria é dona de uma janela de nível superior oculta (nunca exibida)
+//! e do ícone (`Shell_NotifyIconW`). Não é uma janela só de mensagens porque esta
+//! precisa receber difusões (`TaskbarCreated`, fim de sessão) e conseguir o
+//! primeiro plano para o menu fechar direito. Tudo chega por mensagem de janela:
+//! o clique do ícone, as notificações (`WM_APP + 2`) e o fechamento (`WM_CLOSE`).
 
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -18,11 +21,12 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, HWND_MESSAGE,
-    IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW, TPM_NONOTIFY,
+    DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, IDI_APPLICATION,
+    LoadIconW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, TPM_NONOTIFY,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_DESTROY, WM_NCCREATE, WM_NULL, WM_RBUTTONUP, WNDCLASSEXW,
+    WM_DESTROY, WM_ENDSESSION, WM_NCCREATE, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSEXW,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 use crate::manager::SessionView;
@@ -33,6 +37,37 @@ const WM_TRAY: u32 = WM_APP + 1;
 /// Notificação pendente: `lParam` é um `Box<(String, String)>` (título, corpo).
 const WM_NOTIFY_BALLOON: u32 = WM_APP + 2;
 const ICON_ID: u32 = 1;
+/// Novas tentativas de `NIM_ADD` na criação (o Explorer pode ainda não estar pronto no logon).
+const ICON_ADD_RETRIES: u32 = 5;
+const ICON_ADD_INTERVAL: Duration = Duration::from_millis(500);
+/// Quanto o fim de sessão espera o gerente terminar o `Quit`.
+const ENDSESSION_WAIT: Duration = Duration::from_secs(5);
+
+/// Sinal "o gerente terminou o `Quit`": `main` marca depois que `handle(Quit)`
+/// retorna; a bandeja espera por ele no fim da sessão do Windows.
+pub type QuitDone = Arc<(Mutex<bool>, Condvar)>;
+
+/// Marca o `Quit` como concluído e acorda quem espera.
+pub fn signal_quit_done(done: &QuitDone) {
+    let (lock, cvar) = &**done;
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    cvar.notify_all();
+}
+
+/// Espera o sinal por até `timeout`; devolve se ele chegou.
+pub(crate) fn wait_quit_done(done: &QuitDone, timeout: Duration) -> bool {
+    let (lock, cvar) = &**done;
+    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let (guard, _) = cvar
+        .wait_timeout_while(guard, timeout, |done| !*done)
+        .unwrap_or_else(|e| e.into_inner());
+    *guard
+}
+
+/// `WM_ENDSESSION`: `wParam != 0` significa que a sessão vai mesmo terminar.
+pub(crate) fn endsession_should_quit(wparam: usize) -> bool {
+    wparam != 0
+}
 
 pub(crate) const ID_PAUSE: u32 = 1;
 pub(crate) const ID_RESTORE: u32 = 2;
@@ -179,6 +214,9 @@ struct TrayState {
     sessions: Arc<Mutex<Vec<SessionView>>>,
     autostart: Arc<AtomicBool>,
     paused: Cell<bool>,
+    quit_done: QuitDone,
+    /// Mensagem `TaskbarCreated` (0 se não pôde ser registrada).
+    taskbar_created: u32,
 }
 
 pub struct Tray;
@@ -191,6 +229,7 @@ impl Tray {
         on_command: impl Fn(TrayCommand) + Send + 'static,
         sessions: Arc<Mutex<Vec<SessionView>>>,
         autostart: Arc<AtomicBool>,
+        quit_done: QuitDone,
     ) -> (TrayHandle, JoinHandle<()>) {
         let (ready_tx, ready_rx) = mpsc::channel::<isize>();
         let join = std::thread::Builder::new()
@@ -201,6 +240,11 @@ impl Tray {
                     sessions,
                     autostart,
                     paused: Cell::new(false),
+                    quit_done,
+                    // SAFETY: string terminada em zero, viva durante a chamada.
+                    taskbar_created: unsafe {
+                        RegisterWindowMessageW(wide("TaskbarCreated").as_ptr())
+                    },
                 });
                 run(state, ready_tx);
             })
@@ -224,16 +268,17 @@ fn run(state: Box<TrayState>, ready: mpsc::Sender<isize>) {
         };
         RegisterClassExW(&wc);
         let ptr = Box::into_raw(state);
+        // Nível superior (sem pai) e nunca exibida: não há ShowWindow.
         let hwnd = CreateWindowExW(
-            0,
+            WS_EX_TOOLWINDOW,
             class.as_ptr(),
             class.as_ptr(),
+            WS_OVERLAPPED,
             0,
             0,
             0,
             0,
-            0,
-            HWND_MESSAGE,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             instance,
             ptr.cast(),
@@ -251,18 +296,19 @@ fn run(state: Box<TrayState>, ready: mpsc::Sender<isize>) {
         (hwnd, ptr)
     };
 
-    // SAFETY: `hwnd` é a janela recém-criada por esta thread.
-    unsafe {
-        let mut nid = icon_data(hwnd);
-        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-        nid.uCallbackMessage = WM_TRAY;
-        nid.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
-        fill_wide(&mut nid.szTip, "Axis");
-        if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
-            log::warn!("não foi possível adicionar o ícone à bandeja");
-        }
-    }
     let _ = ready.send(hwnd as isize);
+    let mut added = add_icon(hwnd);
+    for attempt in 1..=ICON_ADD_RETRIES {
+        if added {
+            break;
+        }
+        log::warn!("não foi possível adicionar o ícone à bandeja (tentativa {attempt})");
+        std::thread::sleep(ICON_ADD_INTERVAL);
+        added = add_icon(hwnd);
+    }
+    if !added {
+        log::error!("ícone da bandeja não adicionado; aguardando o Explorer (TaskbarCreated)");
+    }
 
     // SAFETY: laço de mensagens padrão; `msg` é um buffer local.
     unsafe {
@@ -275,6 +321,19 @@ fn run(state: Box<TrayState>, ready: mpsc::Sender<isize>) {
         drop(Box::from_raw(ptr));
     }
     log::info!("bandeja encerrada");
+}
+
+/// `NIM_ADD` do ícone desta janela; devolve se deu certo.
+fn add_icon(hwnd: HWND) -> bool {
+    let mut nid = icon_data(hwnd);
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAY;
+    fill_wide(&mut nid.szTip, "Axis");
+    // SAFETY: ícone padrão do sistema; `nid` é uma estrutura local válida.
+    unsafe {
+        nid.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+        Shell_NotifyIconW(NIM_ADD, &nid) != 0
+    }
 }
 
 fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -310,13 +369,14 @@ unsafe extern "system" fn wnd_proc(
     match msg {
         WM_TRAY => {
             let event = (lparam as u32) & 0xFFFF;
-            if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
+            if event == WM_RBUTTONUP {
                 show_menu(hwnd, state);
             }
             0
         }
+        // Intencional: os ids do menu também são aceitos via `WM_COMMAND` (LOWORD
+        // de wParam), para controle por script (ex.: fumaça sem clique).
         WM_COMMAND => {
-            // Mesmo efeito do item do menu (LOWORD de wParam = id do item).
             run_command(state, (wparam & 0xFFFF) as u32);
             0
         }
@@ -325,6 +385,27 @@ unsafe extern "system" fn wnd_proc(
             // cada mensagem postada é tratada uma única vez.
             let boxed = unsafe { Box::from_raw(lparam as *mut (String, String)) };
             show_balloon(hwnd, &boxed.0, &boxed.1);
+            0
+        }
+        m if m != 0 && m == state.taskbar_created => {
+            // O Explorer reiniciou: o ícone sumiu e precisa ser adicionado de novo.
+            if !add_icon(hwnd) {
+                log::warn!("não foi possível recriar o ícone da bandeja");
+            }
+            0
+        }
+        WM_QUERYENDSESSION => 1,
+        WM_ENDSESSION => {
+            if endsession_should_quit(wparam) {
+                log::info!("fim da sessão do Windows: encerrando");
+                let quit = AssertUnwindSafe(|| (state.on_command)(TrayCommand::Quit));
+                if catch_unwind(quit).is_err() {
+                    log::error!("pânico ao pedir o encerramento no fim da sessão");
+                }
+                if !wait_quit_done(&state.quit_done, ENDSESSION_WAIT) {
+                    log::warn!("o encerramento não terminou a tempo do fim da sessão");
+                }
+            }
             0
         }
         WM_DESTROY => {
@@ -496,6 +577,22 @@ mod tests {
         );
         assert_eq!(command_for(ID_QUIT, false), Some(TrayCommand::Quit));
         assert_eq!(command_for(0, false), None);
+    }
+
+    #[test]
+    fn endsession_quits_only_when_the_session_really_ends() {
+        assert!(endsession_should_quit(1));
+        assert!(!endsession_should_quit(0));
+    }
+
+    #[test]
+    fn quit_done_wait_returns_after_signal_and_times_out_without_it() {
+        let done = QuitDone::default();
+        assert!(!wait_quit_done(&done, Duration::from_millis(20)));
+        let other = done.clone();
+        let t = std::thread::spawn(move || signal_quit_done(&other));
+        assert!(wait_quit_done(&done, Duration::from_secs(5)));
+        t.join().unwrap();
     }
 
     #[test]

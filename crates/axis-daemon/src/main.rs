@@ -15,7 +15,7 @@ use axis_daemon::logging::init_logging;
 use axis_daemon::manager::{Event, Manager, ManagerDeps, SessionView};
 use axis_daemon::paths::AppPaths;
 use axis_daemon::ports::{ControllerOpener, HidOpener, Notifier, ThreadScheduler};
-use axis_daemon::tray::{Tray, TrayHandle};
+use axis_daemon::tray::{QuitDone, Tray, TrayHandle, signal_quit_done};
 use axis_devices::{Controller, DeviceError, HidCandidate, HotplugEvent, HotplugWatcher};
 use axis_virtual::{DeviceHider, HidHide, ViGEmBus, VirtualBus};
 
@@ -71,7 +71,9 @@ fn main() {
     let sessions = Arc::new(Mutex::new(Vec::new()));
     let autostart = Arc::new(AtomicBool::new(settings.autostart));
     let on_command = command_handler(tx.clone(), settings_store.clone(), exe, autostart.clone());
-    let (tray, tray_thread) = Tray::spawn(on_command, sessions.clone(), autostart);
+    let quit_done = QuitDone::default();
+    let (tray, tray_thread) =
+        Tray::spawn(on_command, sessions.clone(), autostart, quit_done.clone());
     notifier.attach(tray.clone());
 
     let hotplug_tx = tx.clone();
@@ -100,6 +102,8 @@ fn main() {
         publish(&manager, &sessions, &settings_store, &tray);
     }
 
+    // Libera um fim de sessão do Windows que espera o encerramento do gerente.
+    signal_quit_done(&quit_done);
     tray.close();
     let _ = tray_thread.join();
     log::info!("encerrado");
