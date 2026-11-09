@@ -14,7 +14,7 @@ pub struct TriggerParams {
 pub fn trigger(raw: f32, p: &TriggerParams) -> f32 {
     let raw = raw.clamp(0.0, 1.0);
     let t = ((raw - p.rest) / (p.max - p.rest)).clamp(0.0, 1.0);
-    let t = shape(t, p.inner, 1.0, 0.0);
+    let t = shape(t, p.inner, 1.0);
     let t = curve_scalar(t, &p.curve);
     match p.hair {
         Some(h) => {
