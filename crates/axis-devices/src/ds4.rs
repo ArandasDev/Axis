@@ -1,6 +1,7 @@
 //! Decodificação dos reports de entrada do DualShock 4 (USB e Bluetooth).
 
-use crate::{DeviceStatus, Report};
+use crate::crc::crc32_bt_output;
+use crate::{DeviceStatus, OutputState, Report, Transport};
 use axis_core::{Button, Buttons, InputState, Vec2};
 
 /// Ler este feature report coloca o DS4 no modo completo `0x11` no Bluetooth.
@@ -102,10 +103,38 @@ pub fn mac_from_feature_0x12(buf: &[u8]) -> Option<[u8; 6]> {
     if mac == [0; 6] { None } else { Some(mac) }
 }
 
+/// Monta o report de saída (lightbar e vibração). O DS4 não tem LEDs de jogador: `player` é ignorado.
+pub fn output_report(transport: Transport, out: &OutputState) -> Vec<u8> {
+    match transport {
+        Transport::Usb => {
+            let mut buf = vec![0u8; 32];
+            buf[0] = 0x05;
+            buf[1] = 0xFF;
+            buf[4] = out.rumble_weak;
+            buf[5] = out.rumble_strong;
+            buf[6..9].copy_from_slice(&out.lightbar);
+            buf
+        }
+        Transport::Bluetooth => {
+            let mut buf = vec![0u8; 78];
+            buf[0] = 0x11;
+            buf[1] = 0x80;
+            buf[3] = 0xFF;
+            buf[6] = out.rumble_weak;
+            buf[7] = out.rumble_strong;
+            buf[8..11].copy_from_slice(&out.lightbar);
+            let crc = crc32_bt_output(0xA2, &buf[..74]);
+            buf[74..78].copy_from_slice(&crc.to_le_bytes());
+            buf
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::DeviceStatus;
+    use crate::crc::crc32_bt_output;
     use axis_core::Button;
 
     /// Monta um report USB 0x01 de 64 bytes em repouso (sticks 128, d-pad solto).
@@ -244,5 +273,34 @@ mod tests {
         );
         assert_eq!(mac_from_feature_0x12(&[0x12, 0, 0, 0, 0, 0, 0]), None);
         assert_eq!(mac_from_feature_0x12(&[0x12, 1, 2]), None);
+    }
+
+    #[test]
+    fn usb_output_places_rumble_and_color() {
+        let out = OutputState {
+            lightbar: [95, 179, 122],
+            rumble_strong: 200,
+            rumble_weak: 50,
+            player: Some(2),
+        };
+        let r = output_report(Transport::Usb, &out);
+        assert_eq!(r.len(), 32);
+        assert_eq!(&r[..2], &[0x05, 0xFF]);
+        assert_eq!((r[4], r[5]), (50, 200));
+        assert_eq!(&r[6..9], &[95, 179, 122]);
+    }
+
+    #[test]
+    fn bluetooth_output_has_valid_crc() {
+        let out = OutputState {
+            lightbar: [155, 122, 216],
+            ..Default::default()
+        };
+        let r = output_report(Transport::Bluetooth, &out);
+        assert_eq!(r.len(), 78);
+        assert_eq!((r[0], r[1], r[3]), (0x11, 0x80, 0xFF));
+        assert_eq!(&r[8..11], &[155, 122, 216]);
+        let crc = u32::from_le_bytes(r[74..78].try_into().unwrap());
+        assert_eq!(crc, crc32_bt_output(0xA2, &r[..74]));
     }
 }

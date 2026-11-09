@@ -17,8 +17,6 @@ pub fn crc32(data: &[u8]) -> u32 {
 }
 
 /// CRC de `[seed] ++ body`, sem alocar.
-// Ainda sem chamadores: usado pelos drivers Bluetooth nas próximas tarefas.
-#[allow(dead_code)]
 pub(crate) fn crc32_bt_output(seed: u8, body: &[u8]) -> u32 {
     !update(update(0xFFFF_FFFF, &[seed]), body)
 }
