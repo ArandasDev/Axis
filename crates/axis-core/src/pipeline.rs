@@ -189,6 +189,15 @@ mod tests {
     }
 
     #[test]
+    fn compile_rejects_newer_schema_profile() {
+        let p = Profile {
+            schema_version: 2,
+            ..Profile::default()
+        };
+        assert!(Pipeline::compile(&Corrections::default(), &p).is_err());
+    }
+
+    #[test]
     fn compile_rejects_invalid_profile() {
         let mut p = Profile::default();
         p.vibration = 2.0;

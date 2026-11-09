@@ -9,5 +9,5 @@ pub use input::{Button, Buttons, InputState, Vec2};
 pub use pipeline::{Pipeline, StickTrace, Trace};
 pub use settings::{
     ControllerRecord, Corrections, CurveSpec, DeadzoneSpec, DeviceFamily, Profile, SCHEMA_VERSION,
-    StickCorrection, StickSettings, TriggerCalibration, TriggerSettings, check_schema,
+    SchemaProbe, StickCorrection, StickSettings, TriggerCalibration, TriggerSettings, check_schema,
 };

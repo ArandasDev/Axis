@@ -272,12 +272,32 @@ fn validate_trigger_calibration(path: &str, t: &TriggerCalibration) -> Result<()
 
 impl Profile {
     pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_schema(self.schema_version)?;
         validate_stick("left_stick", &self.left_stick)?;
         validate_stick("right_stick", &self.right_stick)?;
         validate_trigger("l2", &self.l2)?;
         validate_trigger("r2", &self.r2)?;
         check_range("vibration", self.vibration, 0.0, 1.0)
     }
+}
+
+fn validate_schema(found: u32) -> Result<(), ValidationError> {
+    check_schema(found).or_else(|e| fail("schema_version", &e.to_string()))
+}
+
+impl ControllerRecord {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_schema(self.schema_version)?;
+        self.corrections.validate()
+    }
+}
+
+/// Minimal view of a stored file used to read only its schema version.
+/// Loaders deserialize this first and call [`check_schema`] before parsing
+/// the full type, so a newer file is never misread or discarded as corrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct SchemaProbe {
+    pub schema_version: u32,
 }
 
 impl Corrections {
@@ -384,5 +404,62 @@ mod tests {
         );
         assert_eq!(check_schema(0), Err(SchemaError::Zero));
         assert_eq!(check_schema(1), Ok(()));
+    }
+
+    #[test]
+    fn newer_schema_profile_is_rejected_by_validate() {
+        let text = toml::to_string(&Profile::default())
+            .unwrap()
+            .replace("schema_version = 1", "schema_version = 2");
+        let p = toml::from_str::<Profile>(&text).unwrap();
+        assert_eq!(p.schema_version, 2);
+        assert_eq!(p.validate().unwrap_err().field, "schema_version");
+    }
+
+    #[test]
+    fn probe_reads_version_even_when_full_parse_fails() {
+        let text = "schema_version = 2\n[left_stick.curve]\nkind = \"bezier\"\n";
+        assert!(toml::from_str::<Profile>(text).is_err());
+        let probe = toml::from_str::<SchemaProbe>(text).unwrap();
+        assert_eq!(probe.schema_version, 2);
+        assert_eq!(
+            check_schema(probe.schema_version),
+            Err(SchemaError::TooNew {
+                found: 2,
+                supported: 1
+            })
+        );
+    }
+
+    #[test]
+    fn controller_record_validate_checks_schema_and_corrections() {
+        let valid = ControllerRecord {
+            schema_version: SCHEMA_VERSION,
+            id: "a4:ae:12:00:be:ef".into(),
+            family: DeviceFamily::DualSense,
+            owner_name: "Maria".into(),
+            owner_color: [95, 179, 122],
+            active_profile: "Padrão".into(),
+            corrections: Corrections::default(),
+        };
+        assert_eq!(valid.validate(), Ok(()));
+
+        let newer = ControllerRecord {
+            schema_version: 2,
+            ..valid.clone()
+        };
+        assert_eq!(newer.validate().unwrap_err().field, "schema_version");
+
+        let bad = ControllerRecord {
+            corrections: Corrections {
+                r2: TriggerCalibration {
+                    rest: 0.6,
+                    max: 0.6,
+                },
+                ..Corrections::default()
+            },
+            ..valid
+        };
+        assert_eq!(bad.validate().unwrap_err().field, "r2.rest");
     }
 }
