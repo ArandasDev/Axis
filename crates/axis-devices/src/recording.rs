@@ -44,7 +44,7 @@ fn transport_name(t: Transport) -> &'static str {
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.is_empty() || s.len() % 2 != 0 || !s.is_ascii() {
+    if s.is_empty() || s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     s.as_bytes()
@@ -79,6 +79,7 @@ impl Recording {
         }
         let version: u32 = head
             .next()
+            .filter(|v| v.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|v| v.parse().ok())
             .ok_or(RecordingError::BadHeader)?;
         let family = match head.next() {
@@ -109,7 +110,10 @@ impl Recording {
             let (Some(t), Some(hex), None) = (parts.next(), parts.next(), parts.next()) else {
                 return Err(RecordingError::BadLine(n));
             };
-            let t_us = t.parse().map_err(|_| RecordingError::BadLine(n))?;
+            let t_us = Some(t)
+                .filter(|t| t.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|t| t.parse().ok())
+                .ok_or(RecordingError::BadLine(n))?;
             let data = decode_hex(hex).ok_or(RecordingError::BadLine(n))?;
             frames.push(Frame { t_us, data });
         }
@@ -165,6 +169,22 @@ mod tests {
         assert_eq!(
             Recording::from_text("axis-rec 1 DualShock4 usb\n10 zz\n"),
             Err(RecordingError::BadLine(2))
+        );
+    }
+
+    #[test]
+    fn signs_are_rejected() {
+        assert_eq!(
+            Recording::from_text("axis-rec 1 DualShock4 usb\n10 +f\n"),
+            Err(RecordingError::BadLine(2))
+        );
+        assert_eq!(
+            Recording::from_text("axis-rec 1 DualShock4 usb\n+5 00\n"),
+            Err(RecordingError::BadLine(2))
+        );
+        assert_eq!(
+            Recording::from_text("axis-rec +1 DualShock4 usb\n"),
+            Err(RecordingError::BadHeader)
         );
     }
 }
