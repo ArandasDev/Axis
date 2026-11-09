@@ -15,6 +15,7 @@ pub(crate) struct FakeController {
     pub id: String,
     pub reads: ReadQueue,
     pub writes: Arc<Mutex<Vec<OutputState>>>,
+    pub fail_writes: bool,
 }
 
 impl FakeController {
@@ -23,6 +24,7 @@ impl FakeController {
             id: "fake".to_string(),
             reads: Arc::new(Mutex::new(script.into())),
             writes: Arc::new(Mutex::new(Vec::new())),
+            fail_writes: false,
         }
     }
 }
@@ -52,6 +54,9 @@ impl Controller for FakeController {
     }
     fn write_output(&mut self, out: &OutputState) -> Result<(), DeviceError> {
         self.writes.lock().unwrap().push(*out);
+        if self.fail_writes {
+            return Err(DeviceError::Hid("escrita falhou".to_string()));
+        }
         Ok(())
     }
 }

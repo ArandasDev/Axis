@@ -86,6 +86,17 @@ impl LatencyHistogram {
     }
 }
 
+/// Verdadeiro no máximo uma vez por `WARN_INTERVAL`.
+fn rate_limited_ok(last: &mut Option<Instant>) -> bool {
+    let now = Instant::now();
+    if last.is_none_or(|t| now - t >= WARN_INTERVAL) {
+        *last = Some(now);
+        true
+    } else {
+        false
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -101,6 +112,7 @@ struct Worker {
     reports: u64,
     last_status: DeviceStatus,
     last_warn: Option<Instant>,
+    last_out_warn: Option<Instant>,
     latency: LatencyHistogram,
     latency_since: Instant,
 }
@@ -110,9 +122,7 @@ impl Worker {
         let Some(pad) = &self.pad else { return };
         let result = lock(pad).update(input);
         if let Err(e) = result {
-            let now = Instant::now();
-            if self.last_warn.is_none_or(|t| now - t >= WARN_INTERVAL) {
-                self.last_warn = Some(now);
+            if rate_limited_ok(&mut self.last_warn) {
                 log::warn!("falha ao atualizar o controle virtual: {e}");
             }
         }
@@ -154,7 +164,14 @@ impl Worker {
                 self.written = self.out;
                 None
             }
-            Err(e) => Some(exit_for(e)),
+            Err(DeviceError::Disconnected) => Some(WorkerExit::Disconnected),
+            Err(e) => {
+                self.written = self.out;
+                if rate_limited_ok(&mut self.last_out_warn) {
+                    log::warn!("falha ao escrever a saída do controle: {e}");
+                }
+                None
+            }
         }
     }
 
@@ -233,11 +250,13 @@ pub fn spawn_worker(
             reports: 0,
             last_status: DeviceStatus::default(),
             last_warn: None,
+            last_out_warn: None,
             latency: LatencyHistogram::default(),
             latency_since: Instant::now(),
         };
         let exit = w.run(&rx);
         w.publish_status();
+        w.send_pad(&InputState::default());
         on_exit(exit);
     });
     (tx, handle)
@@ -286,7 +305,10 @@ mod tests {
     }
 
     fn start(script: Vec<Result<Option<Report>, DeviceError>>, with_pad: bool) -> Harness {
-        let ctl = FakeController::new(script);
+        start_with(FakeController::new(script), with_pad)
+    }
+
+    fn start_with(ctl: FakeController, with_pad: bool) -> Harness {
         let writes = ctl.writes.clone();
         let reads = ctl.reads.clone();
         let (pad, received) = FakePad::new();
@@ -345,6 +367,28 @@ mod tests {
         let h = start(vec![report_x(1.0), Err(DeviceError::Disconnected)], true);
         h.handle.join().unwrap();
         assert_eq!(*h.exit.lock().unwrap(), Some(WorkerExit::Disconnected));
+        let got = h.received.lock().unwrap();
+        assert!((got[0].left.x - 1.0).abs() < 1e-3);
+        assert_eq!(*got.last().unwrap(), InputState::default());
+    }
+
+    #[test]
+    fn output_write_failure_does_not_stop_input() {
+        let mut ctl = FakeController::new(vec![]);
+        ctl.fail_writes = true;
+        let h = start_with(ctl, true);
+        h.tx.send(WorkerCommand::SetLight {
+            lightbar: [1, 2, 3],
+            player: None,
+        })
+        .unwrap();
+        wait_until(|| !h.writes.lock().unwrap().is_empty());
+        h.reads.lock().unwrap().push_back(report_x(1.0));
+        wait_until(|| h.received.lock().unwrap().len() == 1);
+        h.reads.lock().unwrap().push_back(report_x(1.0));
+        wait_until(|| h.received.lock().unwrap().len() == 2);
+        assert_eq!(h.writes.lock().unwrap().len(), 1);
+        assert_eq!(h.finish(), Some(WorkerExit::Shutdown));
     }
 
     #[test]
