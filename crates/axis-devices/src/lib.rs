@@ -8,6 +8,7 @@ pub mod dualsense;
 mod hid;
 mod hotplug;
 mod identity;
+mod recording;
 mod types;
 pub mod xinput;
 
@@ -17,5 +18,6 @@ pub use crc::crc32;
 pub use hid::{HidCandidate, HidController, enumerate_hid};
 pub use hotplug::{HotplugEvent, HotplugWatcher};
 pub use identity::{fallback_id, format_mac, parse_serial_mac, resolve_identity};
+pub use recording::{Frame, Recording, RecordingError, parse_frame};
 pub use types::{DeviceError, DeviceStatus, OutputState, Report, Transport};
 pub use xinput::{XInputController, available_slots};
