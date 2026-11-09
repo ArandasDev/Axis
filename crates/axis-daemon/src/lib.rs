@@ -1,3 +1,4 @@
+pub mod app;
 pub mod autostart;
 pub mod config;
 pub mod instance;
@@ -8,4 +9,5 @@ pub mod ports;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub mod tray;
 pub mod worker;
