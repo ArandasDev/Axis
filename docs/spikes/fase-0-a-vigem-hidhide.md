@@ -52,6 +52,6 @@ O controle se anuncia como DS4 v2 da Sony (`054C:09CC`), mas o MAC `41:42:00:00:
 
 ## Pendências deste spike
 
-- [ ] **USB:** confirmar o MAC pelo feature `0x12`, a taxa de reports por cabo e o report `0x01` por USB.
+- [ ] **USB:** confirmar o MAC pelo feature `0x12`, a taxa de reports por cabo e o report `0x01` por USB. **Tentativa de 2026-11-09:** com o cabo micro-USB do autor, mesmo com o Bluetooth do PC desligado, o Windows não enumerou nenhum dispositivo USB do controle (só o adaptador Bluetooth da Intel). O cabo é provavelmente **só de carga**. Refazer com outro cabo de dados.
 - [ ] **Teste com movimento:** comparar valores ao vivo (sticks, gatilhos, botões) entre o DS4 e o XInput. O teste ponta a ponta foi feito em repouso.
 - [ ] Comparar a taxa de reports dos três DS4 (verificar se todos são clones).
