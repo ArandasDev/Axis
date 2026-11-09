@@ -81,6 +81,16 @@ impl LatencyHistogram {
         10 * BUCKETS as u64
     }
 
+    /// Percentil para o log: no bucket de estouro, "≥1000" em vez do limite artificial.
+    pub(crate) fn format_percentile(&self, p: f64) -> String {
+        let v = self.percentile(p);
+        if v > 10 * (BUCKETS as u64 - 1) {
+            "≥1000".to_string()
+        } else {
+            v.to_string()
+        }
+    }
+
     pub(crate) fn reset(&mut self) {
         self.buckets = [0; BUCKETS];
     }
@@ -206,8 +216,8 @@ impl Worker {
                     if started - self.latency_since >= LATENCY_LOG_INTERVAL {
                         log::info!(
                             "latência p50 {} µs, p99 {} µs, {} reports",
-                            self.latency.percentile(0.5),
-                            self.latency.percentile(0.99),
+                            self.latency.format_percentile(0.5),
+                            self.latency.format_percentile(0.99),
                             self.latency.total()
                         );
                         self.latency.reset();
@@ -481,5 +491,17 @@ mod tests {
         assert!(h.percentile(0.99) >= 1000);
         h.reset();
         assert_eq!(h.percentile(0.5), 0);
+    }
+
+    #[test]
+    fn overflow_percentile_is_formatted_as_at_least_1000() {
+        let mut h = LatencyHistogram::default();
+        for _ in 0..10 {
+            h.record(2000);
+        }
+        assert_eq!(h.format_percentile(0.99), "≥1000");
+        h.reset();
+        h.record(15);
+        assert_eq!(h.format_percentile(0.5), "20");
     }
 }

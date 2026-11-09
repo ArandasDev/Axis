@@ -77,6 +77,8 @@ struct Session {
     last_error_reopen: Option<std::time::Instant>,
     /// Instance IDs ocultados por esta sessão (estão em `hidden.toml`).
     instances: Vec<String>,
+    /// Reabertura após erro adiada pelo intervalo mínimo; um `Rescan` está agendado.
+    reopen_pending: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -99,6 +101,7 @@ pub struct Manager {
     hiding_enabled: bool,
     next_session: u64,
     warned_no_vigem: bool,
+    warned_plug_failure: bool,
     grace_generation: u64,
     paused: bool,
     /// Depois de `RestoreControllers`: só visualização até o fim da execução.
@@ -124,6 +127,7 @@ impl Manager {
             hiding_enabled,
             next_session: 0,
             warned_no_vigem: false,
+            warned_plug_failure: false,
             grace_generation: 0,
             paused: false,
             emulation_disabled: false,
@@ -132,7 +136,12 @@ impl Manager {
 
     /// Reconcilia ocultações de uma execução que travou e enumera os controles conectados.
     pub fn start(&mut self) {
-        self.unhide_everything();
+        if !self.unhide_everything() {
+            self.notifier.notify(
+                "Axis",
+                "Não foi possível desocultar os controles físicos; tente restaurar pelo menu.",
+            );
+        }
         self.scan();
     }
 
@@ -157,7 +166,12 @@ impl Manager {
             Event::RestoreControllers => self.restore(),
             Event::Quit => {
                 self.shutdown_all();
-                self.unhide_everything();
+                if !self.unhide_everything() {
+                    self.notifier.notify(
+                        "Axis",
+                        "Não foi possível desocultar os controles físicos; isso será desfeito na próxima inicialização do Axis.",
+                    );
+                }
                 return false;
             }
         }
@@ -179,12 +193,13 @@ impl Manager {
     }
 
     /// Desoculta tudo o que consta em `hidden.toml` e limpa o arquivo.
-    fn unhide_everything(&mut self) {
+    /// Devolve `false` se a desocultação falhou (quem chama avisa o usuário).
+    fn unhide_everything(&mut self) -> bool {
         if !self.hiding_enabled || self.hidden.is_empty() {
-            return;
+            return true;
         }
         let Some(hider) = self.hider.clone() else {
-            return;
+            return true;
         };
         let ids = self.hidden.clone();
         match hider.unhide_all(&ids) {
@@ -192,22 +207,29 @@ impl Manager {
                 if let Err(e) = self.write_hidden(Vec::new()) {
                     log::warn!("não foi possível limpar a lista de ocultos: {e}");
                 }
+                true
             }
             Err(e) => {
                 log::warn!("não foi possível desocultar {ids:?}: {e}");
-                self.notifier.notify(
-                    "Axis",
-                    "Não foi possível desocultar os controles físicos; tente restaurar pelo menu.",
-                );
+                false
             }
         }
     }
 
     fn restore(&mut self) {
+        // Os virtuais saem antes da desocultação (evita entrada dupla).
         self.shutdown_all();
-        self.unhide_everything();
-        self.emulation_disabled = true;
-        self.notifier.notify("Axis", "Controles restaurados");
+        if self.unhide_everything() {
+            self.emulation_disabled = true;
+            self.notifier.notify("Axis", "Controles restaurados");
+        } else {
+            // Os físicos continuam ocultos: a emulação volta para não deixar o
+            // usuário sem controle.
+            self.notifier.notify(
+                "Axis",
+                "Não foi possível restaurar os controles; a emulação continua.",
+            );
+        }
         self.scan();
     }
 
@@ -239,6 +261,7 @@ impl Manager {
         else {
             return;
         };
+        let mut deferred = false;
         let reopen_path = match &exit {
             WorkerExit::Error(m) => {
                 let s = &self.sessions[index];
@@ -246,7 +269,11 @@ impl Manager {
                 if s.last_error_reopen
                     .is_some_and(|t| t.elapsed() < ERROR_REOPEN_COOLDOWN)
                 {
-                    log::warn!("erros repetidos em {}; sem nova reabertura", s.id);
+                    log::warn!(
+                        "erros repetidos em {}; nova tentativa após o intervalo",
+                        s.id
+                    );
+                    deferred = true;
                     None
                 } else {
                     Some(s.path.clone())
@@ -255,6 +282,12 @@ impl Manager {
             _ => None,
         };
         self.disconnect(index);
+        if deferred {
+            // O dispositivo continua presente (sem evento de hotplug): sem este
+            // Rescan o controle ficaria parado.
+            self.sessions[index].reopen_pending = true;
+            self.scheduler.after(ERROR_REOPEN_COOLDOWN, Event::Rescan);
+        }
         if let Some(path) = reopen_path {
             // Uma única tentativa de reabrir o mesmo path.
             if let Some(c) = self.opener.enumerate().into_iter().find(|c| c.path == path) {
@@ -274,7 +307,17 @@ impl Manager {
         let session = self.sessions.remove(index);
         let Session { pad, instances, .. } = session;
         drop(pad); // desconecta o virtual antes de desocultar o físico
-        self.unhide_ids(&instances);
+        // Um físico ainda emulado por uma sessão conectada continua oculto.
+        let free: Vec<String> = instances
+            .into_iter()
+            .filter(|i| {
+                !self
+                    .sessions
+                    .iter()
+                    .any(|s| s.connected && s.instances.contains(i))
+            })
+            .collect();
+        self.unhide_ids(&free);
     }
 
     /// Desoculta `ids` e os remove de `hidden.toml` (só depois do sucesso).
@@ -392,16 +435,25 @@ impl Manager {
             }
         };
         let base_id = controller.id().to_string();
-        // Sessão em graça com o mesmo id: a nova chegada a reaproveita.
+        // Sessão em graça com o mesmo id (ou um sufixo `#n` dele): a nova chegada
+        // a reaproveita, preferindo o id exato.
+        let suffixed = format!("{base_id}#");
         let grace_index = self
             .sessions
             .iter()
-            .position(|s| !s.connected && s.id == base_id);
-        let id = if grace_index.is_some() {
-            base_id
-        } else {
-            self.unique_id(&base_id)
+            .position(|s| !s.connected && s.id == base_id)
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .position(|s| !s.connected && s.id.starts_with(&suffixed))
+            });
+        let id = match grace_index {
+            Some(i) => self.sessions[i].id.clone(),
+            None => self.unique_id(&base_id),
         };
+        // Reabertura após erro adiada: a chegada pelo `Rescan` conta como reabertura.
+        let error_reopen =
+            error_reopen || grace_index.is_some_and(|i| self.sessions[i].reopen_pending);
         let family = controller.family();
         let experimental = controller.experimental();
         let palette_index = self.record_count();
@@ -450,6 +502,15 @@ impl Manager {
                 Err(e) => {
                     log::warn!("não foi possível criar o controle virtual de {id}: {e}");
                     view_only = true;
+                    if !self.warned_plug_failure {
+                        self.warned_plug_failure = true;
+                        self.notifier.notify(
+                            "Axis",
+                            &format!(
+                                "Não foi possível criar o controle virtual ({e}); o controle fica só em visualização."
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -545,6 +606,7 @@ impl Manager {
                 grace_index.and_then(|i| self.sessions[i].last_error_reopen)
             },
             instances,
+            reopen_pending: false,
         };
         match grace_index {
             Some(i) => self.sessions[i] = session,
@@ -648,6 +710,7 @@ mod tests {
         recorded: Arc<Mutex<Vec<bool>>>,
         rx: Receiver<Event>,
         scheduler: FakeScheduler,
+        unhide_all_fails: Arc<std::sync::atomic::AtomicBool>,
         mgr: Manager,
     }
 
@@ -668,11 +731,13 @@ mod tests {
         let opener = FakeOpener::default();
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let bus = with_bus.then(|| Arc::new(FakeBus::new(log.clone())));
+        let unhide_all_fails = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hider: Arc<dyn DeviceHider> = Arc::new(FakeHider {
             log: log.clone(),
             fail: hide_fails,
             hidden_path: paths.hidden_file(),
             recorded: recorded.clone(),
+            fail_unhide_all: unhide_all_fails.clone(),
         });
         let notifier = FakeNotifier::default();
         let scheduler = FakeScheduler::default();
@@ -696,6 +761,7 @@ mod tests {
             recorded,
             rx,
             scheduler,
+            unhide_all_fails,
             mgr,
         }
     }
@@ -1164,6 +1230,22 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert!(!s[0].connected);
         assert!(!messages(&r).iter().any(|m| m.contains("reconectou")));
+        // Sem reabertura agora: um Rescan fica agendado para depois do intervalo.
+        assert!(
+            r.scheduler
+                .scheduled
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(d, e)| *d == ERROR_REOPEN_COOLDOWN && matches!(e, Event::Rescan))
+        );
+        r.mgr.handle(Event::Rescan);
+        assert_eq!(r.opener.state.lock().unwrap().opened.len(), 3);
+        let s = r.mgr.sessions();
+        assert_eq!(s.len(), 1);
+        assert!(s[0].connected);
+        assert_eq!(plugs(&r), 1);
+        assert!(!messages(&r).iter().any(|m| m.contains("reconectou")));
     }
 
     #[test]
@@ -1174,5 +1256,128 @@ mod tests {
         assert!(!r.mgr.sessions()[0].connected);
         assert_eq!(r.scheduler.scheduled.lock().unwrap().len(), 1);
         assert_eq!(live(&r), 1);
+    }
+
+    #[test]
+    fn suffixed_session_reconnects_in_grace_and_expiry_does_not_unhide_live() {
+        let mut r = rig("suffix", true, false);
+        r.opener.add(P1, "x");
+        r.opener.add(P2, "x");
+        r.mgr.start();
+        disconnect(&mut r, P2);
+        assert!(!r.mgr.sessions()[1].connected);
+        r.mgr.handle(Event::Rescan);
+        assert_eq!(plugs(&r), 2, "reaproveita o virtual de x#2");
+        let s = r.mgr.sessions();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[1].id, "x#2");
+        assert!(s[1].connected);
+        assert_eq!(s[1].player, Some(2));
+        // GraceExpired antigo: nada é desocultado e a sessão continua.
+        r.mgr.handle(Event::GraceExpired {
+            id: "x#2".to_string(),
+            generation: 1,
+        });
+        assert!(
+            !r.log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("unhide")),
+            "{:?}",
+            r.log.lock().unwrap()
+        );
+        assert!(hidden_text(&r).contains(INST2));
+        assert_eq!(r.mgr.sessions().len(), 2);
+        assert_eq!(live(&r), 2);
+    }
+
+    #[test]
+    fn grace_expiry_keeps_instances_used_by_a_connected_session() {
+        let mut r = one_controller("liveinst");
+        disconnect(&mut r, P1);
+        // Outro controle (outro id) chega no mesmo path durante a graça.
+        r.opener.state.lock().unwrap().ids[0].1 = "bb:02".to_string();
+        r.mgr.handle(Event::Rescan);
+        assert_eq!(r.mgr.sessions().len(), 2);
+        r.mgr.handle(Event::GraceExpired {
+            id: "aa:01".to_string(),
+            generation: 1,
+        });
+        assert_eq!(r.mgr.sessions().len(), 1);
+        assert!(!r.log.lock().unwrap().contains(&format!("unhide:{INST1}")));
+        assert!(hidden_text(&r).contains(INST1));
+    }
+
+    #[test]
+    fn plug_failure_notifies_once_and_stays_view_only() {
+        let mut r = rig("plugfail", true, false);
+        r.bus
+            .as_ref()
+            .unwrap()
+            .fail_plug
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        r.opener.add(P1, "aa:01");
+        r.opener.add(P2, "aa:02");
+        r.mgr.start();
+        let s = r.mgr.sessions();
+        assert_eq!(s.len(), 2);
+        assert!(s.iter().all(|v| v.view_only && v.player.is_none()));
+        let notice = "Não foi possível criar o controle virtual (sem slot livre no ViGEmBus); o controle fica só em visualização.";
+        let m = messages(&r);
+        assert_eq!(
+            m.iter()
+                .filter(|x| x.starts_with("Não foi possível criar o controle virtual"))
+                .count(),
+            1,
+            "{m:?}"
+        );
+        assert!(m.contains(&notice.to_string()), "{m:?}");
+        assert!(r.log.lock().unwrap().is_empty(), "sem plug nem ocultação");
+    }
+
+    #[test]
+    fn failed_restore_keeps_emulation_running() {
+        let mut r = rig("restorefail", true, false);
+        r.opener.add(P1, "aa:01");
+        r.opener.add(P2, "aa:02");
+        r.mgr.start();
+        r.unhide_all_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        r.mgr.handle(Event::RestoreControllers);
+        let m = messages(&r);
+        assert!(!m.contains(&"Controles restaurados".to_string()), "{m:?}");
+        assert!(
+            m.contains(
+                &"Não foi possível restaurar os controles; a emulação continua.".to_string()
+            ),
+            "{m:?}"
+        );
+        assert_eq!(live(&r), 2);
+        let s = r.mgr.sessions();
+        assert_eq!(s.len(), 2);
+        assert!(
+            s.iter()
+                .all(|v| v.connected && !v.view_only && v.player.is_some())
+        );
+        let h = hidden_text(&r);
+        assert!(h.contains(INST1) && h.contains(INST2), "{h}");
+        // A emulação não foi desligada: chegadas novas ganham virtual.
+        r.opener.add(
+            r"\\?\HID#VID_054C&PID_05C4#7&ghi&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}",
+            "aa:03",
+        );
+        r.mgr.handle(Event::Rescan);
+        assert_eq!(live(&r), 3);
+        assert!(!r.mgr.sessions()[2].view_only);
+        // Ao sair com a desocultação falhando, o aviso fala da próxima inicialização.
+        assert!(!r.mgr.handle(Event::Quit));
+        assert!(
+            messages(&r)
+                .iter()
+                .any(|m| m.ends_with("será desfeito na próxima inicialização do Axis.")),
+            "{:?}",
+            messages(&r)
+        );
     }
 }

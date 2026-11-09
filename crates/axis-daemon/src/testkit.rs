@@ -181,6 +181,8 @@ pub(crate) struct FakeBus {
     pub next_index: std::sync::atomic::AtomicU32,
     pub last_input: Arc<Mutex<Option<InputState>>>,
     pub plugs: Arc<std::sync::atomic::AtomicUsize>,
+    /// Quando ligado, `plug_x360` falha (sem slot livre).
+    pub fail_plug: std::sync::atomic::AtomicBool,
 }
 
 impl FakeBus {
@@ -191,6 +193,7 @@ impl FakeBus {
             next_index: std::sync::atomic::AtomicU32::new(0),
             last_input: Arc::new(Mutex::new(None)),
             plugs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_plug: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -220,6 +223,9 @@ impl Drop for FakeBusPad {
 impl VirtualBus for FakeBus {
     fn plug_x360(&self, _on_rumble: RumbleSink) -> Result<Box<dyn VirtualPad>, VirtualError> {
         use std::sync::atomic::Ordering::SeqCst;
+        if self.fail_plug.load(SeqCst) {
+            return Err(VirtualError::NoFreeSlot);
+        }
         self.log.lock().unwrap().push("plug".to_string());
         self.live.fetch_add(1, SeqCst);
         self.plugs.fetch_add(1, SeqCst);
@@ -238,6 +244,8 @@ pub(crate) struct FakeHider {
     pub hidden_path: std::path::PathBuf,
     /// Para cada `hide`: o id já constava em `hidden.toml` naquele instante?
     pub recorded: Arc<Mutex<Vec<bool>>>,
+    /// Quando ligado, `unhide_all` falha.
+    pub fail_unhide_all: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DeviceHider for FakeHider {
@@ -264,6 +272,12 @@ impl DeviceHider for FakeHider {
             .lock()
             .unwrap()
             .push(format!("unhide_all:{}", instance_ids.join(",")));
+        if self
+            .fail_unhide_all
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(HideError::Win32(5));
+        }
         Ok(())
     }
 }

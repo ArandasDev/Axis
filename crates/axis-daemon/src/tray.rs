@@ -4,7 +4,9 @@
 //! e do ícone (`Shell_NotifyIconW`). Não é uma janela só de mensagens porque esta
 //! precisa receber difusões (`TaskbarCreated`, fim de sessão) e conseguir o
 //! primeiro plano para o menu fechar direito. Tudo chega por mensagem de janela:
-//! o clique do ícone, as notificações (`WM_APP + 2`) e o fechamento (`WM_CLOSE`).
+//! o clique do ícone, as notificações (`WM_APP + 2`) e o fechamento interno
+//! (`WM_APP + 3`). Um `WM_CLOSE` vindo de fora (ex.: `taskkill` sem `/F`) vira
+//! `Quit` no gerente; a janela só é destruída quando `main` fecha a bandeja.
 
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -21,12 +23,12 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, IDI_APPLICATION,
-    LoadIconW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_ENDSESSION, WM_NCCREATE, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+    IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow,
+    SetWindowLongPtrW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ENDSESSION, WM_NCCREATE,
+    WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 use crate::manager::SessionView;
@@ -36,6 +38,8 @@ use crate::ports::Notifier;
 const WM_TRAY: u32 = WM_APP + 1;
 /// Notificação pendente: `lParam` é um `Box<(String, String)>` (título, corpo).
 const WM_NOTIFY_BALLOON: u32 = WM_APP + 2;
+/// Fechamento pedido por `TrayHandle::close` (depois que o gerente terminou).
+const WM_TRAY_CLOSE: u32 = WM_APP + 3;
 const ICON_ID: u32 = 1;
 /// Novas tentativas de `NIM_ADD` na criação (o Explorer pode ainda não estar pronto no logon).
 const ICON_ADD_RETRIES: u32 = 5;
@@ -188,7 +192,7 @@ impl TrayHandle {
         }
         // SAFETY: PostMessageW aceita qualquer HWND; se a janela não existe mais,
         // a chamada só falha.
-        unsafe { PostMessageW(self.hwnd(), WM_CLOSE, 0, 0) };
+        unsafe { PostMessageW(self.hwnd(), WM_TRAY_CLOSE, 0, 0) };
     }
 }
 
@@ -394,6 +398,20 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
+        WM_CLOSE => {
+            // Fechamento vindo de fora: encerra o gerente, que depois fecha a
+            // bandeja por `WM_TRAY_CLOSE`. Não destrói a janela aqui.
+            log::info!("pedido de fechamento da janela: encerrando");
+            if catch_unwind(AssertUnwindSafe(|| (state.on_command)(TrayCommand::Quit))).is_err() {
+                log::error!("pânico ao pedir o encerramento pelo fechamento da janela");
+            }
+            0
+        }
+        WM_TRAY_CLOSE => {
+            // SAFETY: destrói a janela desta thread (dona dela); WM_DESTROY encerra o laço.
+            unsafe { DestroyWindow(hwnd) };
+            0
+        }
         WM_QUERYENDSESSION => 1,
         WM_ENDSESSION => {
             if endsession_should_quit(wparam) {
@@ -416,7 +434,7 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
-        // SAFETY: repasse padrão (inclui WM_CLOSE → DestroyWindow).
+        // SAFETY: repasse padrão.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
