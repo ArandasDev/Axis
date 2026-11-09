@@ -9,6 +9,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+log = "0.4"
 toml = "0.8"
 proptest = "1"
 criterion = "0.5"
