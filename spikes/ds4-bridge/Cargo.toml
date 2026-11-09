@@ -1,0 +1,19 @@
+# SPIKE (Fase 0, a) — código descartável. Não faz parte do workspace.
+[package]
+name = "ds4-bridge-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+hidapi = "2"
+vigem-client = "0.1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_Security",
+    "Win32_UI_Input_XboxController",
+] }
