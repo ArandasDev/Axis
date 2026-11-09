@@ -8,8 +8,14 @@ pub fn format_mac(mac: [u8; 6]) -> String {
         .join(":")
 }
 
+/// Um MAC é utilizável como identidade se não for todo zero nem todo `FF` (clones baratos
+/// reportam esses valores). O bit multicast NÃO é checado: o clone real do autor, 41:42:.., o tem.
+pub fn is_usable_mac(mac: &[u8; 6]) -> bool {
+    *mac != [0; 6] && *mac != [0xFF; 6]
+}
+
 /// Interpreta um serial como MAC (12 dígitos hex, com ou sem `:`/`-`).
-/// Um MAC todo zero é tratado como inválido.
+/// MACs inutilizáveis (ver `is_usable_mac`) resultam em `None`.
 pub fn parse_serial_mac(serial: &str) -> Option<[u8; 6]> {
     let digits: String = serial.chars().filter(|c| *c != ':' && *c != '-').collect();
     if digits.len() != 12 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -19,7 +25,7 @@ pub fn parse_serial_mac(serial: &str) -> Option<[u8; 6]> {
     for (i, byte) in mac.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&digits[i * 2..i * 2 + 2], 16).ok()?;
     }
-    (mac != [0; 6]).then_some(mac)
+    is_usable_mac(&mac).then_some(mac)
 }
 
 /// Id de fallback: `"dev-"` + FNV-1a 64 bits do path em maiúsculas.
@@ -39,6 +45,7 @@ pub fn resolve_identity(
     instance_path: &str,
 ) -> String {
     feature_mac
+        .filter(is_usable_mac)
         .or_else(|| serial.and_then(parse_serial_mac))
         .map(format_mac)
         .unwrap_or_else(|| fallback_id(instance_path))
@@ -65,6 +72,21 @@ mod tests {
         assert_eq!(parse_serial_mac(""), None);
         assert_eq!(parse_serial_mac("000000000000"), None);
         assert_eq!(parse_serial_mac("Wireless 1234"), None);
+    }
+
+    #[test]
+    fn unusable_macs_are_rejected() {
+        assert!(!is_usable_mac(&[0; 6]));
+        assert!(!is_usable_mac(&[0xFF; 6]));
+        // O bit multicast não é usado: o clone real do autor (41:42:..) o tem ligado.
+        assert!(is_usable_mac(&[0x01, 2, 3, 4, 5, 6]));
+        assert!(is_usable_mac(&[0x41, 0x42, 0, 0, 0x84, 0xB6]));
+        assert_eq!(parse_serial_mac("ffffffffffff"), None);
+        let p = r"\\?\HID#X";
+        assert_eq!(
+            resolve_identity(Some([0xFF; 6]), Some("4142000084b6"), p),
+            "41:42:00:00:84:b6"
+        );
     }
 
     #[test]

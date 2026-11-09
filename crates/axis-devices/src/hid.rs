@@ -79,22 +79,36 @@ fn read_feature(dev: &HidDevice, report_id: u8) -> Vec<u8> {
     }
 }
 
+/// Feature reports lidos ao abrir, em ordem. O primeiro é o de identidade (MAC); no Bluetooth
+/// o segundo tira o controle do modo simples.
+pub(crate) fn features_to_read(family: DeviceFamily, transport: Transport) -> &'static [u8] {
+    match (family, transport) {
+        (DeviceFamily::DualShock4, Transport::Bluetooth) => &[0x12, ds4::FEATURE_ENABLE_FULL_BT],
+        (DeviceFamily::DualShock4, _) => &[0x12],
+        (DeviceFamily::DualSense, Transport::Bluetooth) => {
+            &[0x09, dualsense::FEATURE_ENABLE_FULL_BT]
+        }
+        (DeviceFamily::DualSense, _) => &[0x09],
+        (DeviceFamily::Xbox, _) => &[],
+    }
+}
+
 impl HidController {
     pub fn open(api: &HidApi, c: &HidCandidate) -> Result<HidController, DeviceError> {
         let path = CString::new(c.path.as_bytes())
             .map_err(|_| DeviceError::Hid("path HID inválido".into()))?;
         let dev = api.open_path(&path).map_err(map_err)?;
-        let mac = match c.family {
-            DeviceFamily::DualShock4 => {
-                let mac = ds4::mac_from_feature_0x12(&read_feature(&dev, 0x12));
-                if c.transport == Transport::Bluetooth {
-                    read_feature(&dev, ds4::FEATURE_ENABLE_FULL_BT);
-                }
-                mac
+        let mut mac = None;
+        for (i, &feature) in features_to_read(c.family, c.transport).iter().enumerate() {
+            let data = read_feature(&dev, feature);
+            if i == 0 {
+                mac = match c.family {
+                    DeviceFamily::DualShock4 => ds4::mac_from_feature_0x12(&data),
+                    DeviceFamily::DualSense => dualsense::mac_from_feature_0x09(&data),
+                    DeviceFamily::Xbox => None,
+                };
             }
-            DeviceFamily::DualSense => dualsense::mac_from_feature_0x09(&read_feature(&dev, 0x09)),
-            DeviceFamily::Xbox => None,
-        };
+        }
         let id = resolve_identity(mac, c.serial.as_deref(), &c.path);
         Ok(HidController {
             dev,
@@ -168,6 +182,22 @@ mod tests {
     use super::*;
     use crate::OutputState;
     use axis_core::DeviceFamily;
+
+    #[test]
+    fn feature_reads_per_family_and_transport() {
+        use Transport::{Bluetooth, Usb};
+        assert_eq!(features_to_read(DeviceFamily::DualShock4, Usb), &[0x12]);
+        assert_eq!(
+            features_to_read(DeviceFamily::DualShock4, Bluetooth),
+            &[0x12, ds4::FEATURE_ENABLE_FULL_BT]
+        );
+        assert_eq!(features_to_read(DeviceFamily::DualSense, Usb), &[0x09]);
+        assert_eq!(
+            features_to_read(DeviceFamily::DualSense, Bluetooth),
+            &[0x09, dualsense::FEATURE_ENABLE_FULL_BT]
+        );
+        assert!(features_to_read(DeviceFamily::Xbox, Usb).is_empty());
+    }
 
     #[test]
     fn disconnect_errors_are_recognized() {

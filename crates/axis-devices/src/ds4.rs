@@ -1,6 +1,7 @@
 //! Decodificação dos reports de entrada do DualShock 4 (USB e Bluetooth).
 
 use crate::crc::crc32_bt_output;
+use crate::is_usable_mac;
 use crate::{DeviceStatus, OutputState, Report, Transport};
 use axis_core::{Button, Buttons, InputState, Vec2};
 
@@ -96,7 +97,7 @@ pub fn parse(buf: &[u8]) -> Option<Report> {
     Some(Report { input, status })
 }
 
-/// MAC (ordem de exibição) a partir do feature report `0x12`; `None` se inválido ou zerado.
+/// MAC (ordem de exibição) a partir do feature report `0x12`; `None` se inválido ou MAC inutilizável.
 pub fn mac_from_feature_0x12(buf: &[u8]) -> Option<[u8; 6]> {
     if buf.len() < 7 || buf[0] != 0x12 {
         return None;
@@ -105,7 +106,7 @@ pub fn mac_from_feature_0x12(buf: &[u8]) -> Option<[u8; 6]> {
     for (i, b) in buf[1..7].iter().rev().enumerate() {
         mac[i] = *b;
     }
-    if mac == [0; 6] { None } else { Some(mac) }
+    is_usable_mac(&mac).then_some(mac)
 }
 
 /// Monta o report de saída (lightbar e vibração). O DS4 não tem LEDs de jogador: `player` é ignorado.
@@ -278,6 +279,10 @@ mod tests {
         );
         assert_eq!(mac_from_feature_0x12(&[0x12, 0, 0, 0, 0, 0, 0]), None);
         assert_eq!(mac_from_feature_0x12(&[0x12, 1, 2]), None);
+        assert_eq!(
+            mac_from_feature_0x12(&[0x12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            None
+        );
     }
 
     #[test]

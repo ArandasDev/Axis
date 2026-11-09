@@ -2,8 +2,13 @@
 
 use crate::crc::crc32_bt_output;
 use crate::ds4::{axis_u8, dpad_buttons, trigger_u8};
+use crate::is_usable_mac;
 use crate::{DeviceStatus, OutputState, Report, Transport};
 use axis_core::{Button, Buttons, InputState, Vec2};
+
+/// Experimental, da documentação pública: ler este feature report faz o DualSense enviar o
+/// report completo `0x31` no Bluetooth (em vez do `0x01` curto).
+pub const FEATURE_ENABLE_FULL_BT: u8 = 0x05;
 
 /// Decodifica um report de entrada (`0x01` USB, `0x31` Bluetooth).
 pub fn parse(buf: &[u8]) -> Option<Report> {
@@ -98,7 +103,7 @@ pub fn output_report(transport: Transport, out: &OutputState) -> Vec<u8> {
     }
 }
 
-/// MAC (ordem de exibição) a partir do feature report `0x09`; `None` se inválido ou zerado.
+/// MAC (ordem de exibição) a partir do feature report `0x09`; `None` se inválido ou MAC inutilizável.
 pub fn mac_from_feature_0x09(buf: &[u8]) -> Option<[u8; 6]> {
     if buf.len() < 7 || buf[0] != 0x09 {
         return None;
@@ -107,7 +112,7 @@ pub fn mac_from_feature_0x09(buf: &[u8]) -> Option<[u8; 6]> {
     for (i, b) in buf[1..7].iter().rev().enumerate() {
         mac[i] = *b;
     }
-    if mac == [0; 6] { None } else { Some(mac) }
+    is_usable_mac(&mac).then_some(mac)
 }
 
 #[cfg(test)]
