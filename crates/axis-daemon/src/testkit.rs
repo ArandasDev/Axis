@@ -112,6 +112,7 @@ pub(crate) struct OpenerState {
     pub ids: Vec<(String, String)>,
     pub writes: Vec<(String, Arc<Mutex<Vec<OutputState>>>)>,
     pub opened: Vec<String>,
+    pub reads: Vec<(String, ReadQueue)>,
 }
 
 #[derive(Clone, Default)]
@@ -129,6 +130,16 @@ impl FakeOpener {
             serial: None,
         });
         s.ids.push((path.to_string(), id.to_string()));
+    }
+
+    pub(crate) fn reads_of(&self, path: &str) -> ReadQueue {
+        let s = self.state.lock().unwrap();
+        s.reads
+            .iter()
+            .rev()
+            .find(|(p, _)| p == path)
+            .map(|(_, r)| r.clone())
+            .expect("controle ainda não aberto")
     }
 
     pub(crate) fn writes_of(&self, path: &str) -> Arc<Mutex<Vec<OutputState>>> {
@@ -157,6 +168,7 @@ impl ControllerOpener for FakeOpener {
         let mut ctl = FakeController::new(vec![]);
         ctl.id = id;
         s.writes.push((c.path.clone(), ctl.writes.clone()));
+        s.reads.push((c.path.clone(), ctl.reads.clone()));
         s.opened.push(c.path.clone());
         Ok(Box::new(ctl))
     }
@@ -167,6 +179,8 @@ pub(crate) struct FakeBus {
     pub log: Log,
     pub live: Arc<std::sync::atomic::AtomicUsize>,
     pub next_index: std::sync::atomic::AtomicU32,
+    pub last_input: Arc<Mutex<Option<InputState>>>,
+    pub plugs: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FakeBus {
@@ -175,17 +189,21 @@ impl FakeBus {
             log,
             live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_index: std::sync::atomic::AtomicU32::new(0),
+            last_input: Arc::new(Mutex::new(None)),
+            plugs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
 
 struct FakeBusPad {
     index: u32,
+    last_input: Arc<Mutex<Option<InputState>>>,
     live: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl VirtualPad for FakeBusPad {
-    fn update(&mut self, _input: &InputState) -> Result<(), VirtualError> {
+    fn update(&mut self, input: &InputState) -> Result<(), VirtualError> {
+        *self.last_input.lock().unwrap() = Some(*input);
         Ok(())
     }
     fn user_index(&self) -> u32 {
@@ -204,8 +222,10 @@ impl VirtualBus for FakeBus {
         use std::sync::atomic::Ordering::SeqCst;
         self.log.lock().unwrap().push("plug".to_string());
         self.live.fetch_add(1, SeqCst);
+        self.plugs.fetch_add(1, SeqCst);
         Ok(Box::new(FakeBusPad {
             index: self.next_index.fetch_add(1, SeqCst),
+            last_input: self.last_input.clone(),
             live: self.live.clone(),
         }))
     }
