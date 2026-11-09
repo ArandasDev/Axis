@@ -57,19 +57,40 @@ impl AppSettings {
     }
 }
 
-/// Nome do arquivo de um controle: `:` vira `-` (e separadores de caminho também, por segurança).
+/// Torna `clean` (sem pontos nem separadores) um nome de arquivo seguro no Windows.
+fn safe_file_name(clean: &str) -> String {
+    // O Windows ignora espaços e pontos finais.
+    let stem = clean.trim_end_matches([' ', '.']);
+    if stem.is_empty() {
+        return "_.toml".into();
+    }
+    let upper = stem.to_ascii_uppercase();
+    let numbered = |prefix: &str| {
+        upper
+            .strip_prefix(prefix)
+            .is_some_and(|n| matches!(n.as_bytes(), [b'1'..=b'9']))
+    };
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || numbered("COM")
+        || numbered("LPT");
+    if reserved {
+        format!("_{stem}.toml")
+    } else {
+        format!("{stem}.toml")
+    }
+}
+
+/// Nome do arquivo de um controle: só `[A-Za-z0-9_-]`; `:` vira `-`, o resto vira `_`.
 fn record_file_name(id: &str) -> String {
-    let name: String = id
+    let clean: String = id
         .chars()
-        .map(|c| {
-            if matches!(c, ':' | '/' | '\\') {
-                '-'
-            } else {
-                c
-            }
+        .map(|c| match c {
+            ':' => '-',
+            c if c.is_ascii_alphanumeric() || c == '_' || c == '-' => c,
+            _ => '_',
         })
         .collect();
-    format!("{name}.toml")
+    safe_file_name(&clean)
 }
 
 /// Nome do arquivo de um perfil: mantém letras (inclusive acentuadas), dígitos, ' ', '_' e '-'.
@@ -84,11 +105,7 @@ fn profile_file_name(name: &str) -> String {
             }
         })
         .collect();
-    if clean.is_empty() {
-        "_.toml".into()
-    } else {
-        format!("{clean}.toml")
-    }
+    safe_file_name(&clean)
 }
 
 /// Leitura e gravação das configurações do app, dos controles e dos perfis.
@@ -96,7 +113,7 @@ pub struct ConfigStore {
     paths: AppPaths,
     notices: Mutex<Vec<String>>,
     /// Arquivos de versão mais nova (ou ilegíveis): nunca são sobrescritos.
-    read_only: HashSet<PathBuf>,
+    read_only: Mutex<HashSet<PathBuf>>,
     warned: Mutex<HashSet<PathBuf>>,
 }
 
@@ -105,7 +122,7 @@ impl ConfigStore {
         ConfigStore {
             paths,
             notices: Mutex::new(Vec::new()),
-            read_only: HashSet::new(),
+            read_only: Mutex::new(HashSet::new()),
             warned: Mutex::new(HashSet::new()),
         }
     }
@@ -143,21 +160,60 @@ impl ConfigStore {
                 self.notify(format!(
                     "{shown} é de uma versão mais nova do Axis; não será alterado"
                 ));
-                self.read_only.insert(path.to_path_buf());
+                self.mark_read_only(path);
                 (None, false)
             }
             Loaded::Unreadable { error } => {
                 self.notify(format!(
                     "Não foi possível ler {shown} ({error}); não será alterado"
                 ));
-                self.read_only.insert(path.to_path_buf());
+                self.mark_read_only(path);
                 (None, false)
             }
         }
     }
 
+    fn mark_read_only(&self, path: &Path) {
+        self.read_only
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_path_buf());
+    }
+
+    fn is_read_only(&self, path: &Path) -> bool {
+        if self
+            .read_only
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(path)
+        {
+            return true;
+        }
+        if !path.exists() {
+            return false;
+        }
+        // Arquivo existente que esta instância ainda não leu: nunca sobrescrever
+        // um arquivo de versão mais nova ou ilegível.
+        let protect = match std::fs::read(path) {
+            Err(_) => true,
+            Ok(bytes) => String::from_utf8(bytes)
+                .ok()
+                .and_then(|text| toml::from_str::<SchemaProbe>(&text).ok())
+                .is_some_and(|probe| {
+                    matches!(
+                        check_schema(probe.schema_version),
+                        Err(SchemaError::TooNew { .. })
+                    )
+                }),
+        };
+        if protect {
+            self.mark_read_only(path);
+        }
+        protect
+    }
+
     fn save<T: Serialize>(&self, path: &Path, value: &T) -> io::Result<()> {
-        if self.read_only.contains(path) {
+        if self.is_read_only(path) {
             let first = self
                 .warned
                 .lock()
@@ -224,6 +280,9 @@ impl ConfigStore {
         }
         let profile = Profile::default();
         if name == DEFAULT_PROFILE {
+            if self.is_read_only(&path) {
+                return profile;
+            }
             // Falha ao gravar não impede o uso do perfil padrão em memória.
             let _ = self.save(&path, &profile);
         } else if missing {
@@ -459,5 +518,80 @@ mod tests {
             n[0].starts_with("Arquivo corrompido preservado em "),
             "{n:?}"
         );
+    }
+
+    #[test]
+    fn save_without_prior_load_never_overwrites_newer_file() {
+        let t = TempDir::new("noload");
+        let dir = t.path().join("config/controllers");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("aa-bb.toml");
+        std::fs::write(&file, "schema_version = 99\n").unwrap();
+        let mut s = store(&t);
+        let r = ConfigStore::new_record("aa:bb", DeviceFamily::Xbox, 0);
+        s.save_record(&r).unwrap();
+        s.save_record(&r).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "schema_version = 99\n"
+        );
+        assert!(!dir.join("aa-bb.toml.bak").exists());
+        assert_eq!(s.take_notices().len(), 1);
+    }
+
+    #[test]
+    fn reserved_windows_names_are_prefixed() {
+        assert_eq!(profile_file_name("CON"), "_CON.toml");
+        assert_eq!(profile_file_name("lpt1"), "_lpt1.toml");
+        assert_eq!(profile_file_name("Com9"), "_Com9.toml");
+        assert_eq!(profile_file_name("console"), "console.toml");
+        assert_eq!(profile_file_name("a."), "a_.toml");
+        assert_eq!(profile_file_name("a "), "a.toml");
+        assert_eq!(profile_file_name("   "), "_.toml");
+        assert_eq!(record_file_name("nul"), "_nul.toml");
+        assert_eq!(record_file_name("a*b:c.d"), "a_b-c_d.toml");
+    }
+
+    #[test]
+    fn too_new_settings_untouched() {
+        let t = TempDir::new("settings-new");
+        let file = t.path().join("config/settings.toml");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "schema_version = 99\n").unwrap();
+        let mut s = store(&t);
+        assert_eq!(s.load_settings(), AppSettings::default());
+        s.save_settings(&AppSettings::default()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "schema_version = 99\n"
+        );
+    }
+
+    #[test]
+    fn too_new_default_profile_untouched_with_single_notice() {
+        let t = TempDir::new("profile-new");
+        let file = t.path().join("config/profiles/Padrão.toml");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "schema_version = 99\n").unwrap();
+        let mut s = store(&t);
+        assert_eq!(s.load_profile("Padrão"), Profile::default());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "schema_version = 99\n"
+        );
+        assert_eq!(s.take_notices().len(), 1);
+    }
+
+    #[test]
+    fn unreadable_record_is_not_written() {
+        let t = TempDir::new("unreadable");
+        let path = t.path().join("config/controllers/aa-bb.toml");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut s = store(&t);
+        assert_eq!(s.load_record("aa:bb"), None);
+        assert_eq!(s.take_notices().len(), 1);
+        let r = ConfigStore::new_record("aa:bb", DeviceFamily::Xbox, 0);
+        s.save_record(&r).unwrap();
+        assert!(path.is_dir());
     }
 }
