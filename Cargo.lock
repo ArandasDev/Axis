@@ -41,6 +41,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "axis-daemon"
+version = "0.1.0"
+dependencies = [
+ "axis-core",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "axis-devices"
 version = "0.1.0"
 dependencies = [
