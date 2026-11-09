@@ -107,6 +107,16 @@ Regra: **`axis-ui` nunca depende de `axis-devices` nem de `axis-virtual`.** Troc
 
 Requisitos de parse: os reports USB e Bluetooth têm formatos diferentes (offsets, CRC no Bluetooth). Cada driver trata os dois.
 
+### 4.1.1 Hardware disponível e verificação (decisão de 2026-11-09)
+
+O autor tem hoje **3 DualShock 4** (micro-USB e Bluetooth). Ainda não tem DualSense nem controle Xbox.
+
+- **Os três drivers entram no MVP.** O DS4 é verificado com hardware real. O DualSense e o Xbox são implementados a partir da documentação pública dos protocolos.
+- **Testes sem hardware:** o parse do DualSense e do Xbox é testado com reports **sintéticos**, montados conforme a documentação e marcados como tal nos fixtures.
+- **Testes com hardware:** ficam marcados `#[ignore]` (rodam com `cargo test -- --ignored`) e são executados quando o autor tiver os controles. Para cada família há um checklist em `docs/hardware-checklist.md`.
+- **Na interface:** enquanto uma família não tiver passado no checklist, o controle aparece com o selo **"experimental"**.
+- **Xbox:** sem hardware, a leitura usa a API XInput do Windows (funciona com qualquer controle Xbox). A ocultação e a identificação única ficam desativadas até o spike (b) ser feito com um controle real.
+
 ### 4.2 Saída virtual
 
 - **MVP:** Xbox 360 (XInput).
@@ -290,14 +300,14 @@ Logs: arquivo rotativo em `%LOCALAPPDATA%\Axis\logs`, nível `info` por padrão,
 
 ### Fase 0: spikes (código descartável, saída = resposta)
 - **(a)** ViGEm + HidHide a partir do Rust: criar Xbox 360 virtual, ocultar e mostrar um DS4, medir a latência básica, descobrir os requisitos de privilégio do HidHide.
-- **(b)** Xbox: dá para ler a entrada, ocultar e identificar de forma única por USB e Bluetooth? Decide se o Xbox entra na v0.2.
+- **(b)** Xbox: dá para ocultar e identificar de forma única por USB e Bluetooth? **Adiado até haver um controle Xbox** (ver 4.1.1).
 - **(c)** Slint: reproduzir o palco da Visão geral (ilustração, grade, chamadas, animação) com fidelidade ao design e medir a RAM e o tempo de abertura.
 
 ### MVP v0.1
-DS4 e DualSense (USB e Bluetooth) → Xbox 360 virtual · identidade e memória por controle · período de graça na desconexão · núcleo na bandeja com início automático · Visão geral com o palco e a cadeia ao vivo · Correção (drift, alcance e círculo, gatilhos) · deadzones, curvas e gatilhos · remapeamento botão → botão · perfis com exportar e importar · tema claro/escuro + destaque · metas de desempenho medidas.
+DS4 (verificado em hardware), DualSense e Xbox (experimentais até o checklist de hardware, ver 4.1.1), por USB e Bluetooth → Xbox 360 virtual · identidade e memória por controle · período de graça na desconexão · núcleo na bandeja com início automático · Visão geral com o palco e a cadeia ao vivo · Correção (drift, alcance e círculo, gatilhos) · deadzones, curvas e gatilhos · remapeamento botão → botão · perfis com exportar e importar · tema claro/escuro + destaque · metas de desempenho medidas.
 
 ### v0.2
-Xbox (se o spike b for positivo) · DS4 virtual como saída · troca automática de perfil por jogo (detecção do processo em foco) · diagnóstico de conexão completo · remapeamento de eixos e combinações.
+ocultação e identidade única do Xbox (se o spike b for positivo) · DS4 virtual como saída · troca automática de perfil por jogo (detecção do processo em foco) · diagnóstico de conexão completo · remapeamento de eixos e combinações.
 
 ### Depois
 Giroscópio (mira), touchpad como mouse, gatilhos adaptáveis e háptico do DualSense, macros, modo serviço do Windows, brilho seguindo o mouse, Linux.
