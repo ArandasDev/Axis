@@ -1,0 +1,383 @@
+global Tokens {
+    out property <color> bg: #1c1b1a;
+    out property <color> surface: #262523;
+    out property <color> surface2: #31302e;
+    out property <color> text: #ecebe6;
+    out property <color> muted: #96938c;
+    out property <color> divider: #ecebe626;
+    out property <color> grid: #ecebe60d;
+    out property <color> accent: #d97757;
+    out property <color> accent-soft: #d9775726;
+    out property <length> radius-panel: 18px;
+    out property <length> radius-btn: 11px;
+    out property <string> font-heading: "Bahnschrift";
+}
+
+component Kicker inherits Text {
+    font-size: 10px;
+    letter-spacing: 1.2px;
+    color: Tokens.accent;
+}
+
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <string> key;
+    in property <bool> active;
+    height: 38px;
+    border-radius: Tokens.radius-btn;
+    background: active ? Tokens.accent-soft : transparent;
+    border-width: active ? 1px : 0px;
+    border-color: #d9775752;
+    HorizontalLayout {
+        padding-left: 12px; padding-right: 12px; spacing: 10px;
+        Text { text: label; color: active ? Tokens.accent : Tokens.text; font-size: 14px; font-weight: 500; vertical-alignment: center; }
+        Rectangle {}
+        Text { text: key; color: Tokens.muted; font-size: 11px; vertical-alignment: center; }
+    }
+}
+
+component PadCard inherits Rectangle {
+    in property <string> owner;
+    in property <string> meta;
+    in property <color> owner-color;
+    in property <bool> active;
+    height: 54px;
+    border-radius: 14px;
+    border-width: 1px;
+    border-color: active ? #d977578c : Tokens.divider;
+    HorizontalLayout {
+        padding: 10px; spacing: 10px;
+        VerticalLayout { alignment: center; Rectangle { width: 10px; height: 10px; border-radius: 5px; background: owner-color; } }
+        VerticalLayout {
+            alignment: center; spacing: 2px;
+            Text { text: owner; color: Tokens.text; font-size: 13px; font-weight: 500; }
+            Text { text: meta; color: Tokens.muted; font-size: 11px; }
+        }
+    }
+}
+
+// Linha pontilhada horizontal (o Path do Slint não tem tracejado).
+component Dotted inherits Rectangle {
+    in property <int> dots: 20;
+    height: 1px;
+    for i in dots: Rectangle {
+        x: i * 6px; y: 0; width: 2px; height: 1px;
+        background: Tokens.muted;
+    }
+}
+
+component Callout inherits Rectangle {
+    in property <string> title;
+    in property <string> value;
+    in property <bool> right-side;
+    width: 120px; height: 34px;
+    VerticalLayout {
+        alignment: center;
+        Text { text: title; font-family: Tokens.font-heading; font-size: 15px; font-weight: 600; color: Tokens.text; horizontal-alignment: right-side ? left : right; }
+        Text { text: value; font-size: 11px; color: Tokens.muted; horizontal-alignment: right-side ? left : right; }
+    }
+}
+
+component Stick inherits Rectangle {
+    in property <float> sx;
+    in property <float> sy;
+    in property <bool> live;
+    width: 64px; height: 64px;
+    border-radius: 32px;
+    border-width: 1.5px;
+    border-color: Tokens.text;
+    Rectangle {
+        width: 44px; height: 44px; border-radius: 22px;
+        border-width: 1px; border-color: #ecebe666;
+    }
+    Rectangle {
+        x: parent.width / 2 - 5px + sx * 18px;
+        y: parent.height / 2 - 5px - sy * 18px;
+        width: 10px; height: 10px; border-radius: 5px;
+        background: Tokens.accent;
+        drop-shadow-blur: 8px; drop-shadow-color: Tokens.accent;
+    }
+}
+
+component FaceButton inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> pressed;
+    width: 26px; height: 26px; border-radius: 13px;
+    border-width: 1.5px;
+    border-color: pressed ? Tokens.accent : Tokens.text;
+    background: pressed ? Tokens.accent : transparent;
+    animate background, border-color { duration: 120ms; }
+    Text { text: glyph; font-size: 11px; color: pressed ? Tokens.bg : Tokens.text; }
+}
+
+// Ilustração em linha de um controle simétrico (aproximação do DS4).
+component Controller inherits Rectangle {
+    in property <float> lx; in property <float> ly;
+    in property <float> rx; in property <float> ry;
+    in property <float> l2; in property <float> r2;
+    in property <bool> cross;
+    width: 560px; height: 340px;
+
+    // gatilhos
+    Rectangle { x: 112px; y: 6px; width: 92px; height: 18px; border-radius: 9px; border-width: 1.5px; border-color: Tokens.text;
+        Rectangle { x: 0; width: parent.width * l2; height: parent.height; border-radius: 9px; background: Tokens.accent; } }
+    Rectangle { x: 356px; y: 6px; width: 92px; height: 18px; border-radius: 9px; border-width: 1.5px; border-color: Tokens.text;
+        Rectangle { x: 0; width: parent.width * r2; height: parent.height; border-radius: 9px; background: Tokens.accent; } }
+    Rectangle { x: 118px; y: 32px; width: 80px; height: 10px; border-radius: 5px; border-width: 1.5px; border-color: Tokens.text; }
+    Rectangle { x: 362px; y: 32px; width: 80px; height: 10px; border-radius: 5px; border-width: 1.5px; border-color: Tokens.text; }
+
+    Path {
+        width: 560px; height: 340px;
+        viewbox-width: 560; viewbox-height: 340;
+        stroke: Tokens.text; stroke-width: 1.6px;
+        commands: "M 130 62 Q 280 42 430 62 C 482 70 520 120 535 210 C 548 285 522 330 488 322 C 462 316 440 270 410 248 Q 280 226 150 248 C 120 270 98 316 72 322 C 38 330 12 285 25 210 C 40 120 78 70 130 62 Z";
+    }
+    // touchpad + barra de luz
+    Rectangle { x: 210px; y: 64px; width: 140px; height: 78px; border-radius: 10px; border-width: 1.5px; border-color: Tokens.text; }
+    Rectangle { x: 250px; y: 150px; width: 60px; height: 4px; border-radius: 2px; background: Tokens.accent; }
+    // share / options
+    Rectangle { x: 184px; y: 74px; width: 10px; height: 18px; border-radius: 5px; border-width: 1.5px; border-color: Tokens.text; }
+    Rectangle { x: 366px; y: 74px; width: 10px; height: 18px; border-radius: 5px; border-width: 1.5px; border-color: Tokens.text; }
+    // d-pad
+    Rectangle { x: 120px; y: 104px; width: 20px; height: 24px; border-radius: 4px; border-width: 1.5px; border-color: Tokens.text; }
+    Rectangle { x: 120px; y: 148px; width: 20px; height: 24px; border-radius: 4px; border-width: 1.5px; border-color: Tokens.text; }
+    Rectangle { x: 94px;  y: 128px; width: 24px; height: 20px; border-radius: 4px; border-width: 1.5px; border-color: Tokens.text; }
+    Rectangle { x: 142px; y: 128px; width: 24px; height: 20px; border-radius: 4px; border-width: 1.5px; border-color: Tokens.text; }
+    // botões de face
+    FaceButton { x: 417px; y: 96px;  glyph: "△"; }
+    FaceButton { x: 445px; y: 124px; glyph: "○"; }
+    FaceButton { x: 389px; y: 124px; glyph: "□"; }
+    FaceButton { x: 417px; y: 152px; glyph: "✕"; pressed: cross; }
+    // analógicos
+    Stick { x: 173px; y: 160px; sx: lx; sy: ly; }
+    Stick { x: 323px; y: 160px; sx: rx; sy: ry; }
+}
+
+component Plot inherits Rectangle {
+    in property <float> px; in property <float> py;
+    in property <string> label; in property <string> value;
+    VerticalLayout {
+        spacing: 6px;
+        Rectangle {
+            height: self.width;
+            border-radius: 14px; border-width: 1px; border-color: Tokens.divider;
+            Rectangle { width: 1px; height: parent.height; background: Tokens.divider; }
+            Rectangle { height: 1px; width: parent.width; background: Tokens.divider; }
+            Rectangle { width: parent.width * 0.86; height: self.width; border-radius: self.width / 2; border-width: 1px; border-color: Tokens.divider; }
+            Rectangle {
+                x: parent.width / 2 - 4px + px * parent.width * 0.43;
+                y: parent.height / 2 - 4px - py * parent.height * 0.43;
+                width: 8px; height: 8px; border-radius: 4px; background: Tokens.accent;
+            }
+        }
+        HorizontalLayout {
+            Text { text: label; font-size: 11px; color: Tokens.muted; }
+            Rectangle {}
+            Text { text: value; font-size: 11px; color: Tokens.text; }
+        }
+    }
+}
+
+component Bar inherits Rectangle {
+    in property <string> label; in property <float> v;
+    height: 16px;
+    HorizontalLayout {
+        spacing: 10px;
+        Text { text: label; width: 22px; font-size: 12px; color: Tokens.muted; vertical-alignment: center; }
+        Rectangle {
+            height: 6px; border-radius: 3px; background: Tokens.surface2;
+            Rectangle { x: 0; width: parent.width * v; height: parent.height; border-radius: 3px; background: Tokens.accent;
+                drop-shadow-blur: 6px; drop-shadow-color: #d9775799; }
+        }
+        Text { text: round(v * 100) + "%"; width: 36px; font-size: 12px; color: Tokens.text; horizontal-alignment: right; vertical-alignment: center; }
+    }
+}
+
+component Pill inherits Rectangle {
+    in property <string> label; in property <bool> on;
+    height: 22px; width: t.preferred-width + 18px;
+    border-radius: 11px; border-width: 1px;
+    border-color: on ? Tokens.accent : Tokens.divider;
+    background: on ? Tokens.accent-soft : transparent;
+    t := Text { text: label; font-size: 11px; color: on ? Tokens.accent : Tokens.text; }
+}
+
+component Stat inherits Rectangle {
+    in property <string> label; in property <string> val; in property <string> unit;
+    background: Tokens.bg;
+    VerticalLayout {
+        padding: 12px; spacing: 2px;
+        Text { text: label; font-size: 10px; letter-spacing: 1px; color: Tokens.muted; }
+        HorizontalLayout {
+            spacing: 3px; alignment: start;
+            Text { text: val; font-family: Tokens.font-heading; font-size: 26px; font-weight: 600; color: Tokens.text; }
+            Text { text: unit; font-size: 11px; color: Tokens.muted; vertical-alignment: bottom; }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    in property <float> lx; in property <float> ly;
+    in property <float> rx; in property <float> ry;
+    in property <float> l2; in property <float> r2;
+    in property <bool> cross;
+    preferred-width: 1280px; preferred-height: 800px;
+    title: "Axis — spike Slint";
+    background: Tokens.bg;
+    default-font-family: "Segoe UI";
+
+    VerticalLayout {
+        // barra de título
+        Rectangle {
+            height: 40px;
+            Rectangle { y: parent.height - 1px; height: 1px; background: Tokens.divider; }
+            HorizontalLayout {
+                padding-left: 14px; padding-right: 14px; spacing: 10px;
+                Rectangle { width: 14px; height: 14px; y: 13px; border-radius: 3px; background: Tokens.accent; }
+                Text { text: "AXIS"; font-family: Tokens.font-heading; font-weight: 600; font-size: 18px; letter-spacing: 1.8px; color: Tokens.text; vertical-alignment: center; }
+                Text { text: "Controller Bridge"; font-size: 12px; color: Tokens.muted; vertical-alignment: center; }
+                Rectangle {}
+                Rectangle { width: 7px; height: 7px; y: 16px; background: Tokens.accent; }
+                Text { text: "Barramento virtual"; font-size: 12px; color: Tokens.text; vertical-alignment: center; }
+                Text { text: "ativo · 3 controles"; font-size: 12px; color: Tokens.muted; vertical-alignment: center; }
+            }
+        }
+
+        HorizontalLayout {
+            // barra lateral
+            Rectangle {
+                width: 232px;
+                Rectangle { x: parent.width - 1px; width: 1px; background: Tokens.divider; }
+                VerticalLayout {
+                    padding: 12px; padding-top: 16px; spacing: 2px;
+                    NavItem { label: "Visão geral"; key: "1"; active: true; }
+                    NavItem { label: "Mapeamento"; key: "2"; }
+                    NavItem { label: "Correção"; key: "3"; }
+                    NavItem { label: "Perfis"; key: "4"; }
+                    Rectangle { height: 24px; }
+                    Kicker { text: "CONTROLES"; }
+                    Rectangle { height: 6px; }
+                    VerticalLayout {
+                        spacing: 8px;
+                        PadCard { owner: "Maria"; meta: "DS4 · USB · Player 1"; owner-color: #5fb37a; active: true; }
+                        PadCard { owner: "João"; meta: "DS4 · BT · Player 2 · 64%"; owner-color: #9b7ad8; }
+                        PadCard { owner: "Ana"; meta: "DS4 · BT · Player 3 · 91%"; owner-color: #e0b04a; }
+                    }
+                    Rectangle {}
+                }
+            }
+
+            // conteúdo
+            VerticalLayout {
+                padding: 26px; padding-right: 28px; spacing: 20px;
+                HorizontalLayout {
+                    VerticalLayout {
+                        spacing: 6px;
+                        Kicker { text: "DISPOSITIVO 01 · USB"; }
+                        Text { text: "Controle da Maria"; font-family: Tokens.font-heading; font-size: 38px; font-weight: 600; color: Tokens.text; }
+                        Text { text: "Emulando Xbox 360 via XInput · perfil Padrão"; font-size: 13px; color: Tokens.muted; }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 20px;
+                    // palco
+                    Rectangle {
+                        horizontal-stretch: 3;
+                        border-radius: Tokens.radius-panel; border-width: 1px; border-color: Tokens.divider;
+                        clip: true;
+                        for i in 60: Rectangle { x: i * 24px; width: 1px; height: parent.height; background: Tokens.grid; }
+                        for j in 40: Rectangle { y: j * 24px; height: 1px; width: parent.width; background: Tokens.grid; }
+                        VerticalLayout {
+                            Rectangle {
+                                height: 46px;
+                                Rectangle { y: parent.height - 1px; height: 1px; background: Tokens.divider; }
+                                HorizontalLayout {
+                                    padding-left: 16px; padding-right: 16px; spacing: 10px;
+                                    Text { text: "SAÍDA VIRTUAL"; font-family: Tokens.font-heading; font-size: 13px; font-weight: 600; letter-spacing: 1px; color: Tokens.text; vertical-alignment: center; }
+                                    Text { text: "Xbox 360"; font-size: 13px; color: Tokens.text; vertical-alignment: center; }
+                                    Pill { y: 12px; label: "XInput"; on: true; }
+                                    Rectangle {}
+                                    Rectangle { width: 8px; height: 8px; y: 19px; border-radius: 4px; background: Tokens.accent; }
+                                    Text { text: "Ao vivo"; font-size: 12px; color: Tokens.text; vertical-alignment: center; }
+                                }
+                            }
+                            Rectangle {
+                                ctl := Controller {
+                                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2 + 10px;
+                                    lx: root.lx; ly: root.ly; rx: root.rx; ry: root.ry; l2: root.l2; r2: root.r2; cross: root.cross;
+                                }
+                                // chamadas
+                                Callout { x: ctl.x - 130px; y: ctl.y - 2px; title: "L2"; value: round(root.l2 * 100) + "%"; }
+                                Dotted { x: ctl.x - 6px; y: ctl.y + 15px; dots: 19; width: 118px; }
+                                Callout { x: ctl.x + ctl.width + 10px; y: ctl.y - 2px; title: "R2"; value: round(root.r2 * 100) + "%"; right-side: true; }
+                                Dotted { x: ctl.x + 448px; y: ctl.y + 15px; dots: 19; width: 118px; }
+                                Callout { x: ctl.x - 130px; y: ctl.y + 175px; title: "Stick esquerdo"; value: (round(root.lx * 100) / 100) + "  " + (round(root.ly * 100) / 100); }
+                                Dotted { x: ctl.x - 6px; y: ctl.y + 192px; dots: 30; width: 180px; }
+                                Callout { x: ctl.x + ctl.width + 10px; y: ctl.y + 175px; title: "Stick direito"; value: (round(root.rx * 100) / 100) + "  " + (round(root.ry * 100) / 100); right-side: true; }
+                                Dotted { x: ctl.x + 388px; y: ctl.y + 192px; dots: 30; width: 180px; }
+                            }
+                            Rectangle {
+                                height: 30px;
+                                Rectangle { height: 1px; background: Tokens.divider; y: 0; }
+                                HorizontalLayout {
+                                    padding-left: 16px; padding-right: 16px;
+                                    Text { text: "SEU CONTROLE → O JOGO RECEBE"; font-size: 10px; letter-spacing: 1px; color: Tokens.muted; vertical-alignment: center; }
+                                    Rectangle {}
+                                    Text { text: "14 SAÍDAS · 0 REMAPEADAS"; font-size: 10px; letter-spacing: 1px; color: Tokens.muted; vertical-alignment: center; }
+                                }
+                            }
+                        }
+                    }
+                    // painel lateral
+                    Rectangle {
+                        horizontal-stretch: 1; min-width: 280px;
+                        border-radius: Tokens.radius-panel; border-width: 1px; border-color: Tokens.divider;
+                        clip: true;
+                        VerticalLayout {
+                            Rectangle {
+                                height: 66px; background: Tokens.divider;
+                                HorizontalLayout {
+                                    spacing: 1px; padding-bottom: 1px;
+                                    Stat { label: "LATÊNCIA"; val: "0.9"; unit: "ms"; }
+                                    Stat { label: "POLLING"; val: "1000"; unit: "Hz"; }
+                                    Stat { label: "BATERIA"; val: "—"; unit: "cabo"; }
+                                }
+                            }
+                            VerticalLayout {
+                                padding: 14px; spacing: 10px;
+                                Text { text: "STICKS"; font-family: Tokens.font-heading; font-size: 13px; font-weight: 600; letter-spacing: 1px; color: Tokens.text; }
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    Plot { px: root.lx; py: root.ly; label: "E"; value: (round(root.lx * 100) / 100) + " " + (round(root.ly * 100) / 100); }
+                                    Plot { px: root.rx; py: root.ry; label: "D"; value: (round(root.rx * 100) / 100) + " " + (round(root.ry * 100) / 100); }
+                                }
+                            }
+                            Rectangle { height: 1px; background: Tokens.divider; }
+                            VerticalLayout {
+                                padding: 14px; spacing: 10px;
+                                Text { text: "GATILHOS"; font-family: Tokens.font-heading; font-size: 13px; font-weight: 600; letter-spacing: 1px; color: Tokens.text; }
+                                Bar { label: "L2"; v: root.l2; }
+                                Bar { label: "R2"; v: root.r2; }
+                            }
+                            Rectangle { height: 1px; background: Tokens.divider; }
+                            VerticalLayout {
+                                padding: 14px; spacing: 10px;
+                                Text { text: "CADEIA DO STICK ESQUERDO"; font-family: Tokens.font-heading; font-size: 13px; font-weight: 600; letter-spacing: 1px; color: Tokens.text; }
+                                HorizontalLayout { spacing: 6px; alignment: start;
+                                    Pill { label: "calibração"; }
+                                    Pill { label: "drift −4%"; on: true; }
+                                    Pill { label: "deadzone 5%"; }
+                                }
+                                HorizontalLayout { spacing: 6px; alignment: start;
+                                    Pill { label: "curva"; }
+                                    Pill { label: "anti 10%"; on: true; }
+                                }
+                            }
+                            Rectangle {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,20 @@
+# SPIKE (Fase 0, c) — código descartável. Não faz parte do workspace.
+[package]
+name = "slint-stage-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+slint = "1.18"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[build-dependencies]
+slint-build = "1.18"
