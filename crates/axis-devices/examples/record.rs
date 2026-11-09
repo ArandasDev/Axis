@@ -1,7 +1,7 @@
 //! Grava pacotes crus do primeiro controle HID: `record <segundos> <arquivo.rec>`.
 
 use axis_core::DeviceFamily;
-use axis_devices::{Frame, Recording, Transport, enumerate_hid};
+use axis_devices::{Frame, OutputState, Recording, Transport, ds4, enumerate_hid};
 use hidapi::HidApi;
 use std::ffi::CString;
 use std::time::{Duration, Instant};
@@ -28,6 +28,21 @@ fn main() {
             eprintln!("aviso: feature report 0x05 falhou: {e}");
         }
     }
+    // Sinal visual no DS4: vermelho = prepare-se (5 s), verde = gravando, azul fraco = fim.
+    let light = |rgb: [u8; 3]| {
+        if c.family == DeviceFamily::DualShock4 {
+            let out = OutputState {
+                lightbar: rgb,
+                ..Default::default()
+            };
+            let _ = dev.write(&ds4::output_report(c.transport, &out));
+        }
+    };
+    light([255, 0, 0]);
+    println!("prepare-se: a gravação começa em 5 s (lightbar vermelha)");
+    std::thread::sleep(Duration::from_secs(5));
+    light([0, 255, 0]);
+    println!("gravando por {secs} s (lightbar verde)");
     let start = Instant::now();
     let limit = Duration::from_secs(secs);
     let mut frames = Vec::new();
@@ -45,6 +60,7 @@ fn main() {
             }
         }
     }
+    light([0, 0, 64]);
     let rec = Recording {
         family: c.family,
         transport: c.transport,
