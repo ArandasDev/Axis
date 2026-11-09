@@ -11,6 +11,9 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
+# Brainstorm companion
+.superpowers/
+
 # Local env
 .env
 *.local.toml

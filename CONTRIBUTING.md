@@ -12,7 +12,8 @@
   - `test/<descricao>`: testes
   - `chore/<descricao>`: manutenção, build, dependências
 - Nomes em kebab-case, curtos: `feat/dualsense-hid-reader`.
-- Integração em `main` via Pull Request.
+- Integração em `main` por merge local (`git merge --no-ff`) seguido de push. Sem Pull Requests:
+  o projeto tem um único autor.
 
 ## Commits
 
