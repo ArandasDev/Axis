@@ -93,3 +93,175 @@ impl VirtualPad for FakePad {
         0
     }
 }
+
+// ---- Falsos do gerente ----
+
+use axis_devices::HidCandidate;
+use axis_virtual::{DeviceHider, HideError, RumbleSink, VirtualBus};
+
+use crate::manager::Event;
+use crate::ports::{ControllerOpener, Notifier, Scheduler};
+
+pub(crate) type Log = Arc<Mutex<Vec<String>>>;
+
+/// Dados compartilhados entre o teste e o `FakeOpener` entregue ao gerente.
+#[derive(Default)]
+pub(crate) struct OpenerState {
+    pub candidates: Vec<HidCandidate>,
+    /// Controle (id) a devolver por path.
+    pub ids: Vec<(String, String)>,
+    pub writes: Vec<(String, Arc<Mutex<Vec<OutputState>>>)>,
+    pub opened: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct FakeOpener {
+    pub state: Arc<Mutex<OpenerState>>,
+}
+
+impl FakeOpener {
+    pub(crate) fn add(&self, path: &str, id: &str) {
+        let mut s = self.state.lock().unwrap();
+        s.candidates.push(HidCandidate {
+            path: path.to_string(),
+            family: DeviceFamily::DualShock4,
+            transport: Transport::Usb,
+            serial: None,
+        });
+        s.ids.push((path.to_string(), id.to_string()));
+    }
+
+    pub(crate) fn writes_of(&self, path: &str) -> Arc<Mutex<Vec<OutputState>>> {
+        let s = self.state.lock().unwrap();
+        s.writes
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, w)| w.clone())
+            .expect("controle ainda não aberto")
+    }
+}
+
+impl ControllerOpener for FakeOpener {
+    fn enumerate(&mut self) -> Vec<HidCandidate> {
+        self.state.lock().unwrap().candidates.clone()
+    }
+
+    fn open(&mut self, c: &HidCandidate) -> Result<Box<dyn Controller>, DeviceError> {
+        let mut s = self.state.lock().unwrap();
+        let id = s
+            .ids
+            .iter()
+            .find(|(p, _)| *p == c.path)
+            .map(|(_, id)| id.clone())
+            .ok_or_else(|| DeviceError::Hid("path desconhecido".to_string()))?;
+        let mut ctl = FakeController::new(vec![]);
+        ctl.id = id;
+        s.writes.push((c.path.clone(), ctl.writes.clone()));
+        s.opened.push(c.path.clone());
+        Ok(Box::new(ctl))
+    }
+}
+
+/// Barramento falso: registra "plug" no log compartilhado e conta virtuais vivos.
+pub(crate) struct FakeBus {
+    pub log: Log,
+    pub live: Arc<std::sync::atomic::AtomicUsize>,
+    pub next_index: std::sync::atomic::AtomicU32,
+}
+
+impl FakeBus {
+    pub(crate) fn new(log: Log) -> Self {
+        Self {
+            log,
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            next_index: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+struct FakeBusPad {
+    index: u32,
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl VirtualPad for FakeBusPad {
+    fn update(&mut self, _input: &InputState) -> Result<(), VirtualError> {
+        Ok(())
+    }
+    fn user_index(&self) -> u32 {
+        self.index
+    }
+}
+
+impl Drop for FakeBusPad {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl VirtualBus for FakeBus {
+    fn plug_x360(&self, _on_rumble: RumbleSink) -> Result<Box<dyn VirtualPad>, VirtualError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.log.lock().unwrap().push("plug".to_string());
+        self.live.fetch_add(1, SeqCst);
+        Ok(Box::new(FakeBusPad {
+            index: self.next_index.fetch_add(1, SeqCst),
+            live: self.live.clone(),
+        }))
+    }
+}
+
+pub(crate) struct FakeHider {
+    pub log: Log,
+    pub fail: bool,
+}
+
+impl DeviceHider for FakeHider {
+    fn hide(&self, instance_id: &str) -> Result<(), HideError> {
+        self.log.lock().unwrap().push(format!("hide:{instance_id}"));
+        if self.fail {
+            Err(HideError::Win32(5))
+        } else {
+            Ok(())
+        }
+    }
+    fn unhide(&self, instance_id: &str) -> Result<(), HideError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("unhide:{instance_id}"));
+        Ok(())
+    }
+    fn unhide_all(&self, instance_ids: &[String]) -> Result<(), HideError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("unhide_all:{}", instance_ids.join(",")));
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct FakeNotifier {
+    pub messages: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl Notifier for FakeNotifier {
+    fn notify(&self, title: &str, body: &str) {
+        self.messages
+            .lock()
+            .unwrap()
+            .push((title.to_string(), body.to_string()));
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct FakeScheduler {
+    pub scheduled: Arc<Mutex<Vec<(Duration, Event)>>>,
+}
+
+impl Scheduler for FakeScheduler {
+    fn after(&self, delay: Duration, event: Event) {
+        self.scheduled.lock().unwrap().push((delay, event));
+    }
+}

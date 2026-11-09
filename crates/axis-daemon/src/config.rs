@@ -127,6 +127,10 @@ impl ConfigStore {
         }
     }
 
+    pub fn paths(&self) -> &AppPaths {
+        &self.paths
+    }
+
     fn notify(&self, msg: String) {
         self.notices
             .lock()

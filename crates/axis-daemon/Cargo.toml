@@ -18,3 +18,4 @@ toml.workspace = true
 axis-devices = { path = "../axis-devices" }
 axis-virtual = { path = "../axis-virtual" }
 log.workspace = true
+hidapi.workspace = true

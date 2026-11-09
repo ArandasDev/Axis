@@ -47,6 +47,7 @@ dependencies = [
  "axis-core",
  "axis-devices",
  "axis-virtual",
+ "hidapi",
  "log",
  "serde",
  "toml",
