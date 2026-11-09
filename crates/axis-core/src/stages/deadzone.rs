@@ -26,6 +26,12 @@ pub(crate) fn shape(m: f32, inner: f32, outer: f32, anti: f32) -> f32 {
     anti + (1.0 - anti) * t
 }
 
+/// Axial helper: shapes `|c|` and restores the sign; yields +0.0 when shaped to zero.
+fn signed_shape(c: f32, p: &DeadzoneParams) -> f32 {
+    let s = shape(c.abs(), p.inner, p.outer, p.anti);
+    if s == 0.0 { 0.0 } else { s.copysign(c) }
+}
+
 pub fn deadzone(v: Vec2, p: &DeadzoneParams) -> Vec2 {
     match p.mode {
         DeadzoneMode::Radial => {
@@ -36,8 +42,8 @@ pub fn deadzone(v: Vec2, p: &DeadzoneParams) -> Vec2 {
             v.scale(shape(m, p.inner, p.outer, p.anti) / m)
         }
         DeadzoneMode::Axial => Vec2 {
-            x: shape(v.x.abs(), p.inner, p.outer, p.anti).copysign(v.x),
-            y: shape(v.y.abs(), p.inner, p.outer, p.anti).copysign(v.y),
+            x: signed_shape(v.x, p),
+            y: signed_shape(v.y, p),
         },
     }
 }
@@ -87,5 +93,17 @@ mod tests {
         let out = deadzone(Vec2 { x: -0.55, y: 0.05 }, &p);
         assert!((out.x + 0.5).abs() < 1e-5);
         assert_eq!(out.y, 0.0);
+    }
+
+    #[test]
+    fn axial_inside_inner_is_positive_zero() {
+        let p = DeadzoneParams {
+            mode: DeadzoneMode::Axial,
+            inner: 0.1,
+            outer: 1.0,
+            anti: 0.0,
+        };
+        let out = deadzone(Vec2 { x: -0.05, y: -0.05 }, &p);
+        assert!(out.x.to_bits() == 0 && out.y.to_bits() == 0);
     }
 }
