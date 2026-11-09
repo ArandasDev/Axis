@@ -176,15 +176,16 @@ Motivo: a correção é sobre o **hardware** e acompanha o controle. A preferên
 ### 6.1 Ordem fixa por analógico
 
 ```
-cru → calibração → drift → deadzone → curva → remapeamento → saída
+cru → calibração → drift → deadzone → curva → anti-deadzone → saída   (remapeamento: botões)
 ```
 
 | Etapa | Parâmetros |
 |---|---|
 | Calibração | offset de centro (x, y); alcance por direção (4 valores); correção de circularidade |
 | Drift | raio de compensação central derivado do ruído medido |
-| Deadzone | interna, externa, anti-deadzone; modo radial ou por eixo |
-| Curva | linear, exponencial (expoente) ou por pontos (spline monotônica) |
+| Deadzone | interna, externa; modo radial ou por eixo |
+| Curva | linear, exponencial (expoente) ou por pontos (spline monotônica; o MVP usa interpolação linear entre os pontos) |
+| Anti-deadzone | piso mínimo de saída: magnitude `m > 0` vira `anti + (1 − anti)·m`. Aplicada **depois** da curva, para que o valor configurado seja exatamente o menor valor que o jogo recebe (decisão de 2026-11-09) |
 | Remapeamento | tabela entrada → saída (MVP: botão → botão; eixos e combinações na v0.2) |
 
 **Gatilhos:** calibração (repouso, máximo) → deadzone → curva → hair trigger opcional (limiar → digital).

@@ -4,6 +4,7 @@ use crate::settings::{
     Corrections, CurveSpec, DeadzoneSpec, Profile, StickCorrection, TriggerCalibration,
     TriggerSettings,
 };
+use crate::stages::anti::anti_deadzone;
 use crate::stages::calibration::{CalibrationParams, calibrate};
 use crate::stages::curve::{CurveParams, MAX_CURVE_POINTS, curve_stick};
 use crate::stages::deadzone::{DeadzoneParams, deadzone};
@@ -17,6 +18,7 @@ struct StickPipeline {
     drift: f32,
     deadzone: DeadzoneParams,
     curve: CurveParams,
+    anti: f32,
 }
 
 /// Compiled, allocation-free per-packet adjustment pipeline.
@@ -37,6 +39,7 @@ pub struct StickTrace {
     pub drift: Vec2,
     pub deadzone: Vec2,
     pub curve: Vec2,
+    pub anti: Vec2,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -76,9 +79,9 @@ fn compile_stick(c: &StickCorrection, d: &DeadzoneSpec, curve: &CurveSpec) -> St
             mode: d.mode,
             inner: d.inner,
             outer: d.outer,
-            anti: d.anti,
         },
         curve: compile_curve(curve),
+        anti: d.anti,
     }
 }
 
@@ -108,14 +111,16 @@ impl StickPipeline {
         let calibrated = calibrate(raw, &self.calibration);
         let drifted = drift(calibrated, self.drift);
         let dead = deadzone(drifted, &self.deadzone);
-        let out = curve_stick(dead, &self.curve);
+        let curved = curve_stick(dead, &self.curve);
+        let out = anti_deadzone(curved, self.anti);
         if let Some(t) = trace {
             *t = StickTrace {
                 raw,
                 calibrated,
                 drift: drifted,
                 deadzone: dead,
-                curve: out,
+                curve: curved,
+                anti: out,
             };
         }
         out
@@ -214,8 +219,27 @@ mod tests {
         let (o, t) = pl.process_traced(&i);
         assert_eq!(t.left.raw, i.left);
         assert!(t.left.drift.x < t.left.calibrated.x);
-        assert_eq!(t.left.curve, o.left);
+        assert_eq!(t.left.anti, o.left);
         assert_eq!(pl.process(&i), o);
+    }
+
+    #[test]
+    fn anti_deadzone_is_the_output_floor_after_the_curve() {
+        let mut p = Profile::default();
+        p.left_stick.deadzone.inner = 0.05;
+        p.left_stick.deadzone.outer = 1.0;
+        p.left_stick.deadzone.anti = 0.2;
+        p.left_stick.curve = CurveSpec::Exponent { e: 2.0 };
+        let pl = Pipeline::compile(&Corrections::default(), &p).unwrap();
+        let mut i = InputState::default();
+        i.left = Vec2 { x: 0.06, y: 0.0 };
+        let (o, t) = pl.process_traced(&i);
+        assert!(o.left.x >= 0.2 && o.left.x < 0.21, "got {}", o.left.x);
+        assert!(
+            t.left.curve.x < 0.01,
+            "curve must see no anti: {}",
+            t.left.curve.x
+        );
     }
 
     #[test]

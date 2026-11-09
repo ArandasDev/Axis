@@ -8,27 +8,27 @@ pub enum DeadzoneMode {
     Axial,
 }
 
+/// Inner/outer deadzone. The anti-deadzone is a separate stage applied after
+/// the response curve (see `stages::anti`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeadzoneParams {
     pub mode: DeadzoneMode,
     pub inner: f32,
     pub outer: f32,
-    pub anti: f32,
 }
 
-/// Maps a magnitude `m >= 0` through inner/outer deadzone with anti-deadzone.
+/// Maps a magnitude `m >= 0` through the inner/outer deadzone onto [0, 1].
 /// Precondition: `inner < outer` (guaranteed by validation).
-pub(crate) fn shape(m: f32, inner: f32, outer: f32, anti: f32) -> f32 {
+pub(crate) fn shape(m: f32, inner: f32, outer: f32) -> f32 {
     if m <= inner {
         return 0.0;
     }
-    let t = ((m - inner) / (outer - inner)).clamp(0.0, 1.0);
-    anti + (1.0 - anti) * t
+    ((m - inner) / (outer - inner)).clamp(0.0, 1.0)
 }
 
 /// Axial helper: shapes `|c|` and restores the sign; yields +0.0 when shaped to zero.
 fn signed_shape(c: f32, p: &DeadzoneParams) -> f32 {
-    let s = shape(c.abs(), p.inner, p.outer, p.anti);
+    let s = shape(c.abs(), p.inner, p.outer);
     if s == 0.0 { 0.0 } else { s.copysign(c) }
 }
 
@@ -39,7 +39,7 @@ pub fn deadzone(v: Vec2, p: &DeadzoneParams) -> Vec2 {
             if m == 0.0 {
                 return Vec2::default();
             }
-            v.scale(shape(m, p.inner, p.outer, p.anti) / m)
+            v.scale(shape(m, p.inner, p.outer) / m)
         }
         DeadzoneMode::Axial => Vec2 {
             x: signed_shape(v.x, p),
@@ -51,35 +51,33 @@ pub fn deadzone(v: Vec2, p: &DeadzoneParams) -> Vec2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::Vec2;
 
-    fn radial(inner: f32, outer: f32, anti: f32) -> DeadzoneParams {
+    fn radial(inner: f32, outer: f32) -> DeadzoneParams {
         DeadzoneParams {
             mode: DeadzoneMode::Radial,
             inner,
             outer,
-            anti,
         }
     }
 
     #[test]
     fn inside_inner_is_exactly_zero() {
         assert_eq!(
-            deadzone(Vec2 { x: 0.03, y: 0.03 }, &radial(0.05, 1.0, 0.0)),
+            deadzone(Vec2 { x: 0.03, y: 0.03 }, &radial(0.05, 1.0)),
             Vec2::default()
         );
     }
 
     #[test]
     fn outer_saturates_to_full() {
-        let out = deadzone(Vec2 { x: 0.95, y: 0.0 }, &radial(0.05, 0.9, 0.0));
+        let out = deadzone(Vec2 { x: 0.95, y: 0.0 }, &radial(0.05, 0.9));
         assert!((out.x - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn anti_deadzone_jumps_to_minimum_just_outside_inner() {
-        let out = deadzone(Vec2 { x: 0.0501, y: 0.0 }, &radial(0.05, 1.0, 0.2));
-        assert!(out.x >= 0.2 && out.x < 0.21);
+    fn just_outside_inner_starts_near_zero() {
+        let out = deadzone(Vec2 { x: 0.0501, y: 0.0 }, &radial(0.05, 1.0));
+        assert!(out.x > 0.0 && out.x < 0.001);
     }
 
     #[test]
@@ -88,7 +86,6 @@ mod tests {
             mode: DeadzoneMode::Axial,
             inner: 0.1,
             outer: 1.0,
-            anti: 0.0,
         };
         let out = deadzone(Vec2 { x: -0.55, y: 0.05 }, &p);
         assert!((out.x + 0.5).abs() < 1e-5);
@@ -101,7 +98,6 @@ mod tests {
             mode: DeadzoneMode::Axial,
             inner: 0.1,
             outer: 1.0,
-            anti: 0.0,
         };
         let out = deadzone(Vec2 { x: -0.05, y: -0.05 }, &p);
         assert!(out.x.to_bits() == 0 && out.y.to_bits() == 0);
