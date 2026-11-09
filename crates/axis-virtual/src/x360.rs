@@ -2,6 +2,7 @@ use axis_core::{Button, InputState};
 use vigem_client::{XButtons, XGamepad};
 
 use std::thread::JoinHandle;
+use std::time::Duration;
 use vigem_client::{Client, TargetId, Xbox360Wired};
 
 use crate::{Rumble, RumbleSink, VirtualBus, VirtualError, VirtualPad};
@@ -18,18 +19,51 @@ pub(crate) fn map_vigem_error(e: vigem_client::Error) -> VirtualError {
 /// `ERROR_NO_MORE_ITEMS`: o driver/XInput ainda não terminou de preparar o virtual recém-criado
 /// (índice de jogador ou primeiros reports); basta tentar de novo em instantes.
 const NOT_READY_YET: u32 = 259;
+/// Tentativas máximas do aquecimento no plug (cada uma espera `WARMUP_INTERVAL`).
+const WARMUP_MAX_TRIES: u32 = 100;
+const WARMUP_INTERVAL: Duration = Duration::from_millis(20);
 
-fn read_user_index(target: &mut Xbox360Wired<Client>) -> Result<u32, VirtualError> {
+/// Repete `op` enquanto o driver responde "ainda não pronto"; só usado no plug.
+fn retry_not_ready<T>(
+    mut op: impl FnMut() -> Result<T, vigem_client::Error>,
+) -> Result<T, VirtualError> {
     let mut tries = 0;
     loop {
-        match target.get_user_index() {
-            Err(vigem_client::Error::WinError(NOT_READY_YET)) if tries < 100 => {
+        match op() {
+            Err(vigem_client::Error::WinError(NOT_READY_YET)) if tries < WARMUP_MAX_TRIES => {
                 tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(WARMUP_INTERVAL);
             }
             other => return other.map_err(map_vigem_error),
         }
     }
+}
+
+/// Reports neutros bem-sucedidos seguidos exigidos para considerar o virtual aquecido
+/// (logo após o plug o driver recusa os primeiros reports com `NOT_READY_YET`); ímpar para o último report enviado ser o neutro.
+const WARMUP_OK_STREAK: u32 = 5;
+
+/// Envia reports alternados (o último é neutro) até `WARMUP_OK_STREAK` sucessos seguidos; só usado no plug.
+fn warm_up(target: &mut Xbox360Wired<Client>) -> Result<(), VirtualError> {
+    let mut streak = 0;
+    let mut tries = 0;
+    while streak < WARMUP_OK_STREAK {
+        // Alterna o report: o driver só recusa o primeiro report que muda o estado.
+        let report = XGamepad {
+            thumb_lx: (streak % 2) as i16,
+            ..XGamepad::default()
+        };
+        match target.update(&report) {
+            Ok(()) => streak += 1,
+            Err(vigem_client::Error::WinError(NOT_READY_YET)) if tries < WARMUP_MAX_TRIES => {
+                streak = 0;
+                tries += 1;
+                std::thread::sleep(WARMUP_INTERVAL);
+            }
+            Err(e) => return Err(map_vigem_error(e)),
+        }
+    }
+    Ok(())
 }
 
 /// Barramento ViGEmBus. Cada virtual abre seu próprio cliente.
@@ -49,7 +83,9 @@ impl VirtualBus for ViGEmBus {
         let mut target = Xbox360Wired::new(client, TargetId::XBOX360_WIRED);
         target.plugin().map_err(map_vigem_error)?;
         target.wait_ready().map_err(map_vigem_error)?;
-        let user_index = read_user_index(&mut target)?;
+        // Todo o aquecimento acontece aqui, fora do caminho crítico de `update`.
+        let user_index = retry_not_ready(|| target.get_user_index())?;
+        warm_up(&mut target)?;
         // Sem notificação o virtual continua funcionando, só sem vibração.
         let notifier = target.request_notification().ok().map(|req| {
             req.spawn_thread(move |_req, n| {
@@ -75,17 +111,9 @@ struct ViGEmX360 {
 
 impl VirtualPad for ViGEmX360 {
     fn update(&mut self, input: &InputState) -> Result<(), VirtualError> {
-        let report = to_xgamepad(input);
-        let mut tries = 0;
-        loop {
-            match self.target.update(&report) {
-                Err(vigem_client::Error::WinError(NOT_READY_YET)) if tries < 50 => {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                other => return other.map_err(map_vigem_error),
-            }
-        }
+        self.target
+            .update(&to_xgamepad(input))
+            .map_err(map_vigem_error)
     }
 
     fn user_index(&self) -> u32 {
@@ -95,10 +123,12 @@ impl VirtualPad for ViGEmX360 {
 
 impl Drop for ViGEmX360 {
     fn drop(&mut self) {
-        // O unplug vem antes do join: a thread de notificação só termina
-        // depois que o alvo sai do barramento.
-        let _ = self.target.unplug();
-        if let Some(handle) = self.notifier.take() {
+        // O unplug vem antes do join: a thread de notificação só termina depois
+        // que o alvo sai do barramento. Se o unplug falhar ela continuaria
+        // bloqueada, então nesse caso o handle é solto sem join.
+        if self.target.unplug().is_ok()
+            && let Some(handle) = self.notifier.take()
+        {
             let _ = handle.join();
         }
     }

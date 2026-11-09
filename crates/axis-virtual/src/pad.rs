@@ -23,8 +23,11 @@ pub trait VirtualPad: Send {
     fn user_index(&self) -> u32;
 }
 
+/// Chamado na thread de notificação do barramento, que o `Drop` do virtual aguarda
+/// com `join`: nunca deve bloquear.
 pub type RumbleSink = Box<dyn FnMut(Rumble) + Send>;
 
 pub trait VirtualBus: Send + Sync {
+    /// `on_rumble` roda na thread de notificação e nunca deve bloquear (o `Drop` do pad a aguarda).
     fn plug_x360(&self, on_rumble: RumbleSink) -> Result<Box<dyn VirtualPad>, VirtualError>;
 }
