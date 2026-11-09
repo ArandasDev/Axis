@@ -3,6 +3,7 @@
 mod classify;
 mod crc;
 pub mod ds4;
+pub mod dualsense;
 mod identity;
 mod types;
 

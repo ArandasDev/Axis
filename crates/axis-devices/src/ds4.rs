@@ -18,16 +18,9 @@ pub(crate) fn trigger_u8(v: u8) -> f32 {
     v as f32 / 255.0
 }
 
-/// Decodifica um report de entrada (`0x01` USB/BT reduzido, `0x11` BT completo).
-pub fn parse(buf: &[u8]) -> Option<Report> {
-    let (d, has_battery) = match *buf.first()? {
-        0x01 if buf.len() >= 10 => (&buf[1..], buf.len() >= 31),
-        0x11 if buf.len() >= 33 => (&buf[3..], true),
-        _ => return None,
-    };
-
-    let mut buttons = Buttons::default();
-    let (up, right, down, left) = match d[4] & 0x0F {
+/// Decodifica o nibble do d-pad (0 = cima, sentido horário; 8+ = solto) em botões.
+pub(crate) fn dpad_buttons(nibble: u8, buttons: &mut Buttons) {
+    let (up, right, down, left) = match nibble {
         0 => (true, false, false, false),
         1 => (true, true, false, false),
         2 => (false, true, false, false),
@@ -42,6 +35,18 @@ pub fn parse(buf: &[u8]) -> Option<Report> {
     buttons.set(Button::DpadRight, right);
     buttons.set(Button::DpadDown, down);
     buttons.set(Button::DpadLeft, left);
+}
+
+/// Decodifica um report de entrada (`0x01` USB/BT reduzido, `0x11` BT completo).
+pub fn parse(buf: &[u8]) -> Option<Report> {
+    let (d, has_battery) = match *buf.first()? {
+        0x01 if buf.len() >= 10 => (&buf[1..], buf.len() >= 31),
+        0x11 if buf.len() >= 33 => (&buf[3..], true),
+        _ => return None,
+    };
+
+    let mut buttons = Buttons::default();
+    dpad_buttons(d[4] & 0x0F, &mut buttons);
     for (mask, b) in [
         (0x10, Button::West),
         (0x20, Button::South),
