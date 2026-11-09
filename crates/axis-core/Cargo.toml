@@ -1,0 +1,18 @@
+[package]
+name = "axis-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "pipeline"
+harness = false
