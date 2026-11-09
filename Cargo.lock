@@ -56,6 +56,7 @@ version = "0.1.0"
 dependencies = [
  "axis-core",
  "axis-devices",
+ "hidapi",
  "thiserror",
  "vigem-client",
  "windows-sys",
