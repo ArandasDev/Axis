@@ -1,8 +1,8 @@
 //! Controle HID (DS4/DualSense) sobre hidapi.
 
 use crate::{
-    Controller, DeviceError, HidInfo, OutputState, Report, Transport, classify, ds4, dualsense,
-    resolve_identity,
+    Controller, DeviceError, DeviceStatus, HidInfo, OutputState, Report, Transport, classify, ds4,
+    dualsense, resolve_identity,
 };
 use axis_core::DeviceFamily;
 use hidapi::{BusType, HidApi, HidDevice};
@@ -129,6 +129,21 @@ impl HidController {
     }
 }
 
+/// Reports DS4 `0x01` via Bluetooth são completados pelo Windows até 128 bytes
+/// e não trazem bateria real; descarta o status para evitar 0% falso.
+pub(crate) fn sanitize_status(
+    family: DeviceFamily,
+    transport: Transport,
+    report_id: u8,
+    mut report: Report,
+) -> Report {
+    if family == DeviceFamily::DualShock4 && transport == Transport::Bluetooth && report_id == 0x01
+    {
+        report.status = DeviceStatus::default();
+    }
+    report
+}
+
 impl Controller for HidController {
     fn id(&self) -> &str {
         &self.id
@@ -158,7 +173,12 @@ impl Controller for HidController {
             if n > 0
                 && let Some(r) = self.parse(n)
             {
-                return Ok(Some(r));
+                return Ok(Some(sanitize_status(
+                    self.family,
+                    self.transport,
+                    self.buf[0],
+                    r,
+                )));
             }
             if Instant::now() >= deadline {
                 return Ok(None);
@@ -255,5 +275,28 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+    }
+
+    #[test]
+    fn ds4_bt_reduced_report_has_no_battery() {
+        let r = Report {
+            status: DeviceStatus {
+                battery_percent: Some(0),
+                charging: false,
+            },
+            ..Report::default()
+        };
+        assert_eq!(
+            sanitize_status(DeviceFamily::DualShock4, Transport::Bluetooth, 0x01, r).status,
+            DeviceStatus::default()
+        );
+        assert_eq!(
+            sanitize_status(DeviceFamily::DualShock4, Transport::Bluetooth, 0x11, r).status,
+            r.status
+        );
+        assert_eq!(
+            sanitize_status(DeviceFamily::DualShock4, Transport::Usb, 0x01, r).status,
+            r.status
+        );
     }
 }

@@ -20,4 +20,4 @@ pub use hotplug::{HotplugEvent, HotplugWatcher};
 pub use identity::{fallback_id, format_mac, is_usable_mac, parse_serial_mac, resolve_identity};
 pub use recording::{Frame, Recording, RecordingError, parse_frame};
 pub use types::{DeviceError, DeviceStatus, OutputState, Report, Transport};
-pub use xinput::{XInputController, available_slots};
+pub use xinput::{XInputController, available_slots, xinput_is_connected};

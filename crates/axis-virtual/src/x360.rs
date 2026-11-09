@@ -1,6 +1,109 @@
 use axis_core::{Button, InputState};
 use vigem_client::{XButtons, XGamepad};
 
+use std::thread::JoinHandle;
+use vigem_client::{Client, TargetId, Xbox360Wired};
+
+use crate::{Rumble, RumbleSink, VirtualBus, VirtualError, VirtualPad};
+
+/// Traduz erros do vigem-client para o erro da camada virtual.
+pub(crate) fn map_vigem_error(e: vigem_client::Error) -> VirtualError {
+    match e {
+        vigem_client::Error::BusNotFound => VirtualError::BusNotFound,
+        vigem_client::Error::NoFreeSlot => VirtualError::NoFreeSlot,
+        other => VirtualError::Bus(other.to_string()),
+    }
+}
+
+/// `ERROR_NO_MORE_ITEMS`: o driver/XInput ainda não terminou de preparar o virtual recém-criado
+/// (índice de jogador ou primeiros reports); basta tentar de novo em instantes.
+const NOT_READY_YET: u32 = 259;
+
+fn read_user_index(target: &mut Xbox360Wired<Client>) -> Result<u32, VirtualError> {
+    let mut tries = 0;
+    loop {
+        match target.get_user_index() {
+            Err(vigem_client::Error::WinError(NOT_READY_YET)) if tries < 100 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other.map_err(map_vigem_error),
+        }
+    }
+}
+
+/// Barramento ViGEmBus. Cada virtual abre seu próprio cliente.
+pub struct ViGEmBus;
+
+impl ViGEmBus {
+    /// Verifica que o ViGEmBus está instalado conectando uma vez.
+    pub fn connect() -> Result<ViGEmBus, VirtualError> {
+        Client::connect().map_err(map_vigem_error)?;
+        Ok(ViGEmBus)
+    }
+}
+
+impl VirtualBus for ViGEmBus {
+    fn plug_x360(&self, mut on_rumble: RumbleSink) -> Result<Box<dyn VirtualPad>, VirtualError> {
+        let client = Client::connect().map_err(map_vigem_error)?;
+        let mut target = Xbox360Wired::new(client, TargetId::XBOX360_WIRED);
+        target.plugin().map_err(map_vigem_error)?;
+        target.wait_ready().map_err(map_vigem_error)?;
+        let user_index = read_user_index(&mut target)?;
+        // Sem notificação o virtual continua funcionando, só sem vibração.
+        let notifier = target.request_notification().ok().map(|req| {
+            req.spawn_thread(move |_req, n| {
+                on_rumble(Rumble {
+                    strong: n.large_motor,
+                    weak: n.small_motor,
+                });
+            })
+        });
+        Ok(Box::new(ViGEmX360 {
+            target,
+            user_index,
+            notifier,
+        }))
+    }
+}
+
+struct ViGEmX360 {
+    target: Xbox360Wired<Client>,
+    user_index: u32,
+    notifier: Option<JoinHandle<()>>,
+}
+
+impl VirtualPad for ViGEmX360 {
+    fn update(&mut self, input: &InputState) -> Result<(), VirtualError> {
+        let report = to_xgamepad(input);
+        let mut tries = 0;
+        loop {
+            match self.target.update(&report) {
+                Err(vigem_client::Error::WinError(NOT_READY_YET)) if tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => return other.map_err(map_vigem_error),
+            }
+        }
+    }
+
+    fn user_index(&self) -> u32 {
+        self.user_index
+    }
+}
+
+impl Drop for ViGEmX360 {
+    fn drop(&mut self) {
+        // O unplug vem antes do join: a thread de notificação só termina
+        // depois que o alvo sai do barramento.
+        let _ = self.target.unplug();
+        if let Some(handle) = self.notifier.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn axis(v: f32) -> i16 {
     (v.clamp(-1.0, 1.0) * 32767.0).round() as i16
 }
@@ -112,5 +215,45 @@ mod tests {
         };
         let g = to_xgamepad(&i);
         assert_eq!((g.thumb_lx, g.left_trigger), (32767, 0));
+    }
+}
+
+#[cfg(test)]
+mod vigem_tests {
+    use super::*;
+    use crate::VirtualBus;
+    use axis_core::InputState;
+
+    #[test]
+    fn vigem_errors_are_mapped() {
+        assert!(matches!(
+            map_vigem_error(vigem_client::Error::BusNotFound),
+            VirtualError::BusNotFound
+        ));
+        assert!(matches!(
+            map_vigem_error(vigem_client::Error::NoFreeSlot),
+            VirtualError::NoFreeSlot
+        ));
+        assert!(matches!(
+            map_vigem_error(vigem_client::Error::WinError(5)),
+            VirtualError::Bus(_)
+        ));
+    }
+
+    #[test]
+    #[ignore = "hardware: ViGEmBus instalado"]
+    fn plugs_a_virtual_pad_visible_in_xinput_and_unplugs_on_drop() {
+        let bus = ViGEmBus::connect().unwrap();
+        let mut pad = bus.plug_x360(Box::new(|_| {})).unwrap();
+        let slot = pad.user_index();
+        assert!(slot < 4);
+        let mut i = InputState::default();
+        i.left.x = 1.0;
+        pad.update(&i).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(axis_devices::xinput_is_connected(slot));
+        drop(pad);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!axis_devices::xinput_is_connected(slot));
     }
 }
