@@ -250,6 +250,11 @@ export component App inherits Window {
 
     title: "Axis";
     no-frame: true;
+    // Sem moldura do sistema, o Windows não acha as bordas: o winit da Slint
+    // redimensiona pela faixa invisível nas bordas (cursor de redimensionar e
+    // arraste com o botão esquerdo). Maximizada (por qualquer caminho, o
+    // `maximized` da janela acompanha o winit), sem faixa.
+    resize-border-width: self.maximized ? 0px : Tokens.resize-border;
     background: Tokens.bg;
     default-font-family: Tokens.font-body;
     preferred-width: 1100px;

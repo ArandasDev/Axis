@@ -124,7 +124,8 @@ fn setup_appearance(app: &App) {
 }
 
 /// Minimizar, maximizar e fechar da barra de título (a janela não tem moldura;
-/// o arraste é do `WindowMoveArea`, que pede ao winit o arraste do sistema).
+/// o arraste é do `WindowMoveArea`, que pede ao winit o arraste do sistema; o
+/// redimensionar é do `resize-border-width` da janela).
 fn setup_window_controls(app: &App) {
     let weak = app.as_weak();
     app.on_minimize(move || {
