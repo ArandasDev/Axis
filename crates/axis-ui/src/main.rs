@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod client;
+mod repair_view;
 mod single;
 mod theme;
 mod view;
@@ -8,12 +9,16 @@ mod view;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use axis_protocol::{ClientMsg, Family, LiveFrame, PadState, SessionInfo, StickStages};
+use axis_protocol::{
+    CaptureKindDto, CaptureResultDto, CaptureState, ClientMsg, CorrectionsDto, Family, LiveFrame,
+    PadState, SessionInfo, StickStages, Transport, TriggerCalDto,
+};
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use client::{Client, UiUpdate};
+use repair_view::{Wizard, WizardStep};
 use view::{Connection, PadCard};
 
 slint::include_modules!();
@@ -21,11 +26,19 @@ slint::include_modules!();
 /// Quanto tempo "Conectando ao núcleo…" fica depois de iniciar o núcleo.
 const START_GRACE: Duration = Duration::from_secs(3);
 
+/// Telas da navegação (posição do item na barra lateral).
+const SCREEN_OVERVIEW: i32 = 0;
+const SCREEN_REPAIR: i32 = 2;
+
 /// Estado da interface que não mora no Slint (só na thread da interface).
 #[derive(Default)]
 struct Shell {
     /// `None` no modo demo: o que seria enviado ao núcleo é descartado.
     client: Option<Client>,
+    /// Modo demo: o controle falso responde às medições.
+    demo: bool,
+    /// Medição do controle falso: tipo e início.
+    demo_capture: Option<(CaptureKindDto, Instant)>,
     /// Cartões mostrados agora; o modelo só é recriado quando mudam.
     cards: Vec<PadCard>,
     selected: Option<String>,
@@ -35,6 +48,15 @@ struct Shell {
     emulation: bool,
     /// Já chegou um quadro do controle selecionado desde a seleção.
     has_live: bool,
+    screen: i32,
+    wizard: Wizard,
+    right_stick: bool,
+    /// Medição pedida por esta interface: controle e tipo. Só ela aparece.
+    capture: Option<(String, CaptureKindDto)>,
+    /// Já veio um quadro "medindo" dela; antes disso, um resultado no quadro
+    /// é o da medição anterior, que o núcleo guarda até a próxima começar.
+    capture_fresh: bool,
+    step: WizardStep,
 }
 
 thread_local! {
@@ -62,10 +84,12 @@ fn main() -> Result<(), slint::PlatformError> {
             select(&app, Some(id.to_string()));
         }
     });
+    setup_repair(&app);
 
     // Modo demo: dados sintéticos, sem pipe e sem iniciar o núcleo (só para
     // captura de tela e desenvolvimento).
     if std::env::var_os("AXIS_UI_DEMO").is_some_and(|v| v == "1") {
+        SHELL.with(|s| s.borrow_mut().demo = true);
         for update in demo_updates() {
             apply(&app, update, false);
         }
@@ -155,10 +179,161 @@ fn rgb([r, g, b]: [u8; 3]) -> slint::Color {
 
 fn send(msg: ClientMsg) {
     SHELL.with(|s| {
-        if let Some(client) = &s.borrow().client {
+        let mut s = s.borrow_mut();
+        if let Some(client) = &s.client {
             client.send(msg);
+        } else if s.demo {
+            // O controle falso do modo demo mede sozinho.
+            match msg {
+                ClientMsg::StartCapture { kind, .. } => {
+                    s.demo_capture = Some((kind, Instant::now()));
+                }
+                ClientMsg::CancelCapture { .. } => s.demo_capture = None,
+                _ => {}
+            }
         }
     });
+}
+
+/// Navegação, assistentes e medição da tela Correção.
+fn setup_repair(app: &App) {
+    let weak = app.as_weak();
+    app.on_navigate(move |screen| {
+        let Some(app) = weak.upgrade() else { return };
+        if screen != SCREEN_OVERVIEW && screen != SCREEN_REPAIR {
+            return;
+        }
+        let previous = SHELL.with(|s| std::mem::replace(&mut s.borrow_mut().screen, screen));
+        if previous == screen {
+            return;
+        }
+        // Sair da Correção no meio de uma medição a cancela.
+        leave_capture(&app);
+        app.set_screen(screen);
+        refresh_overview(&app);
+    });
+    let weak = app.as_weak();
+    app.on_choose_wizard(move |index| {
+        let Some(app) = weak.upgrade() else { return };
+        let wizard = Wizard::from_index(index);
+        if SHELL.with(|s| std::mem::replace(&mut s.borrow_mut().wizard, wizard)) != wizard {
+            leave_capture(&app);
+        }
+        app.set_wizard(wizard.index());
+    });
+    let weak = app.as_weak();
+    app.on_choose_stick(move |right| {
+        let Some(app) = weak.upgrade() else { return };
+        if SHELL.with(|s| std::mem::replace(&mut s.borrow_mut().right_stick, right)) != right {
+            leave_capture(&app);
+        }
+        app.set_right_stick(right);
+    });
+    let weak = app.as_weak();
+    app.on_start_capture(move || {
+        if let Some(app) = weak.upgrade() {
+            start_capture(&app);
+        }
+    });
+    let weak = app.as_weak();
+    app.on_reset_wizard(move || {
+        if let Some(app) = weak.upgrade() {
+            leave_capture(&app);
+        }
+    });
+}
+
+/// "Começar": pede ao núcleo a medição do assistente atual.
+fn start_capture(app: &App) {
+    let msg = SHELL.with(|s| {
+        let mut s = s.borrow_mut();
+        let kind = repair_view::capture_kind(s.wizard, s.right_stick)?;
+        let id = s.selected.clone()?;
+        let connected = s.sessions.iter().any(|x| x.id == id && x.connected);
+        if !connected || s.step == WizardStep::Measuring {
+            return None;
+        }
+        s.capture = Some((id.clone(), kind));
+        s.capture_fresh = false;
+        s.step = WizardStep::Measuring;
+        Some(ClientMsg::StartCapture { id, kind })
+    });
+    if let Some(msg) = msg {
+        show_step(app, WizardStep::Measuring, 0.0, String::new());
+        send(msg);
+    }
+}
+
+/// Volta o assistente ao início; uma medição em andamento é cancelada no
+/// núcleo (trocar de controle, de assistente, de analógico ou de tela).
+fn leave_capture(app: &App) {
+    let cancel = SHELL.with(|s| {
+        let mut s = s.borrow_mut();
+        let measuring = s.step == WizardStep::Measuring;
+        s.step = WizardStep::Intro;
+        s.capture_fresh = false;
+        s.capture.take().filter(|_| measuring).map(|(id, _)| id)
+    });
+    if let Some(id) = cancel {
+        send(ClientMsg::CancelCapture { id });
+    }
+    show_step(app, WizardStep::Intro, 0.0, String::new());
+}
+
+fn show_step(app: &App, step: WizardStep, progress: f32, message: String) {
+    app.set_repair_step(step.code());
+    app.set_repair_progress(progress);
+    app.set_repair_message(message.into());
+}
+
+/// A medição pedida no quadro ao vivo: progresso e, no fim, o resultado.
+fn show_capture(app: &App, frame: &LiveFrame) {
+    let update = SHELL.with(|s| {
+        let mut s = s.borrow_mut();
+        let (id, kind) = s.capture.clone()?;
+        let state = frame.capture.as_ref().filter(|c| c.kind == kind);
+        if !s.capture_fresh {
+            // Até o núcleo começar esta medição, o quadro traz nada ou o
+            // resultado da anterior: continua "medindo" do zero.
+            if state.is_none_or(|c| c.result.is_some()) {
+                return None;
+            }
+            s.capture_fresh = true;
+        }
+        let step = repair_view::step_for(state, frame.id == id);
+        let progress = state.map_or(0.0, |c| c.progress);
+        let changed = std::mem::replace(&mut s.step, step) != step;
+        if step == WizardStep::Intro {
+            // O núcleo esqueceu a medição (reiniciou): volta ao começo.
+            s.capture = None;
+        }
+        let message = match state.and_then(|c| c.result.as_ref()) {
+            Some(r) if changed => repair_view::capture_message(r),
+            _ => String::new(),
+        };
+        (changed || step == WizardStep::Measuring).then_some((step, progress, message))
+    });
+    if let Some((step, progress, message)) = update {
+        show_step(app, step, progress, message);
+    }
+}
+
+/// O controle caiu no meio da medição: o assistente mostra o erro na hora
+/// (o núcleo também marca a captura como abortada).
+fn abort_if_disconnected(app: &App, connected: bool) {
+    let aborted = SHELL.with(|s| {
+        let mut s = s.borrow_mut();
+        if connected || s.step != WizardStep::Measuring {
+            return false;
+        }
+        s.step = WizardStep::Error;
+        s.capture = None;
+        true
+    });
+    if aborted {
+        let message = repair_view::capture_message(&CaptureResultDto::Aborted);
+        show_step(app, WizardStep::Error, 0.0, message);
+    }
 }
 
 fn set_connection(app: &App, c: Connection) {
@@ -188,13 +363,15 @@ fn refresh_overview(app: &App) {
             return;
         };
         let paused = app.get_paused();
-        let h = view::header(index, session, s.emulation, paused);
         app.set_has_pad(true);
-        app.set_header(OverviewHeader {
-            kicker: h.kicker.into(),
-            title: h.title.into(),
-            subtitle: h.subtitle.into(),
-        });
+        app.set_header(header_data(view::header(
+            index,
+            session,
+            s.emulation,
+            paused,
+        )));
+        app.set_repair_header(header_data(view::repair_header(session)));
+        app.set_repair_summary(repair_summary(&session.corrections));
         app.set_family(match session.family {
             Family::DualShock4 => 0,
             Family::DualSense => 1,
@@ -213,6 +390,26 @@ fn refresh_overview(app: &App) {
             view::stage_badge(connected, paused, s.emulation, view_only, s.has_live),
         );
     });
+    let connected = app.get_has_pad() && app.get_pad_connected();
+    abort_if_disconnected(app, connected);
+}
+
+fn header_data(h: view::Header) -> OverviewHeader {
+    OverviewHeader {
+        kicker: h.kicker.into(),
+        title: h.title.into(),
+        subtitle: h.subtitle.into(),
+    }
+}
+
+fn repair_summary(c: &CorrectionsDto) -> RepairSummary {
+    let line = |w| repair_view::summary(w, c).into();
+    RepairSummary {
+        drift: line(Wizard::Drift),
+        range: line(Wizard::Range),
+        triggers: line(Wizard::Triggers),
+        connection: line(Wizard::Connection),
+    }
 }
 
 /// Palco parado: analógicos no centro, gatilhos soltos, métricas sem dado.
@@ -277,6 +474,7 @@ fn show_live(app: &App, frame: &LiveFrame) {
     });
     let Some(first) = first else { return };
     app.set_live(live_data(frame));
+    show_capture(app, frame);
     if first {
         // Primeiro quadro: o selo do palco sai de "Aguardando dados".
         refresh_overview(app);
@@ -292,6 +490,10 @@ fn show_badge(app: &App, badge: view::StageBadge) {
 
 /// Seleciona um controle e pede ao núcleo os quadros ao vivo dele.
 fn select(app: &App, id: Option<String>) {
+    if SHELL.with(|s| s.borrow().selected != id) {
+        // A medição é do controle anterior: cancela antes de trocar.
+        leave_capture(app);
+    }
     let changed = SHELL.with(|s| {
         let mut s = s.borrow_mut();
         let changed = s.selected != id;
@@ -409,11 +611,15 @@ fn demo_updates() -> Vec<UiUpdate> {
             SessionInfo {
                 player: Some(1),
                 battery: Some(64),
+                transport: Some(Transport::Bluetooth),
+                disconnects: 1,
+                corrections: demo_corrections(),
                 ..pad("demo:01", "Maria", [0x5f, 0xb3, 0x7a], Family::DualShock4)
             },
             SessionInfo {
                 player: Some(2),
                 connected: false,
+                transport: Some(Transport::Usb),
                 ..pad("demo:02", "João", [0x9b, 0x7a, 0xd8], Family::DualSense)
             },
             SessionInfo {
@@ -423,6 +629,59 @@ fn demo_updates() -> Vec<UiUpdate> {
             },
         ]),
     ]
+}
+
+/// Correções já aplicadas no controle de demonstração.
+fn demo_corrections() -> CorrectionsDto {
+    let mut c = CorrectionsDto::default();
+    c.left.center = [0.04, -0.03];
+    c.left.drift_radius = 0.05;
+    c.l2 = TriggerCalDto {
+        rest: 0.04,
+        max: 0.97,
+    };
+    c
+}
+
+/// Medição sintética do controle de demonstração, `secs` depois de começar:
+/// progresso até o fim e então um resultado fixo (drift e alcance ok;
+/// gatilhos com R2 apertado só 2 vezes).
+fn demo_capture_state(kind: CaptureKindDto, secs: f32) -> CaptureState {
+    let duration = match kind {
+        CaptureKindDto::DriftLeft | CaptureKindDto::DriftRight => 3.0,
+        CaptureKindDto::RangeLeft | CaptureKindDto::RangeRight => 6.0,
+        CaptureKindDto::Triggers => 5.0,
+    };
+    let progress = (secs / duration).clamp(0.0, 1.0);
+    let result = (progress >= 1.0).then(|| match kind {
+        CaptureKindDto::DriftLeft | CaptureKindDto::DriftRight => CaptureResultDto::Drift {
+            center: [0.04, -0.03],
+            noise: 0.008,
+            radius: 0.03,
+            worn: false,
+        },
+        CaptureKindDto::RangeLeft | CaptureKindDto::RangeRight => CaptureResultDto::Range {
+            // Gate quadrado gasto: diagonais mais longas que os eixos.
+            outer_radius: (0..16)
+                .map(|i| if i % 4 == 2 { 1.06 } else { 0.97 })
+                .collect(),
+            circularity_pct: 3.6,
+        },
+        CaptureKindDto::Triggers => CaptureResultDto::Triggers {
+            l2: Some(TriggerCalDto {
+                rest: 0.05,
+                max: 0.96,
+            }),
+            r2: None,
+            l2_presses: 3,
+            r2_presses: 2,
+        },
+    });
+    CaptureState {
+        kind,
+        progress,
+        result,
+    }
 }
 
 /// Inicia o núcleo e mostra "Conectando…" por até 3 s antes de "parado".
@@ -460,10 +719,17 @@ fn demo_live(app: &App) -> slint::Timer {
         Duration::from_millis(16),
         move || {
             let Some(app) = weak.upgrade() else { return };
-            let Some(id) = SHELL.with(|s| s.borrow().selected.clone()) else {
+            let Some((id, capture)) = SHELL.with(|s| {
+                let s = s.borrow();
+                let capture = s
+                    .demo_capture
+                    .map(|(kind, t0)| demo_capture_state(kind, t0.elapsed().as_secs_f32()));
+                s.selected.clone().map(|id| (id, capture))
+            }) else {
                 return;
             };
-            let frame = demo_frame(id, start.elapsed().as_secs_f32());
+            let mut frame = demo_frame(id, start.elapsed().as_secs_f32());
+            frame.capture = capture;
             apply(&app, UiUpdate::Live(frame), false);
         },
     );
@@ -533,6 +799,41 @@ fn demo_frame(id: String, t: f32) -> LiveFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_capture_progresses_to_a_result() {
+        use axis_protocol::{CaptureKindDto, CaptureResultDto};
+        use repair_view::{WizardStep, step_for};
+
+        let early = demo_capture_state(CaptureKindDto::DriftLeft, 1.5);
+        assert_eq!(early.kind, CaptureKindDto::DriftLeft);
+        assert!((early.progress - 0.5).abs() < 1e-6);
+        assert_eq!(step_for(Some(&early), true), WizardStep::Measuring);
+
+        let drift = demo_capture_state(CaptureKindDto::DriftRight, 10.0);
+        assert_eq!(drift.progress, 1.0);
+        assert!(matches!(
+            drift.result,
+            Some(CaptureResultDto::Drift { worn: false, .. })
+        ));
+        let range = demo_capture_state(CaptureKindDto::RangeLeft, 60.0);
+        let Some(CaptureResultDto::Range { outer_radius, .. }) = range.result else {
+            panic!("esperava Range: {range:?}");
+        };
+        assert_eq!(outer_radius.len(), 16);
+        assert!(outer_radius.iter().all(|r| (0.3..=1.5).contains(r)));
+        // Gatilhos: R2 apertado só 2 vezes fica sem medida.
+        let triggers = demo_capture_state(CaptureKindDto::Triggers, 60.0);
+        assert!(matches!(
+            triggers.result,
+            Some(CaptureResultDto::Triggers {
+                l2: Some(_),
+                r2: None,
+                r2_presses: 2,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn link_changes_clear_the_stage() {

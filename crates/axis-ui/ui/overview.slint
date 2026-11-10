@@ -1,5 +1,5 @@
 import { Tokens } from "tokens.slint";
-import { Kicker } from "components.slint";
+import { GridBackdrop, Kicker, Panel, PanelTitle } from "components.slint";
 import { ControllerArt } from "controller-art.slint";
 
 /// Cabeçalho do controle selecionado (de `view::header`).
@@ -36,15 +36,6 @@ export struct LiveData {
     deadzone-on: bool,
     curve-on: bool,
     anti-on: bool,
-}
-
-/// Título de painel em Barlow Condensed, caixa alta.
-component PanelTitle inherits Text {
-    font-family: Tokens.font-heading;
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 1px;
-    color: Tokens.text;
 }
 
 /// Linha pontilhada horizontal (o `Path` não tem tracejado).
@@ -237,21 +228,6 @@ component Bar inherits HorizontalLayout {
     }
 }
 
-/// Painel com a borda por cima (o renderizador por software apaga um ponto da
-/// borda de um painel arredondado com `clip`).
-component Panel inherits Rectangle {
-    border-radius: Tokens.radius-panel;
-    background: Tokens.surface;
-
-    @children
-
-    Rectangle {
-        border-radius: Tokens.radius-panel;
-        border-width: 1px;
-        border-color: Tokens.divider;
-    }
-}
-
 /// Palco: grade, desenho do controle ao vivo e chamadas pontilhadas.
 component Stage inherits Panel {
     in property <int> family;
@@ -264,29 +240,7 @@ component Stage inherits Panel {
 
     property <length> header-height: 46px;
 
-    // Grade de 24 px em todo o cartão, recortada nos cantos arredondados e
-    // refeita a cada tamanho; as linhas horizontais partem do divisor do
-    // cabeçalho, que tem fundo sólido por cima da grade.
-    Rectangle {
-        width: 100%;
-        height: 100%;
-        border-radius: Tokens.radius-panel;
-        clip: true;
-        for i in ceil(parent.width / Tokens.space-l): Rectangle {
-            x: (i + 1) * Tokens.space-l;
-            y: 0;
-            width: 1px;
-            height: parent.height;
-            background: Tokens.grid;
-        }
-        for j in ceil(max(0, parent.height - root.header-height) / Tokens.space-l): Rectangle {
-            x: 0;
-            y: root.header-height + (j + 1) * Tokens.space-l;
-            width: parent.width;
-            height: 1px;
-            background: Tokens.grid;
-        }
-    }
+    GridBackdrop { header-height: root.header-height; }
 
     VerticalLayout {
         // Cabeçalho com fundo sólido: a grade não passa por trás do texto.

@@ -1,0 +1,373 @@
+import { Tokens } from "tokens.slint";
+import { GridBackdrop, Kicker, Panel, PanelTitle, PrimaryButton, SecondaryButton, SegmentButton, SegmentGroup } from "components.slint";
+import { OverviewHeader } from "overview.slint";
+
+/// Linha de estado de cada cartão (de `repair_view::summary`).
+export struct RepairSummary {
+    drift: string,
+    range: string,
+    triggers: string,
+    connection: string,
+}
+
+/// Cartão de um assistente: nome e o que está aplicado agora.
+component WizardCard inherits Rectangle {
+    in property <string> title;
+    in property <string> status;
+    in property <bool> active;
+    callback clicked();
+
+    border-radius: Tokens.radius-card;
+    border-width: 1px;
+    border-color: active ? Tokens.accent.with-alpha(0.55) : Tokens.divider;
+    background: active ? Tokens.accent-soft : touch.has-hover ? Tokens.hover : Tokens.surface;
+    accessible-role: button;
+    accessible-label: title + ": " + status;
+    accessible-checked: active;
+    accessible-action-default => { root.clicked(); }
+    animate background, border-color { duration: Tokens.dur-fast; }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    VerticalLayout {
+        padding: Tokens.space-m;
+        padding-top: Tokens.space-sm;
+        padding-bottom: Tokens.space-sm;
+        spacing: Tokens.space-xxs;
+        Text {
+            text: root.title;
+            font-family: Tokens.font-heading;
+            font-size: 18px;
+            font-weight: 600;
+            color: root.active ? Tokens.accent : Tokens.text;
+        }
+        Text {
+            text: root.status;
+            font-size: 12px;
+            color: Tokens.muted;
+            wrap: word-wrap;
+        }
+    }
+}
+
+/// Barra de progresso da medição.
+component Progress inherits Rectangle {
+    in property <float> value;
+
+    height: 6px;
+    border-radius: self.height / 2;
+    background: Tokens.hover;
+    accessible-role: progress-indicator;
+    accessible-value: round(max(0, min(1, root.value)) * 100) + "%";
+
+    Rectangle {
+        x: 0;
+        width: parent.width * max(0, min(1, root.value));
+        height: parent.height;
+        border-radius: parent.border-radius;
+        background: Tokens.accent;
+        animate width { duration: Tokens.dur-fast; }
+    }
+}
+
+/// Painel do assistente escolhido: cabeçalho sólido sobre a grade e o passo
+/// atual (os gráficos de cada assistente entram por cima disso).
+component WizardPanel inherits Panel {
+    in property <int> wizard;
+    in property <bool> right-stick;
+    in property <bool> expert;
+    in property <bool> connected;
+    /// 0 início, 1 medindo, 2 resultado, 3 erro.
+    in property <int> step;
+    in property <float> progress;
+    in property <string> message;
+    callback choose-stick(bool);
+    callback begin();
+    callback reset();
+
+    property <length> header-height: 46px;
+    property <string> stick-name: root.right-stick ? "direito" : "esquerdo";
+    property <string> instruction: root.wizard == 0 ? "Solte o analógico " + root.stick-name + " e não toque nele"
+        : root.wizard == 1 ? "Gire o analógico devagar encostando na borda, 3 voltas"
+        : root.wizard == 2 ? "Aperte L2 e R2 até o fim e solte, 3 vezes cada"
+        : "A conexão é acompanhada durante o uso, sem medição";
+    property <string> mode-line: root.expert ? "Especialista: você revisa e edita os números antes de aplicar."
+        : "Leigo: o Axis mede e aplica o resultado.";
+
+    GridBackdrop { header-height: root.header-height; }
+
+    VerticalLayout {
+        Rectangle {
+            height: root.header-height;
+            background: Tokens.surface;
+            border-top-left-radius: Tokens.radius-panel;
+            border-top-right-radius: Tokens.radius-panel;
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Tokens.divider;
+            }
+            HorizontalLayout {
+                padding-left: Tokens.space-m;
+                padding-right: Tokens.space-xs + Tokens.space-xxs;
+                spacing: Tokens.space-s;
+                PanelTitle {
+                    text: root.wizard == 0 ? "DRIFT" : root.wizard == 1 ? "ALCANCE E CÍRCULO" : root.wizard == 2 ? "GATILHOS" : "CONEXÃO";
+                    vertical-alignment: center;
+                }
+                Rectangle { }
+                // Drift e alcance medem um analógico de cada vez.
+                if root.wizard <= 1: VerticalLayout {
+                    alignment: center;
+                    SegmentGroup {
+                        width: 200px;
+                        SegmentButton {
+                            text: "Esquerdo";
+                            active: !root.right-stick;
+                            clicked => { root.choose-stick(false); }
+                        }
+                        SegmentButton {
+                            text: "Direito";
+                            active: root.right-stick;
+                            clicked => { root.choose-stick(true); }
+                        }
+                    }
+                }
+            }
+        }
+
+        VerticalLayout {
+            padding: Tokens.space-l;
+            spacing: Tokens.space-sm;
+            alignment: center;
+
+            if root.step == 0: VerticalLayout {
+                spacing: Tokens.space-sm;
+                Kicker { text: root.wizard == 3 ? "AO VIVO" : "COMO MEDIR"; }
+                Text {
+                    text: root.instruction;
+                    font-family: Tokens.font-heading;
+                    font-size: 28px;
+                    font-weight: 600;
+                    color: Tokens.text;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.wizard == 3 ? "Taxa, jitter, desconexões e bateria do controle selecionado." : root.mode-line;
+                    font-size: 13px;
+                    color: Tokens.muted;
+                    wrap: word-wrap;
+                }
+                if root.wizard != 3: HorizontalLayout {
+                    alignment: start;
+                    padding-top: Tokens.space-s;
+                    spacing: Tokens.space-sm;
+                    PrimaryButton {
+                        text: "Começar";
+                        enabled: root.connected;
+                        clicked => { root.begin(); }
+                    }
+                    if !root.connected: Text {
+                        text: "Conecte o controle para medir";
+                        font-size: 12px;
+                        color: Tokens.muted;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            if root.step == 1: VerticalLayout {
+                spacing: Tokens.space-sm;
+                Kicker { text: "MEDINDO"; }
+                Text {
+                    text: root.instruction;
+                    font-family: Tokens.font-heading;
+                    font-size: 28px;
+                    font-weight: 600;
+                    color: Tokens.text;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: Tokens.space-sm;
+                    VerticalLayout {
+                        alignment: center;
+                        Progress { value: root.progress; }
+                    }
+                    Text {
+                        text: round(max(0, min(1, root.progress)) * 100) + "%";
+                        width: 40px;
+                        font-size: 12px;
+                        color: Tokens.text;
+                        horizontal-alignment: right;
+                    }
+                }
+            }
+
+            if root.step == 2: VerticalLayout {
+                spacing: Tokens.space-sm;
+                Kicker { text: "RESULTADO"; }
+                Text {
+                    text: root.message;
+                    font-size: 15px;
+                    color: Tokens.text;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    padding-top: Tokens.space-s;
+                    SecondaryButton {
+                        text: "Medir de novo";
+                        clicked => { root.reset(); }
+                    }
+                }
+            }
+
+            if root.step == 3: VerticalLayout {
+                spacing: Tokens.space-sm;
+                Kicker {
+                    text: "NÃO DEU CERTO";
+                    color: Tokens.warning;
+                }
+                Text {
+                    text: root.message;
+                    font-size: 15px;
+                    color: Tokens.text;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    padding-top: Tokens.space-s;
+                    PrimaryButton {
+                        text: "Tentar de novo";
+                        clicked => { root.reset(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Tela Correção do controle selecionado: os quatro assistentes à esquerda e
+/// o escolhido à direita.
+export component Repair inherits Rectangle {
+    in property <bool> has-pad;
+    in property <OverviewHeader> header;
+    in property <bool> connected;
+    in property <RepairSummary> summary;
+    /// Leigo ou especialista: só desta sessão da interface.
+    in-out property <bool> expert;
+    in property <int> wizard;
+    in property <bool> right-stick;
+    in property <int> step;
+    in property <float> progress;
+    in property <string> message;
+    callback choose-wizard(int);
+    callback choose-stick(bool);
+    callback begin();
+    callback reset();
+
+    property <length> side-width: 300px;
+
+    if !root.has-pad: Text {
+        text: "Conecte um controle para usar a Correção";
+        color: Tokens.muted;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if root.has-pad: VerticalLayout {
+        padding: Tokens.space-l;
+        spacing: Tokens.space-m;
+
+        HorizontalLayout {
+            vertical-stretch: 0;
+            spacing: Tokens.space-m;
+            VerticalLayout {
+                spacing: Tokens.space-xs;
+                Kicker { text: root.header.kicker; }
+                Text {
+                    text: root.header.title;
+                    font-family: Tokens.font-heading;
+                    font-size: 38px;
+                    font-weight: 600;
+                    color: Tokens.text;
+                    overflow: elide;
+                }
+                Text {
+                    text: root.header.subtitle;
+                    font-size: 13px;
+                    color: Tokens.muted;
+                    overflow: elide;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                SegmentGroup {
+                    width: 240px;
+                    SegmentButton {
+                        text: "Leigo";
+                        active: !root.expert;
+                        clicked => { root.expert = false; }
+                    }
+                    SegmentButton {
+                        text: "Especialista";
+                        active: root.expert;
+                        clicked => { root.expert = true; }
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: Tokens.space-m;
+
+            VerticalLayout {
+                width: root.side-width;
+                spacing: Tokens.space-sm;
+                WizardCard {
+                    title: "Drift";
+                    status: root.summary.drift;
+                    active: root.wizard == 0;
+                    clicked => { root.choose-wizard(0); }
+                }
+                WizardCard {
+                    title: "Alcance e círculo";
+                    status: root.summary.range;
+                    active: root.wizard == 1;
+                    clicked => { root.choose-wizard(1); }
+                }
+                WizardCard {
+                    title: "Gatilhos";
+                    status: root.summary.triggers;
+                    active: root.wizard == 2;
+                    clicked => { root.choose-wizard(2); }
+                }
+                WizardCard {
+                    title: "Conexão";
+                    status: root.summary.connection;
+                    active: root.wizard == 3;
+                    clicked => { root.choose-wizard(3); }
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            WizardPanel {
+                horizontal-stretch: 1;
+                wizard: root.wizard;
+                right-stick: root.right-stick;
+                expert: root.expert;
+                connected: root.connected;
+                step: root.step;
+                progress: root.progress;
+                message: root.message;
+                choose-stick(right) => { root.choose-stick(right); }
+                begin => { root.begin(); }
+                reset => { root.reset(); }
+            }
+        }
+    }
+}
