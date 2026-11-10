@@ -48,11 +48,17 @@ const ERROR_BACKOFF: Duration = Duration::from_secs(1);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cliente que não lê por este tempo (buffer cheio) é desconectado.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Espera da escritora sem inspeção: só uma rede de segurança para notar o
-/// fechamento; mudanças e `wake` a acordam antes.
+/// Espera da escritora sem inspeção: mudanças e `wake` a acordam antes. É o
+/// limite de uma corrida de acordar perdido: se a leitora chama `close()` e
+/// `wake()` entre o `is_closed()` da escritora e a entrada em `wait_change`, o
+/// aviso se perde e a escritora só nota o fechamento ao fim desta espera.
 const IDLE_WAIT: Duration = Duration::from_millis(500);
-/// Espera da escritora com inspeção (~60 quadros por segundo).
-const LIVE_WAIT: Duration = Duration::from_millis(16);
+/// Espera da escritora com inspeção. O Windows arredonda a espera da condvar
+/// para o tick do relógio (~15,6 ms): pedir 16 ms custa dois ticks (~31 ms,
+/// ~32 quadros por segundo). Com 6 ms a espera cabe num tick e a escritora
+/// acompanha o worker (no máximo uma amostra a cada 17 ms, ~59 por segundo);
+/// amostra repetida não é reenviada (`seq`).
+const LIVE_WAIT: Duration = Duration::from_millis(6);
 /// Janela da média móvel de `rate_hz`.
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
@@ -1042,6 +1048,53 @@ mod tests {
         // B sai: desliga em até 1 s.
         drop(b);
         wait_until("torneira desligada", || !tap.enabled());
+    }
+
+    #[test]
+    fn live_cadence_is_close_to_the_worker_rate() {
+        let ui = UiRegistry::new();
+        let tap = LiveTap::new();
+        ui.publish(
+            vec![info("aa:01")],
+            HashMap::from([("aa:01".to_string(), tap.clone())]),
+            false,
+            true,
+        );
+        let (name, _rx) = server(&ui);
+        let c = TestClient::hello(&name);
+        c.send(&ClientMsg::Inspect {
+            id: Some("aa:01".into()),
+        });
+        wait_until("torneira ligada", || tap.enabled());
+
+        // O worker publica no máximo a cada 17 ms (~58 por segundo).
+        let stop = Arc::new(AtomicBool::new(false));
+        let (t2, s2) = (tap.clone(), stop.clone());
+        let feeder = thread::spawn(move || {
+            let mut seq = 1;
+            while !s2.load(Ordering::SeqCst) {
+                t2.publish(LiveSample {
+                    seq,
+                    ..Default::default()
+                });
+                seq += 1;
+                thread::sleep(Duration::from_millis(17));
+            }
+        });
+        c.recv_until(|m| matches!(m, ServerMsg::Live { .. }));
+        let start = Instant::now();
+        let mut frames = 0u32;
+        while start.elapsed() < Duration::from_secs(1) {
+            if let Ok(Some(ServerMsg::Live { .. })) = c.rx.recv_timeout(Duration::from_millis(100))
+            {
+                frames += 1;
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        feeder.join().unwrap();
+        // Folga larga: só pega o ritmo de ~32 por segundo (espera de 16 ms
+        // arredondada para dois ticks de 15,6 ms).
+        assert!(frames >= 45, "só {frames} quadros em 1 s");
     }
 
     #[test]

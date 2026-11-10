@@ -46,8 +46,9 @@ const STATUS_EVERY: u64 = 64;
 const WARN_INTERVAL: Duration = Duration::from_secs(1);
 const LATENCY_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BUCKETS: usize = 101;
-/// Intervalo mínimo entre amostras ao vivo (~60 Hz).
-const LIVE_INTERVAL: Duration = Duration::from_millis(16);
+/// Intervalo mínimo entre amostras ao vivo: 17 ms garante no máximo ~59 por
+/// segundo (16 ms passaria de 60).
+const LIVE_INTERVAL: Duration = Duration::from_millis(17);
 
 /// Histograma de latência em buckets de 10 µs; o último acumula >= 1000 µs.
 pub(crate) struct LatencyHistogram {
@@ -141,7 +142,7 @@ struct Worker {
     latency_since: Instant,
     tap: Arc<LiveTap>,
     last_publish: Option<Instant>,
-    /// Último report barrado pelo limitador de 16 ms; sai na próxima chance.
+    /// Último report barrado pelo limitador de 17 ms; sai na próxima chance.
     pending: Option<(InputState, InputState, Trace)>,
     live_seq: u64,
     /// p99 da última janela de 60 s do histograma (0 antes da primeira).
@@ -162,7 +163,7 @@ impl Worker {
         });
     }
 
-    /// Amostra neutra (palco não congela), fora do limite de 16 ms; só com o tap ligado.
+    /// Amostra neutra (palco não congela), fora do limite de 17 ms; só com o tap ligado.
     fn publish_neutral(&mut self) {
         self.pending = None;
         if self.tap.enabled() {
