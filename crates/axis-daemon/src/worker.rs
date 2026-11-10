@@ -444,7 +444,12 @@ impl Worker {
                 }
                 Ok(None) => {
                     // Analógico parado no XInput: sem report novo, o tempo da captura anda.
-                    if self.link_up && self.capture.as_ref().is_some_and(|(c, _)| !c.is_done()) {
+                    // No HID (`detect_silence`), `Ok(None)` é o controle calando: o último
+                    // report não vale como leitura nova.
+                    if !self.detect_silence
+                        && self.link_up
+                        && self.capture.as_ref().is_some_and(|(c, _)| !c.is_done())
+                    {
                         if let Some(input) = self.last_input {
                             let now = self.now();
                             self.feed_capture(&input, now);
@@ -1145,7 +1150,10 @@ mod tests {
         wait_until(|| snapshot(&h).is_some());
         assert_eq!(snapshot(&h).unwrap().progress, 0.0);
         push_reports(&h, 376, 0.0); // 1,5 s
-        wait_until(|| h.tap.latest().reports == 376);
+        // A amostra pode sair um pouco depois do último report (limite de 17 ms).
+        wait_until(|| {
+            h.tap.latest().reports == 376 && snapshot(&h).is_some_and(|s| s.progress >= 0.49)
+        });
         let s = snapshot(&h).unwrap();
         assert!((s.progress - 0.5).abs() < 0.01, "{s:?}");
         assert_eq!(s.outcome, None);
@@ -1281,6 +1289,21 @@ mod tests {
         assert_eq!(h.tap.latest().reports, 1, "nenhum report novo");
         h.finish();
         outcome
+    }
+
+    #[test]
+    fn hid_silence_near_the_end_of_drift_aborts() {
+        // HID: `Ok(None)` só quando o controle está calando; o último report não
+        // pode empurrar o tempo da captura até o fim.
+        let h = start_clocked(vec![ms(4)], true);
+        h.tap.set_enabled(true);
+        h.tx.send(WorkerCommand::StartCapture(drift_left()))
+            .unwrap();
+        wait_until(|| snapshot(&h).is_some());
+        push_reports(&h, 676, 0.04); // 2,7 s
+        wait_until(|| *h.links.lock().unwrap() == vec![false]);
+        assert_eq!(snapshot(&h).and_then(|s| s.outcome), Some(Outcome::Aborted));
+        h.finish();
     }
 
     #[test]
