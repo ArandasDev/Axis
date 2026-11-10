@@ -20,6 +20,10 @@ export global Tokens {
     out property <color> line-soft: text.with-alpha(0.4);
     // Palco sem dados (sessão reconectando).
     out property <float> dimmed: 0.35;
+    // Aviso (pausado, só visualização): âmbar quente, fora da escolha de
+    // destaque para nunca parecer "ativo"; contraste ≥ 4,5:1 na superfície.
+    out property <color> warning: dark ? #d9a441 : #8a5a00;
+    out property <color> warning-soft: warning.with-alpha(0.14);
     // Fechar a janela: o vermelho do Windows, igual nos dois temas.
     out property <color> danger: #c42b1c;
     out property <color> on-danger: #ffffff;

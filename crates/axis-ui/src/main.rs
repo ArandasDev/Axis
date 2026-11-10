@@ -171,6 +171,7 @@ fn refresh_status(app: &App) {
         (s.emulation, view::connected_count(&s.sessions))
     });
     app.set_status(view::status_line(app.get_paused(), emulation, count).into());
+    app.set_status_active(view::status_active(app.get_paused(), emulation));
 }
 
 /// Cabeçalho e palco do controle selecionado (fora do caminho de 60 Hz).
@@ -185,7 +186,8 @@ fn refresh_overview(app: &App) {
             app.set_has_pad(false);
             return;
         };
-        let h = view::header(index, session, s.emulation);
+        let paused = app.get_paused();
+        let h = view::header(index, session, s.emulation, paused);
         app.set_has_pad(true);
         app.set_header(OverviewHeader {
             kicker: h.kicker.into(),
@@ -198,15 +200,17 @@ fn refresh_overview(app: &App) {
             Family::Xbox => 2,
         });
         app.set_emulating(s.emulation && !session.view_only);
-        let connected = session.connected;
+        let (connected, view_only) = (session.connected, session.view_only);
         app.set_pad_connected(connected);
         if !connected {
             // Reconectando: palco esmaecido e valores em neutro.
             s.has_live = false;
             app.set_live(neutral_live());
         }
-        app.set_has_live(s.has_live);
-        app.set_stage_status(view::stage_status(connected, s.has_live).into());
+        show_badge(
+            app,
+            view::stage_badge(connected, paused, s.emulation, view_only, s.has_live),
+        );
     });
 }
 
@@ -271,9 +275,16 @@ fn show_live(app: &App, frame: &LiveFrame) {
     let Some(first) = first else { return };
     app.set_live(live_data(frame));
     if first {
-        app.set_has_live(true);
-        app.set_stage_status(view::stage_status(true, true).into());
+        // Primeiro quadro: o selo do palco sai de "Aguardando dados".
+        refresh_overview(app);
     }
+}
+
+/// Selo do canto do palco: bolinha ("Ao vivo") ou pílula de aviso.
+fn show_badge(app: &App, badge: view::StageBadge) {
+    app.set_stage_status(badge.text().into());
+    app.set_stage_live(badge.is_live());
+    app.set_stage_pill(badge.is_pill());
 }
 
 /// Seleciona um controle e pede ao núcleo os quadros ao vivo dele.

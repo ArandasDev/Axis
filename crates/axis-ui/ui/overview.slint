@@ -257,7 +257,8 @@ component Stage inherits Panel {
     in property <int> family;
     in property <bool> emulating;
     in property <bool> connected;
-    in property <bool> has-live;
+    in property <bool> stage-live;
+    in property <bool> stage-pill;
     in property <string> status;
     in property <LiveData> live;
 
@@ -311,19 +312,39 @@ component Stage inherits Panel {
                     }
                 }
                 Rectangle { }
-                VerticalLayout {
+                // Pausado ou só visualização: pílula de aviso, para não passar batido.
+                if root.stage-pill: VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        height: 24px;
+                        width: badge.preferred-width + 2 * Tokens.space-sm;
+                        border-radius: Tokens.radius-pill;
+                        border-width: 1px;
+                        border-color: Tokens.warning;
+                        background: Tokens.warning-soft;
+                        accessible-role: text;
+                        accessible-label: root.status;
+                        badge := Text {
+                            text: root.status;
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: Tokens.warning;
+                        }
+                    }
+                }
+                if !root.stage-pill: VerticalLayout {
                     alignment: center;
                     Rectangle {
                         width: 8px;
                         height: 8px;
                         border-radius: self.width / 2;
-                        background: root.has-live && root.connected ? Tokens.accent : Tokens.muted;
+                        background: root.stage-live ? Tokens.accent : Tokens.muted;
                     }
                 }
-                Text {
+                if !root.stage-pill: Text {
                     text: root.status;
                     font-size: 12px;
-                    color: root.has-live && root.connected ? Tokens.text : Tokens.muted;
+                    color: root.stage-live ? Tokens.text : Tokens.muted;
                     vertical-alignment: center;
                 }
             }
@@ -437,7 +458,8 @@ export component Overview inherits Rectangle {
     in property <int> family;
     in property <bool> emulating;
     in property <bool> connected;
-    in property <bool> has-live;
+    in property <bool> stage-live;
+    in property <bool> stage-pill;
     in property <string> stage-status;
     in property <LiveData> live;
     // Coluna das métricas e os dois planos lado a lado dentro dela.
@@ -481,7 +503,8 @@ export component Overview inherits Rectangle {
                 family: root.family;
                 emulating: root.emulating;
                 connected: root.connected;
-                has-live: root.has-live;
+                stage-live: root.stage-live;
+                stage-pill: root.stage-pill;
                 status: root.stage-status;
                 live: root.live;
             }

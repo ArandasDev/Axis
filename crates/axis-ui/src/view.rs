@@ -194,9 +194,12 @@ pub struct Header {
 
 /// `index` é a posição do controle na lista (0 → "DISPOSITIVO 01").
 /// O protocolo não informa USB/Bluetooth; o kicker mostra a família.
-pub fn header(index: usize, s: &SessionInfo, emulation: bool) -> Header {
+/// Pausado, o subtítulo diz com todas as letras que o jogo não recebe nada.
+pub fn header(index: usize, s: &SessionInfo, emulation: bool, paused: bool) -> Header {
     let subtitle = if !s.connected {
         "Reconectando…"
+    } else if paused {
+        "Emulação pausada — o jogo não recebe este controle"
     } else if s.view_only || !emulation {
         "Só visualização"
     } else {
@@ -234,12 +237,64 @@ pub fn live_accepted(selected: Option<&str>, sessions: &[SessionInfo], frame_id:
 }
 
 /// Estado no canto do palco.
-pub fn stage_status(connected: bool, has_live: bool) -> &'static str {
-    match (connected, has_live) {
-        (false, _) => "Reconectando…",
-        (true, true) => "Ao vivo",
-        (true, false) => "Aguardando dados",
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageBadge {
+    /// Bolinha no destaque: quadros chegando e o jogo recebendo.
+    Live,
+    Waiting,
+    Reconnecting,
+    /// Pílula de aviso: o jogo não recebe este controle.
+    Paused,
+    ViewOnly,
+}
+
+impl StageBadge {
+    pub fn text(self) -> &'static str {
+        match self {
+            StageBadge::Live => "Ao vivo",
+            StageBadge::Waiting => "Aguardando dados",
+            StageBadge::Reconnecting => "Reconectando…",
+            StageBadge::Paused => "Pausado",
+            StageBadge::ViewOnly => "Só visualização",
+        }
     }
+
+    /// Mostrado como pílula de aviso em vez da bolinha.
+    pub fn is_pill(self) -> bool {
+        matches!(self, StageBadge::Paused | StageBadge::ViewOnly)
+    }
+
+    /// Bolinha acesa no destaque.
+    pub fn is_live(self) -> bool {
+        self == StageBadge::Live
+    }
+}
+
+/// Reconectando vence tudo (o palco nem tem dados); depois a pausa; depois
+/// a só visualização (sem barramento virtual ou sessão sem controle virtual).
+pub fn stage_badge(
+    connected: bool,
+    paused: bool,
+    emulation: bool,
+    view_only: bool,
+    has_live: bool,
+) -> StageBadge {
+    if !connected {
+        StageBadge::Reconnecting
+    } else if paused {
+        StageBadge::Paused
+    } else if !emulation || view_only {
+        StageBadge::ViewOnly
+    } else if has_live {
+        StageBadge::Live
+    } else {
+        StageBadge::Waiting
+    }
+}
+
+/// A bolinha da barra de título só fica no destaque com a emulação ativa.
+pub fn status_active(paused: bool, emulation: bool) -> bool {
+    !paused && emulation
 }
 
 #[cfg(test)]
@@ -459,7 +514,7 @@ mod tests {
 
     #[test]
     fn header_texts() {
-        let h = header(0, &maria(), true);
+        let h = header(0, &maria(), true, false);
         assert_eq!(h.kicker, "DISPOSITIVO 01 · DS4");
         assert_eq!(h.title, "Controle de Maria");
         assert_eq!(h.subtitle, "Emulando Xbox 360 via XInput");
@@ -469,19 +524,22 @@ mod tests {
             view_only: true,
             ..maria()
         };
-        let h = header(2, &ds, true);
+        let h = header(2, &ds, true, false);
         assert_eq!(h.kicker, "DISPOSITIVO 03 · DUALSENSE");
         assert_eq!(h.subtitle, "Só visualização");
 
         // Núcleo sem barramento virtual: tudo é só visualização.
-        assert_eq!(header(0, &maria(), false).subtitle, "Só visualização");
+        assert_eq!(
+            header(0, &maria(), false, false).subtitle,
+            "Só visualização"
+        );
 
         let gone = SessionInfo {
             connected: false,
             family: Family::Xbox,
             ..maria()
         };
-        let h = header(9, &gone, true);
+        let h = header(9, &gone, true, false);
         assert_eq!(h.kicker, "DISPOSITIVO 10 · XBOX");
         assert_eq!(h.subtitle, "Reconectando…");
     }
@@ -493,16 +551,22 @@ mod tests {
             ..maria()
         };
         // Nome padrão: "Controle 1", não "Controle de Controle 1".
-        assert_eq!(header(0, &named("Controle 1"), true).title, "Controle 1");
         assert_eq!(
-            header(0, &named("  controle azul "), true).title,
+            header(0, &named("Controle 1"), true, false).title,
+            "Controle 1"
+        );
+        assert_eq!(
+            header(0, &named("  controle azul "), true, false).title,
             "controle azul"
         );
-        assert_eq!(header(0, &named("CONTROLE"), true).title, "CONTROLE");
-        assert_eq!(header(0, &named("Maria"), true).title, "Controle de Maria");
+        assert_eq!(header(0, &named("CONTROLE"), true, false).title, "CONTROLE");
+        assert_eq!(
+            header(0, &named("Maria"), true, false).title,
+            "Controle de Maria"
+        );
         // Só o começo conta.
         assert_eq!(
-            header(0, &named("Ana Controle"), true).title,
+            header(0, &named("Ana Controle"), true, false).title,
             "Controle de Ana Controle"
         );
     }
@@ -518,10 +582,66 @@ mod tests {
     }
 
     #[test]
-    fn stage_status_texts() {
-        assert_eq!(stage_status(true, true), "Ao vivo");
-        assert_eq!(stage_status(true, false), "Aguardando dados");
-        assert_eq!(stage_status(false, true), "Reconectando…");
-        assert_eq!(stage_status(false, false), "Reconectando…");
+    fn stage_badges() {
+        use StageBadge::*;
+        // stage_badge(connected, paused, emulation, view_only, has_live)
+        assert_eq!(stage_badge(true, false, true, false, true), Live);
+        assert_eq!(stage_badge(true, false, true, false, false), Waiting);
+        // Pausa vence a falta de dados e a só visualização.
+        assert_eq!(stage_badge(true, true, true, false, true), Paused);
+        assert_eq!(stage_badge(true, true, true, false, false), Paused);
+        assert_eq!(stage_badge(true, true, false, true, true), Paused);
+        // Sem barramento virtual ou sessão sem controle virtual.
+        assert_eq!(stage_badge(true, false, false, false, true), ViewOnly);
+        assert_eq!(stage_badge(true, false, true, true, true), ViewOnly);
+        // Reconectando vence tudo: o palco nem tem dados.
+        assert_eq!(stage_badge(false, true, true, false, true), Reconnecting);
+        assert_eq!(stage_badge(false, false, true, false, false), Reconnecting);
+    }
+
+    #[test]
+    fn stage_badge_texts_and_styles() {
+        use StageBadge::*;
+        let all = [Live, Waiting, Reconnecting, Paused, ViewOnly];
+        assert_eq!(
+            all.map(StageBadge::text),
+            [
+                "Ao vivo",
+                "Aguardando dados",
+                "Reconectando…",
+                "Pausado",
+                "Só visualização"
+            ]
+        );
+        // Pausado e só visualização viram pílula; o resto fica com a bolinha.
+        assert_eq!(
+            all.map(StageBadge::is_pill),
+            [false, false, false, true, true]
+        );
+        assert_eq!(
+            all.map(StageBadge::is_live),
+            [true, false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn paused_header_subtitle() {
+        let paused = "Emulação pausada — o jogo não recebe este controle";
+        assert_eq!(header(0, &maria(), true, true).subtitle, paused);
+        // A pausa vale também com a emulação desligada ou só visualização.
+        assert_eq!(header(0, &maria(), false, true).subtitle, paused);
+        let gone = SessionInfo {
+            connected: false,
+            ..maria()
+        };
+        assert_eq!(header(0, &gone, true, true).subtitle, "Reconectando…");
+    }
+
+    #[test]
+    fn status_dot_active_only_when_emulating() {
+        assert!(status_active(false, true));
+        assert!(!status_active(true, true));
+        assert!(!status_active(false, false));
+        assert!(!status_active(true, false));
     }
 }
