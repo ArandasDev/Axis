@@ -66,6 +66,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "axis-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "axis-virtual"
 version = "0.1.0"
 dependencies = [
