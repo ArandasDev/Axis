@@ -5,13 +5,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use axis_core::repair::{Capture, Outcome};
 use axis_core::{InputState, Pipeline, Trace};
 use axis_devices::{Controller, DeviceError, DeviceStatus, OutputState};
 use axis_virtual::{Rumble, VirtualPad};
 
-use crate::live::{LiveSample, LiveTap};
+use crate::live::{CaptureSnapshot, LiveSample, LiveTap};
 
 pub type SharedPad = Arc<Mutex<Box<dyn VirtualPad>>>;
+
+/// Relógio do worker; os testes injetam um tempo simulado.
+pub(crate) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 pub enum WorkerCommand {
     SetPipeline(Box<Pipeline>),
@@ -23,6 +27,11 @@ pub enum WorkerCommand {
     SetPaused(bool),
     /// Troca (ou solta, com `None`) o controle virtual sem reiniciar o worker.
     SetPad(Option<SharedPad>),
+    /// Começa uma captura do kit de correção (o buffer já vem alocado); substitui
+    /// qualquer captura ou resultado anterior.
+    StartCapture(Box<Capture>),
+    /// Solta a captura em andamento e limpa o resultado.
+    CancelCapture,
     Shutdown,
 }
 
@@ -105,6 +114,52 @@ impl LatencyHistogram {
     }
 }
 
+const JITTER_WINDOW: usize = 256;
+
+/// Anel fixo com os últimos intervalos entre reports, em µs.
+pub(crate) struct IntervalRing {
+    buf: [u32; JITTER_WINDOW],
+    len: usize,
+    next: usize,
+}
+
+impl Default for IntervalRing {
+    fn default() -> Self {
+        Self {
+            buf: [0; JITTER_WINDOW],
+            len: 0,
+            next: 0,
+        }
+    }
+}
+
+impl IntervalRing {
+    pub(crate) fn record(&mut self, us: u32) {
+        self.buf[self.next] = us;
+        self.next = (self.next + 1) % JITTER_WINDOW;
+        self.len = (self.len + 1).min(JITTER_WINDOW);
+    }
+
+    /// p99 de |intervalo − média| (0 se vazio). Sem alocação: ordena uma cópia na pilha.
+    pub(crate) fn jitter_p99(&self) -> u32 {
+        let n = self.len;
+        if n == 0 {
+            return 0;
+        }
+        // Antes de encher, os válidos são `buf[..len]`; depois, o anel inteiro.
+        let vals = &self.buf[..n];
+        let mean = vals.iter().map(|&v| u64::from(v)).sum::<u64>() as f64 / n as f64;
+        let mut dev = [0u32; JITTER_WINDOW];
+        for (d, &v) in dev.iter_mut().zip(vals) {
+            *d = (f64::from(v) - mean).abs().round() as u32;
+        }
+        let dev = &mut dev[..n];
+        dev.sort_unstable();
+        let i = ((n as f64 * 0.99).ceil() as usize).clamp(1, n) - 1;
+        dev[i]
+    }
+}
+
 /// Verdadeiro no máximo uma vez por `WARN_INTERVAL`.
 fn rate_limited_ok(last: &mut Option<Instant>) -> bool {
     let now = Instant::now();
@@ -147,11 +202,26 @@ struct Worker {
     live_seq: u64,
     /// p99 da última janela de 60 s do histograma (0 antes da primeira).
     latency_p99_us: u32,
+    /// Última amostra publicada, para republicar quando só a captura muda.
+    last_live: (InputState, InputState, Trace),
+    clock: Clock,
+    /// Captura em andamento e o instante em que começou.
+    capture: Option<(Box<Capture>, Instant)>,
+    /// O que a amostra ao vivo mostra da captura (inclui o resultado final).
+    capture_snapshot: Option<CaptureSnapshot>,
+    intervals: IntervalRing,
+    /// Report anterior para o jitter; `None` no início e após o link cair.
+    prev_report: Option<Instant>,
 }
 
 impl Worker {
+    fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
     fn publish_live(&mut self, input: InputState, output: InputState, trace: Trace) {
         self.live_seq += 1;
+        self.last_live = (input, output, trace);
         self.tap.publish(LiveSample {
             input,
             output,
@@ -160,7 +230,43 @@ impl Worker {
             reports: self.reports,
             latency_p99_us: self.latency_p99_us,
             seq: self.live_seq,
+            capture: self.capture_snapshot.clone(),
+            jitter_us: self.intervals.jitter_p99(),
         });
+    }
+
+    /// A captura mudou por comando: republica a última amostra (respeitando os 17 ms).
+    fn capture_changed(&mut self) {
+        if self.tap.enabled() && self.pending.is_none() {
+            self.pending = Some(self.last_live);
+        }
+    }
+
+    /// Entrega o report cru à captura; ao terminar, guarda o resultado e solta o buffer.
+    fn feed_capture(&mut self, input: &InputState, now: Instant) {
+        let Some((cap, since)) = self.capture.as_mut() else {
+            return;
+        };
+        cap.push(input, now.saturating_duration_since(*since).as_secs_f32());
+        let done = cap.is_done();
+        let snap = CaptureSnapshot {
+            kind: cap.kind(),
+            progress: cap.progress(),
+            outcome: done.then(|| cap.finish()),
+        };
+        self.capture_snapshot = Some(snap);
+        if done {
+            self.capture = None;
+        }
+    }
+
+    /// Link caído ou saída com captura ativa: resultado `Aborted`.
+    fn abort_capture(&mut self) {
+        if self.capture.take().is_some() {
+            if let Some(s) = &mut self.capture_snapshot {
+                s.outcome = Some(Outcome::Aborted);
+            }
+        }
     }
 
     /// Amostra neutra (palco não congela), fora do limite de 17 ms; só com o tap ligado.
@@ -207,6 +313,20 @@ impl Worker {
                 Ok(WorkerCommand::SetPad(p)) => {
                     self.pad = p;
                     self.stop_rumble();
+                }
+                Ok(WorkerCommand::StartCapture(c)) => {
+                    self.capture_snapshot = Some(CaptureSnapshot {
+                        kind: c.kind(),
+                        progress: c.progress(),
+                        outcome: None,
+                    });
+                    self.capture = Some((c, self.now()));
+                    self.capture_changed();
+                }
+                Ok(WorkerCommand::CancelCapture) => {
+                    self.capture = None;
+                    self.capture_snapshot = None;
+                    self.capture_changed();
                 }
                 Ok(WorkerCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
                     return Some(WorkerExit::Shutdown);
@@ -259,14 +379,21 @@ impl Worker {
             }
             match self.controller.read(READ_TIMEOUT_MS) {
                 Ok(Some(report)) => {
-                    let started = Instant::now();
+                    let started = self.now();
                     self.last_report = started;
                     if !self.link_up {
                         self.link_up = true;
                         (self.on_link)(true);
                     }
+                    if let Some(prev) = self.prev_report {
+                        let us = started.saturating_duration_since(prev).as_micros();
+                        self.intervals.record(us.min(u128::from(u32::MAX)) as u32);
+                    }
+                    self.prev_report = Some(started);
                     self.reports += 1;
                     self.last_status = report.status;
+                    // Entrada crua: vale pausado, só visualização e sem inspeção.
+                    self.feed_capture(&report.input, started);
                     let live = self.tap.enabled();
                     let forward = !self.paused && self.pad.is_some();
                     if live || forward {
@@ -277,7 +404,8 @@ impl Worker {
                         };
                         if forward {
                             self.send_pad(&out);
-                            self.latency.record(started.elapsed().as_micros() as u64);
+                            let took = self.now().saturating_duration_since(started);
+                            self.latency.record(took.as_micros() as u64);
                         }
                         if live {
                             if self
@@ -309,7 +437,7 @@ impl Worker {
                 }
                 Ok(None) => {
                     if let Some((input, out, trace)) = self.pending {
-                        let now = Instant::now();
+                        let now = self.now();
                         if self.last_publish.is_none_or(|t| now - t >= LIVE_INTERVAL) {
                             self.pending = None;
                             self.last_publish = Some(now);
@@ -320,12 +448,16 @@ impl Worker {
                     }
                     if self.detect_silence
                         && self.link_up
-                        && self.last_report.elapsed() >= SILENCE_THRESHOLD
+                        && self.now().saturating_duration_since(self.last_report)
+                            >= SILENCE_THRESHOLD
                     {
                         self.link_up = false;
                         self.written = None;
+                        self.prev_report = None;
                         self.stop_rumble();
                         self.send_pad(&InputState::default());
+                        // O neutro já leva o `Aborted`: é a amostra que fica.
+                        self.abort_capture();
                         self.publish_neutral();
                         (self.on_link)(false);
                     }
@@ -359,8 +491,35 @@ pub fn spawn_worker(
     on_link: impl Fn(bool) + Send + 'static,
     tap: Arc<LiveTap>,
 ) -> (Sender<WorkerCommand>, JoinHandle<()>) {
+    spawn_clocked(
+        controller,
+        pad,
+        pipeline,
+        status,
+        detect_silence,
+        on_exit,
+        on_link,
+        tap,
+        Arc::new(Instant::now),
+    )
+}
+
+/// `spawn_worker` com relógio injetável (os testes simulam o tempo).
+#[allow(clippy::too_many_arguments)]
+fn spawn_clocked(
+    controller: Box<dyn Controller>,
+    pad: Option<SharedPad>,
+    pipeline: Pipeline,
+    status: Arc<Mutex<WorkerStatus>>,
+    detect_silence: bool,
+    on_exit: impl FnOnce(WorkerExit) + Send + 'static,
+    on_link: impl Fn(bool) + Send + 'static,
+    tap: Arc<LiveTap>,
+    clock: Clock,
+) -> (Sender<WorkerCommand>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
+        let now = clock();
         let mut w = Worker {
             controller,
             pad,
@@ -372,20 +531,27 @@ pub fn spawn_worker(
             on_link: Box::new(on_link),
             detect_silence,
             link_up: true,
-            last_report: Instant::now(),
+            last_report: now,
             reports: 0,
             last_status: DeviceStatus::default(),
             last_warn: None,
             last_out_warn: None,
             latency: LatencyHistogram::default(),
-            latency_since: Instant::now(),
+            latency_since: now,
             tap,
             last_publish: None,
             pending: None,
             live_seq: 0,
             latency_p99_us: 0,
+            last_live: Default::default(),
+            clock,
+            capture: None,
+            capture_snapshot: None,
+            intervals: IntervalRing::default(),
+            prev_report: None,
         };
         let exit = w.run(&rx);
+        w.abort_capture();
         w.publish_status();
         w.publish_neutral();
         w.send_pad(&InputState::default());
@@ -397,15 +563,17 @@ pub fn spawn_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live::LiveTap;
+    use crate::live::{CaptureSnapshot, LiveTap};
     use crate::testkit::{FakeController, FakePad, ReadQueue};
+    use axis_core::repair::{Capture, CaptureKind, Outcome, Stick};
     use axis_core::{Corrections, InputState, Pipeline, Profile, Trace, Vec2};
-    use axis_devices::{DeviceError, OutputState, Report};
+    use axis_devices::{Controller, DeviceError, OutputState, Report};
     use axis_virtual::{Rumble, VirtualPad};
     use std::sync::mpsc::Sender;
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
     use std::time::Duration;
+    use std::time::Instant;
 
     fn report_x(x: f32) -> Result<Option<Report>, DeviceError> {
         let mut r = Report::default();
@@ -450,6 +618,105 @@ mod tests {
     fn start_opts(ctl: FakeController, with_pad: bool, detect_silence: bool) -> Harness {
         let writes = ctl.writes.clone();
         let reads = ctl.reads.clone();
+        launch(
+            Box::new(ctl),
+            writes,
+            reads,
+            with_pad,
+            detect_silence,
+            Arc::new(Instant::now),
+        )
+    }
+
+    /// Relógio simulado: só anda quando o controle falso lê.
+    #[derive(Clone)]
+    struct FakeClock {
+        base: Instant,
+        offset: Arc<Mutex<Duration>>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                base: Instant::now(),
+                offset: Arc::new(Mutex::new(Duration::ZERO)),
+            }
+        }
+
+        fn advance(&self, d: Duration) {
+            *self.offset.lock().unwrap() += d;
+        }
+
+        fn clock(&self) -> Clock {
+            let c = self.clone();
+            Arc::new(move || c.base + *c.offset.lock().unwrap())
+        }
+    }
+
+    /// Controle falso com tempo simulado: cada report avança o relógio pelo
+    /// próximo passo (em ciclo); cada leitura ociosa avança o timeout.
+    struct ClockedController {
+        inner: FakeController,
+        clock: FakeClock,
+        steps: Vec<Duration>,
+        n: usize,
+    }
+
+    impl Controller for ClockedController {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn family(&self) -> axis_core::DeviceFamily {
+            self.inner.family()
+        }
+        fn transport(&self) -> axis_devices::Transport {
+            self.inner.transport()
+        }
+        fn experimental(&self) -> bool {
+            self.inner.experimental()
+        }
+        fn read(&mut self, timeout_ms: i32) -> Result<Option<Report>, DeviceError> {
+            let r = self.inner.read(timeout_ms);
+            match &r {
+                Ok(Some(_)) => {
+                    self.clock.advance(self.steps[self.n % self.steps.len()]);
+                    self.n += 1;
+                }
+                Ok(None) => self
+                    .clock
+                    .advance(Duration::from_millis(timeout_ms.max(0) as u64)),
+                Err(_) => {}
+            }
+            r
+        }
+        fn write_output(&mut self, out: &OutputState) -> Result<(), DeviceError> {
+            self.inner.write_output(out)
+        }
+    }
+
+    fn start_clocked(steps: Vec<Duration>, with_pad: bool) -> Harness {
+        let inner = FakeController::new(vec![]);
+        let writes = inner.writes.clone();
+        let reads = inner.reads.clone();
+        let clock = FakeClock::new();
+        let c = clock.clock();
+        let ctl = ClockedController {
+            inner,
+            clock,
+            steps,
+            n: 0,
+        };
+        launch(Box::new(ctl), writes, reads, with_pad, true, c)
+    }
+
+    fn launch(
+        ctl: Box<dyn Controller>,
+        writes: Arc<Mutex<Vec<OutputState>>>,
+        reads: ReadQueue,
+        with_pad: bool,
+        detect_silence: bool,
+        clock: Clock,
+    ) -> Harness {
         let (pad, received) = FakePad::new();
         let shared: Option<SharedPad> = if with_pad {
             Some(Arc::new(Mutex::new(Box::new(pad) as Box<dyn VirtualPad>)))
@@ -462,8 +729,8 @@ mod tests {
         let links = Arc::new(Mutex::new(Vec::new()));
         let links2 = links.clone();
         let tap = LiveTap::new();
-        let (tx, handle) = spawn_worker(
-            Box::new(ctl),
+        let (tx, handle) = spawn_clocked(
+            ctl,
             shared,
             default_pipeline(),
             status.clone(),
@@ -475,6 +742,7 @@ mod tests {
             },
             move |up| links2.lock().unwrap().push(up),
             tap.clone(),
+            clock,
         );
         Harness {
             tx,
@@ -774,6 +1042,169 @@ mod tests {
         wait_until(|| tap.latest().input.left.x > 0.5);
         h.finish();
         assert_eq!(tap.latest().output, InputState::default());
+    }
+
+    fn ms(v: u64) -> Duration {
+        Duration::from_millis(v)
+    }
+
+    fn drift_left() -> Box<Capture> {
+        Box::new(Capture::new(
+            CaptureKind::Drift(Stick::Left),
+            Vec2::default(),
+        ))
+    }
+
+    fn push_reports(h: &Harness, n: usize, x: f32) {
+        let mut q = h.reads.lock().unwrap();
+        for _ in 0..n {
+            q.push_back(report_x(x));
+        }
+    }
+
+    fn snapshot(h: &Harness) -> Option<CaptureSnapshot> {
+        h.tap.latest().capture
+    }
+
+    #[test]
+    fn capture_collects_raw_input_and_reports_outcome() {
+        // Só visualização: a captura não depende do virtual nem da saída.
+        let h = start_clocked(vec![ms(4)], false);
+        h.tap.set_enabled(true);
+        h.tx.send(WorkerCommand::StartCapture(drift_left()))
+            .unwrap();
+        std::thread::sleep(ms(80));
+        // 776 reports a cada 4 ms = 3,1 s de tempo simulado.
+        push_reports(&h, 776, 0.04);
+        wait_until(|| snapshot(&h).is_some_and(|s| s.outcome.is_some()));
+        let s = h.tap.latest();
+        assert_eq!(s.output.left.x, 0.0, "a deadzone padrão zera 0,04 na saída");
+        let snap = s.capture.unwrap();
+        assert_eq!(snap.kind, CaptureKind::Drift(Stick::Left));
+        assert_eq!(snap.progress, 1.0);
+        let Some(Outcome::Drift(r)) = snap.outcome else {
+            panic!("esperava Drift, veio {:?}", snap.outcome);
+        };
+        assert!((r.center.x - 0.04).abs() < 1e-3, "{r:?}");
+        assert!(r.center.y.abs() < 1e-3, "{r:?}");
+        // O resultado fica na amostra enquanto não vier outro comando.
+        let before = h.tap.latest().reports;
+        push_reports(&h, 10, 0.04);
+        wait_until(|| h.tap.latest().reports >= before + 10);
+        assert!(matches!(
+            snapshot(&h).and_then(|s| s.outcome),
+            Some(Outcome::Drift(_))
+        ));
+        h.finish();
+    }
+
+    #[test]
+    fn capture_progress_is_published_while_running() {
+        let h = start_clocked(vec![ms(4)], true);
+        h.tap.set_enabled(true);
+        h.tx.send(WorkerCommand::StartCapture(drift_left()))
+            .unwrap();
+        // Sem reports: o início da captura já sai na amostra.
+        wait_until(|| snapshot(&h).is_some());
+        assert_eq!(snapshot(&h).unwrap().progress, 0.0);
+        push_reports(&h, 376, 0.0); // 1,5 s
+        wait_until(|| h.tap.latest().reports == 376);
+        let s = snapshot(&h).unwrap();
+        assert!((s.progress - 0.5).abs() < 0.01, "{s:?}");
+        assert_eq!(s.outcome, None);
+        h.finish();
+    }
+
+    #[test]
+    fn capture_aborted_on_link_down() {
+        let h = start_clocked(vec![ms(4)], true);
+        h.tap.set_enabled(true);
+        h.tx.send(WorkerCommand::StartCapture(drift_left()))
+            .unwrap();
+        std::thread::sleep(ms(80));
+        push_reports(&h, 50, 0.04);
+        wait_until(|| snapshot(&h).is_some_and(|s| s.progress > 0.0));
+        // Fila vazia: o relógio simulado passa dos 500 ms de silêncio.
+        wait_until(|| *h.links.lock().unwrap() == vec![false]);
+        let s = h.tap.latest();
+        assert_eq!(s.input, InputState::default(), "neutro publicado");
+        assert_eq!(
+            s.capture.as_ref().and_then(|c| c.outcome.clone()),
+            Some(Outcome::Aborted)
+        );
+        // O sinal volta: a captura não recomeça sozinha.
+        push_reports(&h, 5, 0.04);
+        wait_until(|| h.tap.latest().reports == 55);
+        assert_eq!(snapshot(&h).and_then(|c| c.outcome), Some(Outcome::Aborted));
+        h.finish();
+    }
+
+    #[test]
+    fn capture_aborted_on_worker_exit() {
+        let h = start_clocked(vec![ms(4)], true);
+        h.tap.set_enabled(true);
+        h.tx.send(WorkerCommand::StartCapture(drift_left()))
+            .unwrap();
+        std::thread::sleep(ms(80));
+        push_reports(&h, 20, 0.04);
+        wait_until(|| snapshot(&h).is_some_and(|s| s.progress > 0.0));
+        let tap = h.tap.clone();
+        h.finish();
+        let s = tap.latest();
+        assert_eq!(s.output, InputState::default());
+        assert_eq!(s.capture.and_then(|c| c.outcome), Some(Outcome::Aborted));
+    }
+
+    #[test]
+    fn cancel_clears_capture() {
+        let h = start_clocked(vec![ms(4)], true);
+        h.tap.set_enabled(true);
+        h.tx.send(WorkerCommand::StartCapture(drift_left()))
+            .unwrap();
+        std::thread::sleep(ms(80));
+        push_reports(&h, 50, 0.04);
+        wait_until(|| snapshot(&h).is_some_and(|s| s.progress > 0.0));
+        h.tx.send(WorkerCommand::CancelCapture).unwrap();
+        // Sem reports novos: o cancelamento sai na leitura ociosa seguinte.
+        wait_until(|| snapshot(&h).is_none());
+        // A captura foi solta: 3,1 s de reports depois, nada de resultado.
+        push_reports(&h, 776, 0.04);
+        wait_until(|| h.tap.latest().reports == 826);
+        assert_eq!(snapshot(&h), None);
+        h.finish();
+    }
+
+    #[test]
+    fn jitter_reflects_interval_spread() {
+        let h = start_clocked(vec![ms(4), ms(6)], true);
+        h.tap.set_enabled(true);
+        push_reports(&h, 300, 0.0);
+        wait_until(|| h.tap.latest().reports == 300);
+        let j = h.tap.latest().jitter_us;
+        assert!((800..=1200).contains(&j), "jitter {j}");
+        h.finish();
+
+        let h = start_clocked(vec![ms(5)], true);
+        h.tap.set_enabled(true);
+        push_reports(&h, 300, 0.0);
+        wait_until(|| h.tap.latest().reports == 300);
+        let j = h.tap.latest().jitter_us;
+        assert!(j < 100, "jitter {j}");
+        h.finish();
+    }
+
+    #[test]
+    fn interval_ring_p99_of_deviation() {
+        let mut r = IntervalRing::default();
+        assert_eq!(r.jitter_p99(), 0);
+        for i in 0..1000 {
+            r.record(if i % 2 == 0 { 4000 } else { 6000 });
+        }
+        assert_eq!(r.jitter_p99(), 1000);
+        for _ in 0..256 {
+            r.record(5000);
+        }
+        assert_eq!(r.jitter_p99(), 0, "a janela só guarda os 256 últimos");
     }
 
     #[test]

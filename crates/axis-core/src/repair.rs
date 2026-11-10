@@ -259,6 +259,10 @@ impl Capture {
         self.done
     }
 
+    pub fn kind(&self) -> CaptureKind {
+        self.kind
+    }
+
     /// Analisa o que foi capturado. Nunca devolve `Outcome::Aborted`.
     pub fn finish(&self) -> Outcome {
         match self.kind {

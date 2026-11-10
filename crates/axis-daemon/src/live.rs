@@ -5,12 +5,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use axis_core::repair::{CaptureKind, Outcome};
 use axis_core::{DeviceFamily, InputState, StickTrace, Trace, Vec2};
 use axis_devices::DeviceStatus;
 use axis_protocol::{Family, PadState, SessionInfo, StickStages};
 
+/// Estado da captura do kit de correção; o resultado fica até a próxima
+/// `StartCapture`/`CancelCapture`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CaptureSnapshot {
+    pub kind: CaptureKind,
+    pub progress: f32,
+    pub outcome: Option<Outcome>,
+}
+
 /// Fotografia do que o worker viu e produziu no último report publicado.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LiveSample {
     pub input: InputState,
     pub output: InputState,
@@ -21,6 +31,9 @@ pub struct LiveSample {
     /// p99 da última janela de 60 s do histograma (0 antes da primeira).
     pub latency_p99_us: u32,
     pub seq: u64,
+    pub capture: Option<CaptureSnapshot>,
+    /// p99 de |intervalo − média| entre os últimos 256 reports, em µs.
+    pub jitter_us: u32,
 }
 
 /// Canal worker -> UI: desligado por padrão, o worker não paga nada por ele.
@@ -46,7 +59,10 @@ impl LiveTap {
     }
 
     pub fn latest(&self) -> LiveSample {
-        *self.sample.lock().unwrap_or_else(|e| e.into_inner())
+        self.sample
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub(crate) fn publish(&self, s: LiveSample) {
