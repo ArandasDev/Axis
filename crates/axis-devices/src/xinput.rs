@@ -40,6 +40,11 @@ fn query(slot: u32) -> Result<XINPUT_STATE, u32> {
     }
 }
 
+/// `true` se há um controle (físico ou virtual) conectado no slot XInput.
+pub fn xinput_is_connected(slot: u32) -> bool {
+    query(slot).is_ok()
+}
+
 /// Parte pura de [`available_slots`].
 pub(crate) fn filter_slots(connected: [bool; 4], exclude: &[u32]) -> Vec<u32> {
     (0u32..4)

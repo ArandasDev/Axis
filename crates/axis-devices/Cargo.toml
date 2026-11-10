@@ -7,5 +7,6 @@ rust-version.workspace = true
 [dependencies]
 axis-core = { path = "../axis-core" }
 hidapi.workspace = true
+log.workspace = true
 thiserror.workspace = true
 windows-sys.workspace = true

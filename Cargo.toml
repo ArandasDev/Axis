@@ -9,8 +9,9 @@ rust-version = "1.85"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+log = { version = "0.4", features = ["std"] }
 toml = "0.8"
 proptest = "1"
 criterion = "0.5"
 hidapi = "2"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Input_XboxController", "Win32_Devices_DeviceAndDriverInstallation"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Input_XboxController", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Security", "Win32_System_Registry", "Win32_System_Threading"] }

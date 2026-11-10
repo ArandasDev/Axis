@@ -1,0 +1,15 @@
+[package]
+name = "axis-virtual"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axis-core = { path = "../axis-core" }
+axis-devices = { path = "../axis-devices" }
+thiserror.workspace = true
+vigem-client = { version = "0.1", features = ["unstable_xtarget_notification"] }
+windows-sys.workspace = true
+
+[dev-dependencies]
+hidapi.workspace = true
