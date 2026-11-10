@@ -203,6 +203,7 @@ impl Controller for HidController {
                     now,
                 ) {
                     self.last_full_request = Some(now);
+                    log::info!("reativando modo completo do DS4");
                     // Buffer na pilha (sem alocação); a resposta não interessa.
                     let mut feature = [0u8; 64];
                     feature[0] = ds4::FEATURE_ENABLE_FULL_BT;

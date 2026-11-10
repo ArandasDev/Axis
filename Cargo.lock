@@ -60,6 +60,7 @@ version = "0.1.0"
 dependencies = [
  "axis-core",
  "hidapi",
+ "log",
  "thiserror",
  "windows-sys",
 ]

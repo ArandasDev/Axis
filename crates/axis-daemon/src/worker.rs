@@ -125,6 +125,8 @@ struct Worker {
     written: Option<OutputState>,
     paused: bool,
     on_link: Box<dyn Fn(bool) + Send>,
+    /// Só controles que transmitem sempre (DS4/DualSense) usam o silêncio como sinal.
+    detect_silence: bool,
     link_up: bool,
     last_report: Instant,
     reports: u64,
@@ -165,13 +167,22 @@ impl Worker {
                     }
                     self.paused = p;
                 }
-                Ok(WorkerCommand::SetPad(p)) => self.pad = p,
+                Ok(WorkerCommand::SetPad(p)) => {
+                    self.pad = p;
+                    self.stop_rumble();
+                }
                 Ok(WorkerCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
                     return Some(WorkerExit::Shutdown);
                 }
                 Err(TryRecvError::Empty) => return None,
             }
         }
+    }
+
+    /// Zera a vibração: nenhum pedido antigo deve voltar quando o controle religar.
+    fn stop_rumble(&mut self) {
+        self.out.rumble_strong = 0;
+        self.out.rumble_weak = 0;
     }
 
     fn flush_output(&mut self) -> Option<WorkerExit> {
@@ -239,9 +250,13 @@ impl Worker {
                     }
                 }
                 Ok(None) => {
-                    if self.link_up && self.last_report.elapsed() >= SILENCE_THRESHOLD {
+                    if self.detect_silence
+                        && self.link_up
+                        && self.last_report.elapsed() >= SILENCE_THRESHOLD
+                    {
                         self.link_up = false;
                         self.written = None;
+                        self.stop_rumble();
                         self.send_pad(&InputState::default());
                         (self.on_link)(false);
                     }
@@ -261,6 +276,7 @@ fn exit_for(e: DeviceError) -> WorkerExit {
 }
 
 /// Inicia a thread do controle. `pad = None` é o modo visualização (sem virtual).
+/// `detect_silence` liga a detecção de silêncio (só para quem transmite sempre).
 /// `on_link` é chamado na própria thread (não pode bloquear): `false` após
 /// `SILENCE_THRESHOLD` sem reports, `true` quando os reports voltam.
 pub fn spawn_worker(
@@ -268,6 +284,7 @@ pub fn spawn_worker(
     pad: Option<SharedPad>,
     pipeline: Pipeline,
     status: Arc<Mutex<WorkerStatus>>,
+    detect_silence: bool,
     on_exit: impl FnOnce(WorkerExit) + Send + 'static,
     on_link: impl Fn(bool) + Send + 'static,
 ) -> (Sender<WorkerCommand>, JoinHandle<()>) {
@@ -282,6 +299,7 @@ pub fn spawn_worker(
             written: Some(OutputState::default()),
             paused: false,
             on_link: Box::new(on_link),
+            detect_silence,
             link_up: true,
             last_report: Instant::now(),
             reports: 0,
@@ -347,6 +365,10 @@ mod tests {
     }
 
     fn start_with(ctl: FakeController, with_pad: bool) -> Harness {
+        start_opts(ctl, with_pad, true)
+    }
+
+    fn start_opts(ctl: FakeController, with_pad: bool, detect_silence: bool) -> Harness {
         let writes = ctl.writes.clone();
         let reads = ctl.reads.clone();
         let (pad, received) = FakePad::new();
@@ -365,6 +387,7 @@ mod tests {
             shared,
             default_pipeline(),
             status.clone(),
+            detect_silence,
             move |e| {
                 let mut slot = exit2.lock().unwrap();
                 assert!(slot.is_none(), "on_exit chamado mais de uma vez");
@@ -529,6 +552,51 @@ mod tests {
         wait_until(|| h.received.lock().unwrap().len() == 4);
         assert!((h.received.lock().unwrap()[3].left.x - 1.0).abs() < 1e-3);
         assert_eq!(*h.links.lock().unwrap(), vec![false, true]);
+        h.finish();
+    }
+
+    #[test]
+    fn non_streaming_controller_never_signals_link_down() {
+        let h = start_opts(FakeController::new(vec![report_x(1.0)]), true, false);
+        wait_until(|| h.received.lock().unwrap().len() == 1);
+        std::thread::sleep(SILENCE_THRESHOLD + Duration::from_millis(200));
+        assert!(h.links.lock().unwrap().is_empty());
+        assert_eq!(
+            h.received.lock().unwrap().len(),
+            1,
+            "sem neutro por silêncio"
+        );
+        h.finish();
+    }
+
+    #[test]
+    fn rumble_is_zeroed_when_the_link_drops_and_on_set_pad() {
+        let h = start(vec![report_x(1.0)], true);
+        h.tx.send(WorkerCommand::SetLight {
+            lightbar: [1, 2, 3],
+            player: Some(1),
+        })
+        .unwrap();
+        h.tx.send(WorkerCommand::Rumble(Rumble {
+            strong: 200,
+            weak: 50,
+        }))
+        .unwrap();
+        wait_until(|| {
+            h.writes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|w| w.rumble_strong == 200)
+        });
+        wait_until(|| *h.links.lock().unwrap() == vec![false]);
+        h.tx.send(WorkerCommand::SetPad(None)).unwrap();
+        let before = h.writes.lock().unwrap().len();
+        h.reads.lock().unwrap().push_back(report_x(1.0));
+        wait_until(|| h.writes.lock().unwrap().len() > before);
+        let w = *h.writes.lock().unwrap().last().unwrap();
+        assert_eq!((w.rumble_strong, w.rumble_weak), (0, 0));
+        assert_eq!((w.lightbar, w.player), ([1, 2, 3], Some(1)));
         h.finish();
     }
 

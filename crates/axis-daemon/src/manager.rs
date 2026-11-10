@@ -703,11 +703,14 @@ impl Manager {
         let status = Arc::new(Mutex::new(WorkerStatus::default()));
         let link_events = self.events.clone();
         let events = self.events.clone();
+        // Xbox (XInput) não manda nada parado: silêncio não indica desligamento.
+        let detect_silence = matches!(family, DeviceFamily::DualShock4 | DeviceFamily::DualSense);
         let (tx, handle) = spawn_worker(
             controller,
             pad.clone(),
             pipeline,
             status.clone(),
+            detect_silence,
             move |exit| {
                 let _ = events.send(Event::WorkerExited {
                     session: number,
@@ -1623,6 +1626,20 @@ mod tests {
     fn link_up_after_expiry_plugs_new_pad_and_announces_player() {
         let mut r = one_controller("silback");
         let writes = r.opener.writes_of(P1);
+        r.mgr.handle(Event::Rumble {
+            id: "aa:01".to_string(),
+            rumble: Rumble {
+                strong: 200,
+                weak: 50,
+            },
+        });
+        wait_until(|| {
+            writes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|w| w.rumble_strong == 200)
+        });
         go_silent(&mut r);
         expire_silence(&mut r);
         wait_until(|| live(&r) == 0);
@@ -1637,6 +1654,9 @@ mod tests {
             "Controle 1 (verde) → Player 2"
         );
         wait_until(|| writes.lock().unwrap().iter().any(|w| w.player == Some(2)));
+        // A vibração antiga não volta com o controle religado.
+        let w = *writes.lock().unwrap().last().unwrap();
+        assert_eq!((w.rumble_strong, w.rumble_weak), (0, 0));
         // O virtual novo recebe a entrada.
         r.opener
             .reads_of(P1)
