@@ -1,6 +1,7 @@
 pub mod error;
 pub mod input;
 pub mod pipeline;
+pub mod repair;
 pub mod settings;
 pub mod stages;
 
