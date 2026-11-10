@@ -141,6 +141,8 @@ struct Worker {
     latency_since: Instant,
     tap: Arc<LiveTap>,
     last_publish: Option<Instant>,
+    /// Último report barrado pelo limitador de 16 ms; sai na próxima chance.
+    pending: Option<(InputState, InputState, Trace)>,
     live_seq: u64,
     /// p99 da última janela de 60 s do histograma (0 antes da primeira).
     latency_p99_us: u32,
@@ -162,6 +164,7 @@ impl Worker {
 
     /// Amostra neutra (palco não congela), fora do limite de 16 ms; só com o tap ligado.
     fn publish_neutral(&mut self) {
+        self.pending = None;
         if self.tap.enabled() {
             self.publish_live(
                 InputState::default(),
@@ -275,13 +278,17 @@ impl Worker {
                             self.send_pad(&out);
                             self.latency.record(started.elapsed().as_micros() as u64);
                         }
-                        if live
-                            && self
+                        if live {
+                            if self
                                 .last_publish
                                 .is_none_or(|t| started - t >= LIVE_INTERVAL)
-                        {
-                            self.last_publish = Some(started);
-                            self.publish_live(report.input, out, trace);
+                            {
+                                self.last_publish = Some(started);
+                                self.pending = None;
+                                self.publish_live(report.input, out, trace);
+                            } else {
+                                self.pending = Some((report.input, out, trace));
+                            }
                         }
                     }
                     if self.reports % STATUS_EVERY == 0 {
@@ -300,6 +307,16 @@ impl Worker {
                     }
                 }
                 Ok(None) => {
+                    if let Some((input, out, trace)) = self.pending {
+                        let now = Instant::now();
+                        if self.last_publish.is_none_or(|t| now - t >= LIVE_INTERVAL) {
+                            self.pending = None;
+                            self.last_publish = Some(now);
+                            if self.tap.enabled() {
+                                self.publish_live(input, out, trace);
+                            }
+                        }
+                    }
                     if self.detect_silence
                         && self.link_up
                         && self.last_report.elapsed() >= SILENCE_THRESHOLD
@@ -363,6 +380,7 @@ pub fn spawn_worker(
             latency_since: Instant::now(),
             tap,
             last_publish: None,
+            pending: None,
             live_seq: 0,
             latency_p99_us: 0,
         };
@@ -711,10 +729,28 @@ mod tests {
         assert_eq!(s.reports, 1);
         assert_eq!(s.trace.left.raw, s.input.left);
         assert!((s.input.left.x - 0.5).abs() < 1e-3);
+        // O 20º report, barrado pelo limitador, sai na leitura ociosa seguinte.
+        wait_until(|| h.tap.latest().seq == 2);
+        assert_eq!(h.tap.latest().reports, 20);
         std::thread::sleep(Duration::from_millis(20));
         h.reads.lock().unwrap().push_back(report_x(0.5));
-        wait_until(|| h.tap.latest().seq == 2);
+        wait_until(|| h.tap.latest().seq == 3);
         assert_eq!(h.tap.latest().reports, 21);
+        h.finish();
+    }
+
+    #[test]
+    fn throttled_last_report_is_flushed_later() {
+        let h = start_opts(FakeController::new(vec![]), true, false);
+        h.tap.set_enabled(true);
+        {
+            let mut q = h.reads.lock().unwrap();
+            q.push_back(report_x(1.0));
+            q.push_back(report_x(0.0));
+        }
+        wait_until(|| h.received.lock().unwrap().len() == 2);
+        wait_until(|| h.tap.latest().output.left.x == 0.0 && h.tap.latest().seq >= 1);
+        assert_eq!(h.tap.latest().reports, 2);
         h.finish();
     }
 
