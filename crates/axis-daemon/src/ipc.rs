@@ -35,7 +35,7 @@ use windows_sys::Win32::System::Threading::{
     CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects,
 };
 
-use crate::live::{LiveSample, LiveTap, UiRegistry, to_pad_state, to_stages};
+use crate::live::{LiveSample, LiveTap, UiRegistry, to_capture_state, to_pad_state, to_stages};
 use crate::manager::Event;
 
 const MAX_INSTANCES: u32 = 4;
@@ -570,10 +570,11 @@ fn read_loop(
             }
             ClientMsg::SetPaused { paused } => Some(Event::SetPaused(paused)),
             ClientMsg::Restore => Some(Event::RestoreControllers),
-            // Captura e correções chegam na Task 4; por ora são ignoradas.
-            ClientMsg::StartCapture { .. }
-            | ClientMsg::CancelCapture { .. }
-            | ClientMsg::SetCorrections { .. } => None,
+            ClientMsg::StartCapture { id, kind } => Some(Event::StartCapture { id, kind }),
+            ClientMsg::CancelCapture { id } => Some(Event::CancelCapture { id }),
+            ClientMsg::SetCorrections { id, corrections } => {
+                Some(Event::SetCorrections { id, corrections })
+            }
         };
         if let Some(ev) = ev
             && events.send(ev).is_err()
@@ -701,8 +702,8 @@ fn frame(id: &str, s: &LiveSample, rate_hz: u32) -> LiveFrame {
         latency_p99_us: s.latency_p99_us,
         battery: s.status.battery_percent,
         charging: s.status.charging,
-        jitter_us: 0,
-        capture: None,
+        jitter_us: s.jitter_us,
+        capture: s.capture.as_ref().map(to_capture_state),
     }
 }
 
@@ -1233,6 +1234,101 @@ mod tests {
             rx.recv_timeout(RECV),
             Ok(Event::RestoreControllers)
         ));
+    }
+
+    #[test]
+    fn start_capture_message_reaches_manager() {
+        use axis_protocol::{CaptureKindDto, CorrectionsDto};
+        let ui = UiRegistry::new();
+        let (name, rx) = server(&ui);
+        let c = TestClient::hello(&name);
+        let mut corrections = CorrectionsDto::default();
+        corrections.l2.max = 0.8;
+        c.send(&ClientMsg::StartCapture {
+            id: "aa:01".into(),
+            kind: CaptureKindDto::RangeRight,
+        });
+        c.send(&ClientMsg::CancelCapture { id: "aa:01".into() });
+        c.send(&ClientMsg::SetCorrections {
+            id: "aa:01".into(),
+            corrections: corrections.clone(),
+        });
+        assert!(matches!(
+            rx.recv_timeout(RECV),
+            Ok(Event::StartCapture { id, kind: CaptureKindDto::RangeRight }) if id == "aa:01"
+        ));
+        assert!(matches!(
+            rx.recv_timeout(RECV),
+            Ok(Event::CancelCapture { id }) if id == "aa:01"
+        ));
+        match rx.recv_timeout(RECV) {
+            Ok(Event::SetCorrections { id, corrections: c }) => {
+                assert_eq!(id, "aa:01");
+                assert_eq!(c, corrections);
+            }
+            other => panic!("esperava SetCorrections, veio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_frame_carries_capture_state() {
+        use crate::live::CaptureSnapshot;
+        use axis_core::repair::{CaptureKind, Outcome, RangeReport, Stick};
+        use axis_protocol::{CaptureKindDto, CaptureResultDto, CaptureState};
+        let ui = UiRegistry::new();
+        let tap = LiveTap::new();
+        ui.publish(
+            vec![info("aa:01")],
+            HashMap::from([("aa:01".to_string(), tap.clone())]),
+            false,
+            true,
+        );
+        let (name, _rx) = server(&ui);
+        let c = TestClient::hello(&name);
+        c.send(&ClientMsg::Inspect {
+            id: Some("aa:01".into()),
+        });
+        wait_until("torneira ligada", || tap.enabled());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (t2, s2) = (tap.clone(), stop.clone());
+        let feeder = thread::spawn(move || {
+            let mut seq = 1;
+            while !s2.load(Ordering::SeqCst) {
+                t2.publish(LiveSample {
+                    seq,
+                    jitter_us: 120,
+                    capture: Some(CaptureSnapshot {
+                        kind: CaptureKind::Range(Stick::Left),
+                        progress: 1.0,
+                        outcome: Some(Outcome::Range(RangeReport {
+                            outer_radius: [0.95; 16],
+                            circularity_pct: 1.5,
+                        })),
+                    }),
+                    ..Default::default()
+                });
+                seq += 1;
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let ServerMsg::Live { frame } = c.recv_until(|m| matches!(m, ServerMsg::Live { .. }))
+        else {
+            unreachable!()
+        };
+        stop.store(true, Ordering::SeqCst);
+        feeder.join().unwrap();
+        assert_eq!(frame.jitter_us, 120);
+        assert_eq!(
+            frame.capture,
+            Some(CaptureState {
+                kind: CaptureKindDto::RangeLeft,
+                progress: 1.0,
+                result: Some(CaptureResultDto::Range {
+                    outer_radius: vec![0.95; 16],
+                    circularity_pct: 1.5
+                })
+            })
+        );
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub(crate) struct FakeController {
     pub reads: ReadQueue,
     pub writes: Arc<Mutex<Vec<OutputState>>>,
     pub fail_writes: bool,
+    pub family: DeviceFamily,
+    pub transport: Transport,
 }
 
 impl FakeController {
@@ -25,6 +27,8 @@ impl FakeController {
             reads: Arc::new(Mutex::new(script.into())),
             writes: Arc::new(Mutex::new(Vec::new())),
             fail_writes: false,
+            family: DeviceFamily::DualShock4,
+            transport: Transport::Usb,
         }
     }
 }
@@ -34,10 +38,10 @@ impl Controller for FakeController {
         &self.id
     }
     fn family(&self) -> DeviceFamily {
-        DeviceFamily::DualShock4
+        self.family
     }
     fn transport(&self) -> Transport {
-        Transport::Usb
+        self.transport
     }
     fn experimental(&self) -> bool {
         false
@@ -167,6 +171,8 @@ impl ControllerOpener for FakeOpener {
             .ok_or_else(|| DeviceError::Hid("path desconhecido".to_string()))?;
         let mut ctl = FakeController::new(vec![]);
         ctl.id = id;
+        ctl.family = c.family;
+        ctl.transport = c.transport;
         s.writes.push((c.path.clone(), ctl.writes.clone()));
         s.reads.push((c.path.clone(), ctl.reads.clone()));
         s.opened.push(c.path.clone());

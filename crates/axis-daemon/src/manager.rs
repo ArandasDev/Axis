@@ -4,14 +4,21 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use axis_core::{Corrections, DeviceFamily, Pipeline, Profile};
+use std::collections::HashMap;
+
+use axis_core::repair::{Capture, CaptureKind, Stick};
+use axis_core::{
+    ControllerRecord, Corrections, DeviceFamily, Pipeline, Profile, SCHEMA_VERSION, Vec2,
+};
 use axis_devices::{Controller, HidCandidate};
-use axis_protocol::SessionInfo;
+use axis_protocol::{CaptureKindDto, CorrectionsDto, SessionInfo, Transport};
 use axis_virtual::{DeviceHider, Rumble, VirtualBus, instance_id_from_path};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigStore, OWNER_PALETTE};
-use crate::live::{LiveTap, UiRegistry, to_family};
+use crate::live::{
+    LiveTap, UiRegistry, from_capture_kind, from_corrections_dto, to_corrections_dto, to_family,
+};
 use crate::ports::{ControllerOpener, Notifier, Scheduler};
 use crate::store::{Loaded, load_toml, write_atomic};
 use crate::worker::{SharedPad, WorkerCommand, WorkerExit, WorkerStatus, spawn_worker};
@@ -51,6 +58,19 @@ pub enum Event {
     RestoreControllers,
     Quit,
     Rescan,
+    /// Pedido da interface: começar uma captura do kit de correção.
+    StartCapture {
+        id: String,
+        kind: CaptureKindDto,
+    },
+    CancelCapture {
+        id: String,
+    },
+    /// Pedido da interface: aplicar e gravar novas correções do controle físico.
+    SetCorrections {
+        id: String,
+        corrections: CorrectionsDto,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,6 +125,12 @@ struct Session {
     instances: Vec<String>,
     /// Reabertura após erro adiada pelo intervalo mínimo; um `Rescan` está agendado.
     reopen_pending: bool,
+    /// `None` no Xbox (XInput não informa como está ligado).
+    transport: Option<Transport>,
+    /// Perfil ativo do registro (para recompilar o pipeline).
+    active_profile: String,
+    /// Correções do controle físico em uso (as do registro).
+    corrections: Corrections,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -133,6 +159,8 @@ pub struct Manager {
     paused: bool,
     /// Depois de `RestoreControllers`: só visualização até o fim da execução.
     emulation_disabled: bool,
+    /// Quedas por id desde o início do núcleo (sobrevive ao fim da graça).
+    disconnects: HashMap<String, u32>,
 }
 
 impl Manager {
@@ -160,6 +188,7 @@ impl Manager {
             grace_generation: 0,
             paused: false,
             emulation_disabled: false,
+            disconnects: HashMap::new(),
         }
     }
 
@@ -206,9 +235,9 @@ impl Manager {
                     view_only: s.view_only,
                     battery: st.battery_percent,
                     charging: st.charging,
-                    transport: None,
-                    disconnects: 0,
-                    corrections: Default::default(),
+                    transport: s.transport,
+                    disconnects: self.disconnects.get(&s.id).copied().unwrap_or(0),
+                    corrections: to_corrections_dto(&s.corrections),
                 }
             })
             .collect();
@@ -254,6 +283,13 @@ impl Manager {
                 }
             }
             Event::RestoreControllers => self.restore(),
+            Event::StartCapture { id, kind } => self.start_capture(&id, kind),
+            Event::CancelCapture { id } => {
+                if let Some(s) = self.sessions.iter().find(|s| s.connected && s.id == id) {
+                    let _ = s.tx.send(WorkerCommand::CancelCapture);
+                }
+            }
+            Event::SetCorrections { id, corrections } => self.set_corrections(&id, &corrections),
             Event::Quit => {
                 self.shutdown_all();
                 if !self.unhide_everything() {
@@ -323,6 +359,103 @@ impl Manager {
         self.scan();
     }
 
+    /// Uma queda física do controle da sessão `index` (link caído ou worker saiu).
+    fn count_disconnect(&mut self, index: usize) {
+        let id = self.sessions[index].id.clone();
+        let n = self.disconnects.entry(id).or_insert(0);
+        *n = n.saturating_add(1);
+    }
+
+    fn start_capture(&mut self, id: &str, kind: CaptureKindDto) {
+        let Some(s) = self
+            .sessions
+            .iter()
+            .find(|s| s.connected && s.link_up && s.id == id)
+        else {
+            // Com o sinal caído a captura nunca terminaria.
+            self.notify("Axis", "Controle não está conectado");
+            return;
+        };
+        let kind = from_capture_kind(kind);
+        let center = match kind {
+            CaptureKind::Drift(Stick::Left) | CaptureKind::Range(Stick::Left) => {
+                s.corrections.left.center
+            }
+            CaptureKind::Drift(Stick::Right) | CaptureKind::Range(Stick::Right) => {
+                s.corrections.right.center
+            }
+            CaptureKind::Triggers => [0.0, 0.0],
+        };
+        let center = Vec2 {
+            x: center[0],
+            y: center[1],
+        };
+        // O buffer da captura é alocado aqui, fora do caminho crítico do worker.
+        let _ = s.tx.send(WorkerCommand::StartCapture(Box::new(Capture::new(
+            kind, center,
+        ))));
+    }
+
+    fn set_corrections(&mut self, id: &str, dto: &CorrectionsDto) {
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|s| s.connected && s.id == id)
+            .or_else(|| self.sessions.iter().position(|s| s.id == id))
+        else {
+            self.notify("Axis", "Controle não está conectado");
+            return;
+        };
+        let corrections = match from_corrections_dto(dto) {
+            Ok(c) => c,
+            Err(e) => {
+                self.notify("Axis", &format!("Ajuste não aplicado: {e}"));
+                return;
+            }
+        };
+        if let Err(e) = corrections.validate() {
+            self.notify(
+                "Axis",
+                &format!("Ajuste não aplicado: {} {}", e.field, e.reason),
+            );
+            return;
+        }
+        let s = &self.sessions[index];
+        let mut record = self
+            .store
+            .load_record(id)
+            .unwrap_or_else(|| ControllerRecord {
+                schema_version: SCHEMA_VERSION,
+                id: s.id.clone(),
+                family: s.family,
+                owner_name: s.owner.clone(),
+                owner_color: s.color,
+                active_profile: s.active_profile.clone(),
+                corrections: s.corrections.clone(),
+            });
+        let profile = self.store.load_profile(&record.active_profile);
+        let pipeline = match Pipeline::compile(&corrections, &profile) {
+            Ok(p) => p,
+            Err(e) => {
+                self.forward_notices();
+                self.notify("Axis", &format!("Ajuste não aplicado: {e:?}"));
+                return;
+            }
+        };
+        record.corrections = corrections.clone();
+        let saved = self.store.save_record(&record);
+        self.forward_notices();
+        let s = &mut self.sessions[index];
+        let _ = s.tx.send(WorkerCommand::SetPipeline(Box::new(pipeline)));
+        s.corrections = corrections;
+        s.active_profile = record.active_profile;
+        log::info!("correções de {id} aplicadas");
+        if let Err(e) = saved {
+            log::warn!("não foi possível gravar as correções de {id}: {e}");
+            self.notify("Axis", "Não foi possível salvar a correção");
+        }
+    }
+
     fn disconnect(&mut self, index: usize) {
         let grace = std::time::Duration::from_secs(self.store.load_settings().grace_secs);
         self.grace_generation += 1;
@@ -352,6 +485,10 @@ impl Manager {
         else {
             return;
         };
+        // Com o sinal já caído, esta saída é a mesma queda (contada em `link_changed`).
+        if exit != WorkerExit::Shutdown && self.sessions[index].link_up {
+            self.count_disconnect(index);
+        }
         let mut deferred = false;
         let reopen_path = match &exit {
             WorkerExit::Error(m) => {
@@ -429,6 +566,7 @@ impl Manager {
         }
         if !up {
             log::info!("sessão {session} sem sinal");
+            self.count_disconnect(index);
             let grace = std::time::Duration::from_secs(self.store.load_settings().grace_secs);
             self.grace_generation += 1;
             let generation = self.grace_generation;
@@ -677,14 +815,25 @@ impl Manager {
             error_reopen || grace_index.is_some_and(|i| self.sessions[i].reopen_pending);
         let family = controller.family();
         let experimental = controller.experimental();
+        let transport = match family {
+            DeviceFamily::Xbox => None,
+            _ => Some(match controller.transport() {
+                axis_devices::Transport::Usb => Transport::Usb,
+                axis_devices::Transport::Bluetooth => Transport::Bluetooth,
+            }),
+        };
         let palette_index = self.record_count();
-        let record = self.store.load_record(&id).unwrap_or_else(|| {
+        let mut record = self.store.load_record(&id).unwrap_or_else(|| {
             let r = ConfigStore::new_record(&id, family, palette_index);
             if let Err(e) = self.store.save_record(&r) {
                 log::warn!("não foi possível gravar o registro de {id}: {e}");
             }
             r
         });
+        if let Some(i) = grace_index {
+            // A correção aplicada nesta sessão vale mesmo se não pôde ser gravada.
+            record.corrections = self.sessions[i].corrections.clone();
+        }
         let profile = self.store.load_profile(&record.active_profile);
         let pipeline = Pipeline::compile(&record.corrections, &profile).unwrap_or_else(|e| {
             self.notify(
@@ -832,6 +981,9 @@ impl Manager {
             },
             instances,
             reopen_pending: false,
+            transport,
+            active_profile: record.active_profile,
+            corrections: record.corrections,
         };
         match grace_index {
             Some(i) => self.sessions[i] = session,
@@ -1852,6 +2004,291 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(live(&r), 1);
         assert_eq!(r.mgr.sessions()[0].player, Some(1));
+    }
+
+    fn push_report(r: &Rig, path: &str, input: axis_core::InputState) {
+        r.opener
+            .reads_of(path)
+            .lock()
+            .unwrap()
+            .push_back(Ok(Some(axis_devices::Report {
+                input,
+                ..Default::default()
+            })));
+    }
+
+    fn snapshot_session(r: &Rig) -> axis_protocol::SessionInfo {
+        r.ui.snapshot().sessions[0].clone()
+    }
+
+    #[test]
+    fn set_corrections_validates_saves_and_swaps_pipeline() {
+        let mut r = one_controller("setcorr");
+        let mut dto = axis_protocol::CorrectionsDto::default();
+        dto.l2.max = 0.5;
+        dto.left.drift_radius = 0.05;
+        let g0 = r.ui.snapshot().generation;
+        r.mgr.handle(Event::SetCorrections {
+            id: "aa:01".to_string(),
+            corrections: dto.clone(),
+        });
+        // O registro no disco tem a correção nova.
+        let mut store = ConfigStore::new(r.paths.clone());
+        let rec = store.load_record("aa:01").unwrap();
+        assert_eq!(rec.corrections.l2.max, 0.5);
+        assert_eq!(rec.corrections.left.drift_radius, 0.05);
+        assert_eq!(rec.owner_name, "Controle 1");
+        // A interface recebe a lista com as correções novas.
+        let snap = r.ui.snapshot();
+        assert!(snap.generation > g0);
+        assert_eq!(snap.sessions[0].corrections, dto);
+        // O worker usa o pipeline novo: meio curso de L2 vira curso completo.
+        let last = r.bus.as_ref().unwrap().last_input.clone();
+        let half = axis_core::InputState {
+            l2: 0.5,
+            ..Default::default()
+        };
+        wait_until(|| {
+            push_report(&r, P1, half);
+            last.lock().unwrap().is_some_and(|i| i.l2 > 0.99)
+        });
+        assert!(!messages(&r).iter().any(|m| m.contains("Ajuste")));
+    }
+
+    #[test]
+    fn invalid_corrections_are_rejected_with_notice() {
+        let mut r = one_controller("badcorr");
+        let path = r.paths.controllers_dir();
+        let before: Vec<_> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        let mut dto = axis_protocol::CorrectionsDto::default();
+        dto.l2.rest = 0.6;
+        dto.l2.max = 0.5;
+        r.mgr.handle(Event::SetCorrections {
+            id: "aa:01".to_string(),
+            corrections: dto,
+        });
+        let m = messages(&r);
+        assert!(
+            m.last()
+                .unwrap()
+                .starts_with("Ajuste não aplicado: l2.rest "),
+            "{m:?}"
+        );
+        // 15 setores: recusado antes de virar `Corrections`.
+        let mut dto = axis_protocol::CorrectionsDto::default();
+        dto.right.outer_radius.truncate(15);
+        r.mgr.handle(Event::SetCorrections {
+            id: "aa:01".to_string(),
+            corrections: dto,
+        });
+        let m = messages(&r);
+        assert!(
+            m.last()
+                .unwrap()
+                .starts_with("Ajuste não aplicado: right.outer_radius "),
+            "{m:?}"
+        );
+        let after: Vec<_> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(before, after, "o registro não muda");
+        assert_eq!(
+            snapshot_session(&r).corrections,
+            axis_protocol::CorrectionsDto::default()
+        );
+        assert!(
+            r.ui.snapshot()
+                .notices
+                .iter()
+                .any(|n| n.starts_with("Ajuste não aplicado"))
+        );
+    }
+
+    #[test]
+    fn set_corrections_save_failure_still_applies_for_the_session() {
+        let mut r = one_controller("savefail");
+        // Um diretório no caminho do arquivo temporário faz a gravação atômica falhar.
+        let dir = r.paths.controllers_dir();
+        let file = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "toml"))
+            .unwrap();
+        let mut tmp = file.into_os_string();
+        tmp.push(".tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut dto = axis_protocol::CorrectionsDto::default();
+        dto.l2.max = 0.5;
+        r.mgr.handle(Event::SetCorrections {
+            id: "aa:01".to_string(),
+            corrections: dto.clone(),
+        });
+        assert!(
+            messages(&r).contains(&"Não foi possível salvar a correção".to_string()),
+            "{:?}",
+            messages(&r)
+        );
+        assert_eq!(snapshot_session(&r).corrections, dto);
+        let last = r.bus.as_ref().unwrap().last_input.clone();
+        let half = axis_core::InputState {
+            l2: 0.5,
+            ..Default::default()
+        };
+        wait_until(|| {
+            push_report(&r, P1, half);
+            last.lock().unwrap().is_some_and(|i| i.l2 > 0.99)
+        });
+    }
+
+    #[test]
+    fn start_capture_uses_record_center() {
+        let mut r = rig("capcenter", true, false);
+        let store = ConfigStore::new(r.paths.clone());
+        let mut rec = ConfigStore::new_record("aa:01", axis_core::DeviceFamily::DualShock4, 0);
+        let center = axis_core::Vec2 { x: 0.2, y: 0.1 };
+        rec.corrections.left.center = [center.x, center.y];
+        store.save_record(&rec).unwrap();
+        r.opener.add(P1, "aa:01");
+        r.mgr.handle(Event::DeviceArrived(P1.to_string()));
+        r.ui.inspect("aa:01", true);
+        let tap = r.ui.tap("aa:01").unwrap();
+        assert!(tap.enabled());
+        r.mgr.handle(Event::StartCapture {
+            id: "aa:01".to_string(),
+            kind: axis_protocol::CaptureKindDto::RangeLeft,
+        });
+        wait_until(|| tap.latest().capture.is_some());
+        // Três voltas e pouco de raio 0,6 em torno do centro gravado: só fecha
+        // com todos os setores em 0,6 se a captura medir a partir desse centro.
+        for k in 0..=(64 * 3 + 8) {
+            let a = k as f32 * std::f32::consts::TAU / 64.0;
+            push_report(
+                &r,
+                P1,
+                axis_core::InputState {
+                    left: axis_core::Vec2 {
+                        x: center.x + 0.6 * a.cos(),
+                        y: center.y + 0.6 * a.sin(),
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        wait_until(|| tap.latest().capture.is_some_and(|c| c.outcome.is_some()));
+        let cap = tap.latest().capture.unwrap();
+        assert_eq!(
+            cap.kind,
+            axis_core::repair::CaptureKind::Range(axis_core::repair::Stick::Left)
+        );
+        match cap.outcome.unwrap() {
+            axis_core::repair::Outcome::Range(rep) => {
+                for v in rep.outer_radius {
+                    assert!((v - 0.6).abs() < 0.01, "{:?}", rep.outer_radius);
+                }
+            }
+            other => panic!("esperava Range, veio {other:?}"),
+        }
+        // Cancelar limpa o resultado.
+        r.mgr.handle(Event::CancelCapture {
+            id: "aa:01".to_string(),
+        });
+        wait_until(|| {
+            push_report(&r, P1, axis_core::InputState::default());
+            tap.latest().capture.is_none()
+        });
+    }
+
+    #[test]
+    fn start_capture_requires_a_connected_controller() {
+        let mut r = one_controller("capoff");
+        r.mgr.handle(Event::StartCapture {
+            id: "zz:99".to_string(),
+            kind: axis_protocol::CaptureKindDto::Triggers,
+        });
+        assert_eq!(messages(&r).last().unwrap(), "Controle não está conectado");
+        let n = messages(&r).len();
+        r.ui.inspect("aa:01", true);
+        let tap = r.ui.tap("aa:01").unwrap();
+        go_silent(&mut r);
+        r.mgr.handle(Event::StartCapture {
+            id: "aa:01".to_string(),
+            kind: axis_protocol::CaptureKindDto::DriftLeft,
+        });
+        assert_eq!(messages(&r).len(), n + 1);
+        assert_eq!(messages(&r).last().unwrap(), "Controle não está conectado");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(tap.latest().capture.is_none(), "nenhum comando ao worker");
+        // Em graça (worker encerrado) também não.
+        come_back(&mut r, P1);
+        disconnect(&mut r, P1);
+        r.mgr.handle(Event::StartCapture {
+            id: "aa:01".to_string(),
+            kind: axis_protocol::CaptureKindDto::DriftLeft,
+        });
+        assert_eq!(messages(&r).last().unwrap(), "Controle não está conectado");
+    }
+
+    #[test]
+    fn disconnects_are_counted() {
+        let mut r = one_controller("disccount");
+        assert_eq!(snapshot_session(&r).disconnects, 0);
+        // Sinal caiu e voltou: uma queda.
+        go_silent(&mut r);
+        assert_eq!(snapshot_session(&r).disconnects, 1);
+        come_back(&mut r, P1);
+        assert_eq!(snapshot_session(&r).disconnects, 1);
+        // O worker saiu (controle removido): outra queda; reconectar na graça não conta.
+        disconnect(&mut r, P1);
+        assert_eq!(snapshot_session(&r).disconnects, 2);
+        r.mgr.handle(Event::Rescan);
+        assert!(snapshot_session(&r).connected);
+        assert_eq!(snapshot_session(&r).disconnects, 2);
+        // Sem sinal e depois o worker sai: a mesma queda conta uma vez só.
+        go_silent(&mut r);
+        assert_eq!(snapshot_session(&r).disconnects, 3);
+        disconnect(&mut r, P1);
+        assert_eq!(snapshot_session(&r).disconnects, 3);
+        // O contador sobrevive ao fim da graça (é por id desde o início do núcleo).
+        let generation = r
+            .scheduler
+            .scheduled
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|(_, e)| match e {
+                Event::GraceExpired { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .unwrap();
+        r.mgr.handle(Event::GraceExpired {
+            id: "aa:01".to_string(),
+            generation,
+        });
+        assert!(r.mgr.sessions().is_empty());
+        r.mgr.handle(Event::Rescan);
+        assert!(r.mgr.sessions()[0].connected);
+        assert_eq!(snapshot_session(&r).disconnects, 3);
+    }
+
+    #[test]
+    fn transport_is_reported() {
+        let mut r = rig("transport", true, false);
+        r.opener.add(P1, "aa:01");
+        r.opener.add(P2, "aa:02");
+        r.opener.state.lock().unwrap().candidates[1].transport = axis_devices::Transport::Bluetooth;
+        r.opener.add(r"\\?\xinput#0", "xinput:0");
+        r.opener.state.lock().unwrap().candidates[2].family = axis_core::DeviceFamily::Xbox;
+        r.mgr.start();
+        let snap = r.ui.snapshot();
+        let by_id = |id: &str| snap.sessions.iter().find(|s| s.id == id).unwrap().transport;
+        assert_eq!(by_id("aa:01"), Some(axis_protocol::Transport::Usb));
+        assert_eq!(by_id("aa:02"), Some(axis_protocol::Transport::Bluetooth));
+        assert_eq!(by_id("xinput:0"), None);
     }
 
     #[test]
