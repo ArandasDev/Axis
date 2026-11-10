@@ -262,20 +262,26 @@ component Stage inherits Panel {
     in property <string> status;
     in property <LiveData> live;
 
-    // Grade de 24 px, recortada nos cantos arredondados.
+    property <length> header-height: 46px;
+
+    // Grade de 24 px em todo o cartão, recortada nos cantos arredondados e
+    // refeita a cada tamanho; as linhas horizontais partem do divisor do
+    // cabeçalho, que tem fundo sólido por cima da grade.
     Rectangle {
+        width: 100%;
+        height: 100%;
         border-radius: Tokens.radius-panel;
         clip: true;
-        for i in floor(parent.width / Tokens.space-l): Rectangle {
+        for i in ceil(parent.width / Tokens.space-l): Rectangle {
             x: (i + 1) * Tokens.space-l;
             y: 0;
             width: 1px;
             height: parent.height;
             background: Tokens.grid;
         }
-        for j in floor(parent.height / Tokens.space-l): Rectangle {
+        for j in ceil(max(0, parent.height - root.header-height) / Tokens.space-l): Rectangle {
             x: 0;
-            y: (j + 1) * Tokens.space-l;
+            y: root.header-height + (j + 1) * Tokens.space-l;
             width: parent.width;
             height: 1px;
             background: Tokens.grid;
@@ -283,8 +289,12 @@ component Stage inherits Panel {
     }
 
     VerticalLayout {
+        // Cabeçalho com fundo sólido: a grade não passa por trás do texto.
         Rectangle {
-            height: 46px;
+            height: root.header-height;
+            background: Tokens.surface;
+            border-top-left-radius: Tokens.radius-panel;
+            border-top-right-radius: Tokens.radius-panel;
             Rectangle {
                 y: parent.height - 1px;
                 height: 1px;
