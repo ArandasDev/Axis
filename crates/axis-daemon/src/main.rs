@@ -11,6 +11,7 @@ use axis_daemon::app::{
 use axis_daemon::autostart::RunKey;
 use axis_daemon::config::ConfigStore;
 use axis_daemon::instance::SingleInstance;
+use axis_daemon::ipc::spawn_ipc_server;
 use axis_daemon::live::UiRegistry;
 use axis_daemon::logging::init_logging;
 use axis_daemon::manager::{Event, Manager, ManagerDeps, SessionView};
@@ -59,7 +60,7 @@ fn main() {
         }
     };
     let notifier = DeferredNotifier::<TrayHandle>::new();
-    // A task do servidor IPC consome o registro; até lá só o gerente o alimenta.
+    // O gerente alimenta o registro; o servidor do pipe o entrega à interface.
     let ui = UiRegistry::new();
     let mut manager = Manager::new(ManagerDeps {
         opener,
@@ -71,6 +72,7 @@ fn main() {
         events: tx.clone(),
         ui: ui.clone(),
     });
+    let _ipc = spawn_ipc_server(axis_protocol::PIPE_NAME, ui.clone(), tx.clone());
 
     let sessions = Arc::new(Mutex::new(Vec::new()));
     let autostart = Arc::new(AtomicBool::new(settings.autostart));

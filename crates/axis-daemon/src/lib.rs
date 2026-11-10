@@ -2,6 +2,7 @@ pub mod app;
 pub mod autostart;
 pub mod config;
 pub mod instance;
+pub mod ipc;
 pub mod live;
 pub mod logging;
 pub mod manager;

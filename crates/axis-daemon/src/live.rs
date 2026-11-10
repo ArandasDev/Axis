@@ -62,15 +62,26 @@ pub struct UiState {
     pub taps: HashMap<String, Arc<LiveTap>>,
     pub paused: bool,
     pub emulation: bool,
+    /// Os avisos mais recentes (até 20).
     pub notices: Vec<String>,
+    /// Total de avisos já guardados, inclusive os que saíram da janela.
+    pub notices_total: u64,
 }
 
 /// Número máximo de avisos guardados.
 const MAX_NOTICES: usize = 20;
 
+struct Inner {
+    ui: UiState,
+    /// Quantos clientes inspecionam cada id; sobrevive à troca da torneira.
+    inspecting: HashMap<String, usize>,
+    /// Incrementado por `wake`: acorda quem espera sem mudar a geração.
+    wakes: u64,
+}
+
 /// Ponte gerente -> servidor da interface: estado versionado e espera por mudança.
 pub struct UiRegistry {
-    state: Mutex<UiState>,
+    state: Mutex<Inner>,
     changed: Condvar,
 }
 
@@ -83,19 +94,24 @@ fn same_taps(a: &HashMap<String, Arc<LiveTap>>, b: &HashMap<String, Arc<LiveTap>
 impl UiRegistry {
     pub fn new() -> Arc<UiRegistry> {
         Arc::new(UiRegistry {
-            state: Mutex::new(UiState {
-                generation: 0,
-                sessions: Vec::new(),
-                taps: HashMap::new(),
-                paused: false,
-                emulation: true,
-                notices: Vec::new(),
+            state: Mutex::new(Inner {
+                ui: UiState {
+                    generation: 0,
+                    sessions: Vec::new(),
+                    taps: HashMap::new(),
+                    paused: false,
+                    emulation: true,
+                    notices: Vec::new(),
+                    notices_total: 0,
+                },
+                inspecting: HashMap::new(),
+                wakes: 0,
             }),
             changed: Condvar::new(),
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, UiState> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -107,7 +123,9 @@ impl UiRegistry {
         paused: bool,
         emulation: bool,
     ) {
-        let mut st = self.lock();
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let st = &mut inner.ui;
         if st.sessions == sessions
             && st.paused == paused
             && st.emulation == emulation
@@ -115,62 +133,110 @@ impl UiRegistry {
         {
             return;
         }
+        // Torneira que saiu do registro (ou foi trocada) não fica ligada à toa.
+        for (id, old) in &st.taps {
+            if !taps.get(id).is_some_and(|t| Arc::ptr_eq(t, old)) {
+                old.set_enabled(false);
+            }
+        }
+        for (id, tap) in &taps {
+            tap.set_enabled(inner.inspecting.get(id).is_some_and(|&n| n > 0));
+        }
         st.sessions = sessions;
         st.taps = taps;
         st.paused = paused;
         st.emulation = emulation;
         st.generation += 1;
-        drop(st);
+        drop(guard);
         self.changed.notify_all();
     }
 
     /// Guarda um aviso (os 20 mais recentes) e acorda quem espera.
     pub fn push_notice(&self, text: &str) {
-        let mut st = self.lock();
+        let mut guard = self.lock();
+        let st = &mut guard.ui;
         st.notices.push(text.to_string());
         let excess = st.notices.len().saturating_sub(MAX_NOTICES);
         st.notices.drain(..excess);
+        st.notices_total += 1;
         st.generation += 1;
-        drop(st);
+        drop(guard);
         self.changed.notify_all();
     }
 
     pub fn snapshot(&self) -> UiState {
-        self.lock().clone()
+        self.lock().ui.clone()
+    }
+
+    /// Torneira atual do controle `id`, se houver.
+    pub fn tap(&self, id: &str) -> Option<Arc<LiveTap>> {
+        self.lock().ui.taps.get(id).cloned()
+    }
+
+    /// Um cliente passa a inspecionar (`on`) ou deixa de inspecionar `id`.
+    /// A torneira fica ligada enquanto algum cliente a inspeciona.
+    pub fn inspect(&self, id: &str, on: bool) {
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let count = if on {
+            let n = inner.inspecting.entry(id.to_string()).or_insert(0);
+            *n += 1;
+            *n
+        } else {
+            match inner.inspecting.get_mut(id) {
+                Some(n) if *n > 1 => {
+                    *n -= 1;
+                    *n
+                }
+                _ => {
+                    inner.inspecting.remove(id);
+                    0
+                }
+            }
+        };
+        if let Some(tap) = inner.ui.taps.get(id) {
+            tap.set_enabled(count > 0);
+        }
+    }
+
+    /// Acorda quem está em `wait_change` sem mudar a geração.
+    pub fn wake(&self) {
+        self.lock().wakes += 1;
+        self.changed.notify_all();
     }
 
     /// Devolve a geração atual: na hora se já difere de `since`, senão espera
-    /// a próxima mudança (até `timeout`, ou sem limite com `None`).
+    /// a próxima mudança (até `timeout`, ou sem limite com `None`). Um `wake`
+    /// também encerra a espera (com a mesma geração).
     pub fn wait_change(&self, since: u64, timeout: Option<Duration>) -> u64 {
         let guard = self.lock();
+        let wakes = guard.wakes;
+        let waiting = |s: &mut Inner| s.ui.generation == since && s.wakes == wakes;
         let guard = match timeout {
             Some(t) => {
                 self.changed
-                    .wait_timeout_while(guard, t, |s| s.generation == since)
+                    .wait_timeout_while(guard, t, waiting)
                     .unwrap_or_else(|e| e.into_inner())
                     .0
             }
             None => self
                 .changed
-                .wait_while(guard, |s| s.generation == since)
+                .wait_while(guard, waiting)
                 .unwrap_or_else(|e| e.into_inner()),
         };
-        guard.generation
+        guard.ui.generation
     }
 }
 
-#[allow(dead_code)] // usadas pelo servidor IPC (task 4)
 fn finite(v: f32) -> f32 {
     if v.is_finite() { v } else { 0.0 }
 }
 
-#[allow(dead_code)] // usadas pelo servidor IPC (task 4)
 fn pair(v: Vec2) -> [f32; 2] {
     [finite(v.x), finite(v.y)]
 }
 
 /// Converte o estado do núcleo para o do protocolo (não finitos viram 0).
-#[allow(dead_code)] // usada pelo servidor IPC (task 4)
 pub(crate) fn to_pad_state(s: &InputState) -> PadState {
     PadState {
         lx: finite(s.left.x),
@@ -184,7 +250,6 @@ pub(crate) fn to_pad_state(s: &InputState) -> PadState {
 }
 
 /// Converte o rastro de um analógico (não finitos viram 0).
-#[allow(dead_code)] // usada pelo servidor IPC (task 4)
 pub(crate) fn to_stages(t: &StickTrace) -> StickStages {
     StickStages {
         raw: pair(t.raw),
@@ -277,6 +342,95 @@ mod tests {
             ui.wait_change(g + 1, Some(Duration::from_millis(30))),
             g + 1
         );
+    }
+
+    #[test]
+    fn inspect_counts_per_id_and_follows_tap_replacement() {
+        let ui = UiRegistry::new();
+        let tap = LiveTap::new();
+        ui.publish(
+            vec![info("a")],
+            HashMap::from([("a".to_string(), tap.clone())]),
+            false,
+            true,
+        );
+        ui.inspect("a", true);
+        ui.inspect("a", true);
+        assert!(tap.enabled());
+        ui.inspect("a", false);
+        assert!(tap.enabled(), "outro cliente ainda inspeciona");
+        // Torneira trocada (nova sessão): o contador do id vale para a nova.
+        let novo = LiveTap::new();
+        ui.publish(
+            vec![info("a")],
+            HashMap::from([("a".to_string(), novo.clone())]),
+            false,
+            true,
+        );
+        assert!(novo.enabled());
+        assert!(
+            !tap.enabled(),
+            "a torneira antiga sai do registro desligada"
+        );
+        ui.inspect("a", false);
+        assert!(!novo.enabled());
+        // Desligar a mais não deixa o contador negativo.
+        ui.inspect("a", false);
+        ui.inspect("a", true);
+        assert!(novo.enabled());
+        // Id ainda sem torneira: liga quando ela aparecer.
+        ui.inspect("b", true);
+        let tb = LiveTap::new();
+        ui.publish(
+            vec![info("a"), info("b")],
+            HashMap::from([
+                ("a".to_string(), novo.clone()),
+                ("b".to_string(), tb.clone()),
+            ]),
+            false,
+            true,
+        );
+        assert!(tb.enabled());
+    }
+
+    #[test]
+    fn notices_total_keeps_counting_past_the_window() {
+        let ui = UiRegistry::new();
+        for i in 0..25 {
+            ui.push_notice(&format!("n{i}"));
+        }
+        let s = ui.snapshot();
+        assert_eq!(s.notices_total, 25);
+        assert_eq!(s.notices.len(), 20);
+    }
+
+    #[test]
+    fn wake_returns_wait_change_early_with_the_same_generation() {
+        let ui = UiRegistry::new();
+        let g = ui.snapshot().generation;
+        let ui2 = ui.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            ui2.wake();
+        });
+        let start = std::time::Instant::now();
+        assert_eq!(ui.wait_change(g, Some(Duration::from_secs(5))), g);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn tap_lookup_by_id() {
+        let ui = UiRegistry::new();
+        let tap = LiveTap::new();
+        ui.publish(
+            vec![info("a")],
+            HashMap::from([("a".to_string(), tap.clone())]),
+            false,
+            true,
+        );
+        assert!(Arc::ptr_eq(&ui.tap("a").unwrap(), &tap));
+        assert!(ui.tap("b").is_none());
     }
 
     #[test]
