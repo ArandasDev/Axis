@@ -316,13 +316,12 @@ pub(crate) fn to_corrections_dto(c: &Corrections) -> CorrectionsDto {
     }
 }
 
-fn from_stick_dto(path: &str, d: &StickCorrectionDto) -> Result<StickCorrection, String> {
-    let outer_radius: [f32; SECTORS] = d.outer_radius.as_slice().try_into().map_err(|_| {
-        format!(
-            "{path}.outer_radius precisa de {SECTORS} setores (veio {})",
-            d.outer_radius.len()
-        )
-    })?;
+fn from_stick_dto(side: &str, d: &StickCorrectionDto) -> Result<StickCorrection, String> {
+    let outer_radius: [f32; SECTORS] = d
+        .outer_radius
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("alcance do analógico {side} precisa de {SECTORS} setores"))?;
     Ok(StickCorrection {
         center: d.center,
         outer_radius,
@@ -334,8 +333,8 @@ fn from_stick_dto(path: &str, d: &StickCorrectionDto) -> Result<StickCorrection,
 /// por analógico. Os limites dos valores ficam com `Corrections::validate`.
 pub(crate) fn from_corrections_dto(d: &CorrectionsDto) -> Result<Corrections, String> {
     Ok(Corrections {
-        left: from_stick_dto("left", &d.left)?,
-        right: from_stick_dto("right", &d.right)?,
+        left: from_stick_dto("esquerdo", &d.left)?,
+        right: from_stick_dto("direito", &d.right)?,
         l2: from_trigger_dto(&d.l2),
         r2: from_trigger_dto(&d.r2),
     })
@@ -643,11 +642,11 @@ mod tests {
         dto.left.outer_radius.pop();
         assert_eq!(dto.left.outer_radius.len(), 15);
         let e = from_corrections_dto(&dto).unwrap_err();
-        assert!(e.starts_with("left.outer_radius"), "{e}");
+        assert_eq!(e, "alcance do analógico esquerdo precisa de 16 setores");
         let mut dto = to_corrections_dto(&sample_corrections());
         dto.right.outer_radius.push(1.0);
         let e = from_corrections_dto(&dto).unwrap_err();
-        assert!(e.starts_with("right.outer_radius"), "{e}");
+        assert_eq!(e, "alcance do analógico direito precisa de 16 setores");
     }
 
     #[test]

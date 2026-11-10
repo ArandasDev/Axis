@@ -8,7 +8,8 @@ use std::collections::HashMap;
 
 use axis_core::repair::{Capture, CaptureKind, Stick};
 use axis_core::{
-    ControllerRecord, Corrections, DeviceFamily, Pipeline, Profile, SCHEMA_VERSION, Vec2,
+    ControllerRecord, Corrections, DeviceFamily, Pipeline, Profile, SCHEMA_VERSION,
+    ValidationError, Vec2,
 };
 use axis_devices::{Controller, HidCandidate};
 use axis_protocol::{CaptureKindDto, CorrectionsDto, SessionInfo, Transport};
@@ -416,7 +417,7 @@ impl Manager {
         if let Err(e) = corrections.validate() {
             self.notify(
                 "Axis",
-                &format!("Ajuste não aplicado: {} {}", e.field, e.reason),
+                &format!("Ajuste não aplicado: {}", validation_text(&e)),
             );
             return;
         }
@@ -437,8 +438,9 @@ impl Manager {
         let pipeline = match Pipeline::compile(&corrections, &profile) {
             Ok(p) => p,
             Err(e) => {
+                log::warn!("correção válida não compilou: {e:?}");
                 self.forward_notices();
-                self.notify("Axis", &format!("Ajuste não aplicado: {e:?}"));
+                self.notify("Axis", "Ajuste não aplicado: valores inválidos");
                 return;
             }
         };
@@ -1051,6 +1053,36 @@ fn arrival_message(owner: &str, color: [u8; 3], player: u8) -> String {
     match OWNER_PALETTE.iter().position(|c| *c == color) {
         Some(i) => format!("{owner} ({}) → Player {player}", COLOR_NAMES[i]),
         None => format!("{owner} → Player {player}"),
+    }
+}
+
+/// Texto pt-BR de um erro de `Corrections::validate` (campo + motivo).
+fn validation_text(e: &ValidationError) -> String {
+    let (path, leaf) = e.field.split_once('.').unwrap_or((e.field.as_str(), ""));
+    let stick = match path {
+        "left" => Some("esquerdo"),
+        "right" => Some("direito"),
+        _ => None,
+    };
+    let trigger = match path {
+        "l2" => Some("L2"),
+        "r2" => Some("R2"),
+        _ => None,
+    };
+    match (stick, trigger, leaf) {
+        (Some(s), _, "center") => format!("centro do analógico {s} fora da faixa"),
+        (Some(s), _, "outer_radius") => {
+            format!("alcance do analógico {s} precisa estar entre 0,3 e 1,5")
+        }
+        (Some(s), _, "drift_radius") => {
+            format!("raio de drift do analógico {s} precisa estar entre 0 e 0,5")
+        }
+        (_, Some(t), "rest") if e.reason == "must be below max" => {
+            format!("repouso do {t} precisa ser menor que o máximo")
+        }
+        (_, Some(t), "rest") => format!("repouso do {t} precisa estar entre 0 e 1"),
+        (_, Some(t), "max") => format!("máximo do {t} precisa estar entre 0 e 1"),
+        _ => "valores inválidos".to_string(),
     }
 }
 
@@ -2072,9 +2104,8 @@ mod tests {
         });
         let m = messages(&r);
         assert!(
-            m.last()
-                .unwrap()
-                .starts_with("Ajuste não aplicado: l2.rest "),
+            m.last().unwrap()
+                == "Ajuste não aplicado: repouso do L2 precisa ser menor que o máximo",
             "{m:?}"
         );
         // 15 setores: recusado antes de virar `Corrections`.
@@ -2086,9 +2117,8 @@ mod tests {
         });
         let m = messages(&r);
         assert!(
-            m.last()
-                .unwrap()
-                .starts_with("Ajuste não aplicado: right.outer_radius "),
+            m.last().unwrap()
+                == "Ajuste não aplicado: alcance do analógico direito precisa de 16 setores",
             "{m:?}"
         );
         let after: Vec<_> = std::fs::read_dir(&path)
@@ -2106,6 +2136,46 @@ mod tests {
                 .iter()
                 .any(|n| n.starts_with("Ajuste não aplicado"))
         );
+    }
+
+    #[test]
+    fn validation_errors_map_to_portuguese() {
+        let mut c = Corrections::default();
+        c.left.center[1] = 0.6;
+        let cases = [(c, "centro do analógico esquerdo fora da faixa")];
+        let mut c = Corrections::default();
+        c.right.outer_radius[3] = 2.0;
+        let mut d = Corrections::default();
+        d.left.drift_radius = f32::NAN;
+        let mut e = Corrections::default();
+        e.l2.rest = 0.6;
+        e.l2.max = 0.5;
+        let mut g = Corrections::default();
+        g.r2.max = 1.2;
+        let mut k = Corrections::default();
+        k.r2.rest = -0.1;
+        let cases = cases.into_iter().chain([
+            (
+                c,
+                "alcance do analógico direito precisa estar entre 0,3 e 1,5",
+            ),
+            (
+                d,
+                "raio de drift do analógico esquerdo precisa estar entre 0 e 0,5",
+            ),
+            (e, "repouso do L2 precisa ser menor que o máximo"),
+            (g, "máximo do R2 precisa estar entre 0 e 1"),
+            (k, "repouso do R2 precisa estar entre 0 e 1"),
+        ]);
+        for (c, text) in cases {
+            let err = c.validate().unwrap_err();
+            assert_eq!(validation_text(&err), text, "{err:?}");
+        }
+        let odd = axis_core::ValidationError {
+            field: "vibration".to_string(),
+            reason: "x".to_string(),
+        };
+        assert_eq!(validation_text(&odd), "valores inválidos");
     }
 
     #[test]
