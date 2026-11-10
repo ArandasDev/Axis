@@ -346,6 +346,13 @@ fn apply(app: &App, update: UiUpdate, first_failure: bool) {
         }
         UiUpdate::Sessions(sessions) => show_sessions(app, &sessions),
         UiUpdate::Live(frame) => show_live(app, &frame),
+        UiUpdate::State { paused, emulation } => {
+            // Mudou fora daqui (ex.: pausa pela bandeja): reflete na hora.
+            app.set_paused(paused);
+            SHELL.with(|s| s.borrow_mut().emulation = emulation);
+            refresh_status(app);
+            refresh_overview(app);
+        }
         // Avisos: tela de uma próxima tarefa.
         UiUpdate::Notice(_) => {}
     }

@@ -49,12 +49,20 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// O que a thread do cliente entrega à interface.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiUpdate {
-    Connected { paused: bool, emulation: bool },
+    Connected {
+        paused: bool,
+        emulation: bool,
+    },
     Incompatible,
     Disconnected,
     Sessions(Vec<SessionInfo>),
     Live(LiveFrame),
     Notice(String),
+    /// Pausa ou emulação mudaram no núcleo depois do `Connected`.
+    State {
+        paused: bool,
+        emulation: bool,
+    },
 }
 
 /// Traduz uma mensagem do núcleo (o único lugar a mudar quando o protocolo
@@ -70,6 +78,7 @@ fn translate(msg: ServerMsg) -> UiUpdate {
         ServerMsg::Sessions { sessions } => UiUpdate::Sessions(sessions),
         ServerMsg::Live { frame } => UiUpdate::Live(frame),
         ServerMsg::Notice { text } => UiUpdate::Notice(text),
+        ServerMsg::State { paused, emulation } => UiUpdate::State { paused, emulation },
     }
 }
 
@@ -512,6 +521,20 @@ mod tests {
     };
 
     const RECV: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn state_becomes_a_state_update() {
+        assert_eq!(
+            translate(ServerMsg::State {
+                paused: true,
+                emulation: false
+            }),
+            UiUpdate::State {
+                paused: true,
+                emulation: false
+            }
+        );
+    }
 
     static NEXT: AtomicU32 = AtomicU32::new(0);
 

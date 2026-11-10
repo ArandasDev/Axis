@@ -1074,6 +1074,21 @@ mod tests {
     }
 
     #[test]
+    fn start_and_restore_publish_the_real_emulation_state() {
+        let mut r = rig("uiemu", true, false);
+        r.opener.add(P1, "aa:01");
+        let g0 = r.ui.snapshot().generation;
+        r.mgr.start();
+        let snap = r.ui.snapshot();
+        assert!(snap.generation > g0, "start publica o estado");
+        assert!(snap.emulation && !snap.paused);
+        r.mgr.handle(Event::RestoreControllers);
+        let snap = r.ui.snapshot();
+        assert!(!snap.emulation, "depois de restaurar: só visualização");
+        assert!(snap.sessions.iter().all(|s| s.view_only));
+    }
+
+    #[test]
     fn known_controller_keeps_owner_and_profile() {
         let mut r = rig("known", true, false);
         let store = ConfigStore::new(r.paths.clone());

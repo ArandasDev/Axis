@@ -100,6 +100,11 @@ pub enum ServerMsg {
     Notice {
         text: String,
     },
+    /// Pausa ou emulação mudaram depois do `Welcome` (ex.: pela bandeja).
+    State {
+        paused: bool,
+        emulation: bool,
+    },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -292,6 +297,10 @@ mod tests {
             ServerMsg::Notice {
                 text: "olá\nmundo".into(),
             },
+            ServerMsg::State {
+                paused: true,
+                emulation: false,
+            },
         ];
         for m in servers {
             assert_eq!(decode_server(&encode(&m)).unwrap(), m);
@@ -363,6 +372,15 @@ mod tests {
         assert!(PIPE_NAME.starts_with("\\\\.\\pipe\\"));
         assert!(PIPE_NAME.ends_with("axis-v1"));
         assert_eq!(PIPE_NAME.len(), 16);
+    }
+
+    #[test]
+    fn state_uses_the_state_tag() {
+        let s = encode(&ServerMsg::State {
+            paused: true,
+            emulation: false,
+        });
+        assert!(s.contains("\"t\":\"state\""), "{s}");
     }
 
     #[test]

@@ -461,11 +461,15 @@ fn serve(client: Arc<Client>, ui: Arc<UiRegistry>, events: Sender<Event>) {
 
     let writer = {
         let (client, ui) = (client.clone(), ui.clone());
-        let (generation, notices) = (snap.generation, snap.notices_total);
+        let start = WriterStart {
+            generation: snap.generation,
+            notices_sent: snap.notices_total,
+            state: (snap.paused, snap.emulation),
+        };
         std::thread::Builder::new()
             .name("axis-ipc-escritora".into())
             .spawn(move || {
-                if let Err(e) = write_loop(&client, &ui, &wev, generation, notices) {
+                if let Err(e) = write_loop(&client, &ui, &wev, start) {
                     log::info!("interface parou de receber: {e}");
                 }
                 // Acorda a leitora, que faz a limpeza.
@@ -533,13 +537,25 @@ fn read_loop(
     }
 }
 
+/// O que o cliente já recebeu no handshake (ponto de partida da escritora).
+struct WriterStart {
+    generation: u64,
+    notices_sent: u64,
+    /// `(paused, emulation)` do `Welcome`.
+    state: (bool, bool),
+}
+
 fn write_loop(
     client: &Client,
     ui: &UiRegistry,
     ev: &WinEvent,
-    mut generation: u64,
-    mut notices_sent: u64,
+    start: WriterStart,
 ) -> io::Result<()> {
+    let WriterStart {
+        mut generation,
+        mut notices_sent,
+        mut state,
+    } = start;
     let conn = &client.conn;
     let mut live = LiveCursor::default();
     loop {
@@ -556,6 +572,17 @@ fn write_loop(
         if g != generation {
             let snap = ui.snapshot();
             generation = snap.generation;
+            // Pausa/emulação antes da lista: a interface já a mostra no estado novo.
+            if (snap.paused, snap.emulation) != state {
+                state = (snap.paused, snap.emulation);
+                conn.send(
+                    ev,
+                    &ServerMsg::State {
+                        paused: snap.paused,
+                        emulation: snap.emulation,
+                    },
+                )?;
+            }
             conn.send(
                 ev,
                 &ServerMsg::Sessions {
@@ -881,6 +908,51 @@ mod tests {
                 text: "outro".into()
             }
         );
+    }
+
+    #[test]
+    fn pause_and_emulation_changes_send_state_before_sessions() {
+        let ui = UiRegistry::new();
+        ui.publish(vec![info("aa:01")], HashMap::new(), false, true);
+        let (name, _rx) = server(&ui);
+        let c = TestClient::hello(&name);
+
+        ui.publish(vec![info("aa:01")], HashMap::new(), true, true);
+        assert_eq!(
+            c.recv(),
+            Some(ServerMsg::State {
+                paused: true,
+                emulation: true
+            })
+        );
+        assert!(matches!(c.recv(), Some(ServerMsg::Sessions { .. })));
+
+        // Mesmo par: só a lista nova, sem outro State.
+        ui.publish(
+            vec![info("aa:01"), info("bb:02")],
+            HashMap::new(),
+            true,
+            true,
+        );
+        assert!(matches!(c.recv(), Some(ServerMsg::Sessions { .. })));
+        ui.push_notice("aviso");
+        assert!(matches!(c.recv(), Some(ServerMsg::Sessions { .. })));
+        assert!(matches!(c.recv(), Some(ServerMsg::Notice { .. })));
+
+        ui.publish(
+            vec![info("aa:01"), info("bb:02")],
+            HashMap::new(),
+            true,
+            false,
+        );
+        assert_eq!(
+            c.recv(),
+            Some(ServerMsg::State {
+                paused: true,
+                emulation: false
+            })
+        );
+        assert!(matches!(c.recv(), Some(ServerMsg::Sessions { .. })));
     }
 
     #[test]
