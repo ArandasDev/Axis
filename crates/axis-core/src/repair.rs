@@ -15,11 +15,14 @@ const TIMEOUT_SECS: f32 = 30.0;
 const RANGE_TURNS: f32 = 3.0;
 const RANGE_MIN_MAGNITUDE: f32 = 0.5;
 const ALL_SECTORS: u16 = u16::MAX;
+/// Ângulo entre nós de `calibrate`.
+const NODE_STEP: f32 = TAU / SECTORS as f32;
 const PRESSES: u8 = 3;
 const PRESS_HIGH: f32 = 0.8;
 const PRESS_LOW: f32 = 0.2;
 const REST_BAND: f32 = 0.1;
 const MIN_TRIGGER_SPAN: f32 = 0.3;
+const MIN_TRIGGER_PEAK: f32 = 0.6;
 
 const MSG_DRIFT_MOVED: &str = "O analógico mexeu durante a medição. Solte e tente de novo.";
 const MSG_NO_SAMPLES: &str = "Nenhuma leitura do controle durante a medição.";
@@ -129,7 +132,8 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// `center` é o centro atual do analógico (usado pelo alcance).
+    /// `center` é o centro atual do analógico; só `CaptureKind::Range` o usa
+    /// (drift e gatilhos o ignoram).
     pub fn new(kind: CaptureKind, center: Vec2) -> Capture {
         let capacity = match kind {
             CaptureKind::Drift(_) => DRIFT_CAPACITY,
@@ -170,7 +174,7 @@ impl Capture {
             },
         };
         // a checagem vem antes do recorte: `clamp` tornaria ±inf finito
-        if raw.x.is_finite() && raw.y.is_finite() && self.samples.len() < self.capacity {
+        if raw.x.is_finite() && raw.y.is_finite() {
             let sample = match self.kind {
                 CaptureKind::Triggers => Vec2 {
                     x: raw.x.clamp(0.0, 1.0),
@@ -178,7 +182,7 @@ impl Capture {
                 },
                 _ => clamp_stick(raw),
             };
-            self.samples.push(sample);
+            // os rastreadores O(1) seguem além da capacidade; só o armazenamento para
             match self.kind {
                 CaptureKind::Drift(_) => {}
                 CaptureKind::Range(_) => self.track_range(sample),
@@ -186,6 +190,9 @@ impl Capture {
                     self.l2.push(sample.x);
                     self.r2.push(sample.y);
                 }
+            }
+            if self.samples.len() < self.capacity {
+                self.samples.push(sample);
             }
         }
 
@@ -203,7 +210,7 @@ impl Capture {
             return;
         }
         let a = angle(v);
-        self.covered |= 1 << sector(a);
+        self.covered |= 1 << nearest_node(a);
         if let Some(last) = self.last_angle {
             let mut d = a - last;
             if d > PI {
@@ -294,17 +301,30 @@ impl Capture {
         if !self.range_complete() {
             return Outcome::Incomplete(MSG_RANGE);
         }
-        let mut outer = [0.0f32; SECTORS];
+        // `calibrate` lê outer_radius[i] como o raio NO ângulo i·passo e interpola
+        // entre nós: o valor do nó é o máximo na janela mais estreita com amostras,
+        // entre ±1/16, ±¼ e ±½ passo (esta última = nó mais próximo). Janela larga
+        // num gate não circular pega o raio da borda da janela, não o do nó.
+        const TIERS: [f32; 3] = [NODE_STEP / 16.0, NODE_STEP / 4.0, NODE_STEP / 2.0];
+        let mut tiers = [[0.0f32; SECTORS]; 3];
         for s in &self.samples {
             let v = sub(*s, self.center);
             let m = v.length();
             if m > RANGE_MIN_MAGNITUDE {
-                let i = sector(angle(v));
-                outer[i] = outer[i].max(m);
+                let a = angle(v);
+                let i = nearest_node(a);
+                let d = node_distance(a, i);
+                for (tier, width) in tiers.iter_mut().zip(TIERS) {
+                    if d <= width {
+                        tier[i] = tier[i].max(m);
+                    }
+                }
             }
         }
-        for r in &mut outer {
-            *r = r.clamp(0.3, 1.5);
+        let mut outer = [0.0f32; SECTORS];
+        for (i, r) in outer.iter_mut().enumerate() {
+            let best = tiers.iter().map(|t| t[i]).find(|v| *v > 0.0).unwrap_or(0.0);
+            *r = best.clamp(0.3, 1.5);
         }
         let mean = outer.iter().sum::<f32>() / SECTORS as f32;
         let dev = outer.iter().map(|r| (r - mean).abs()).sum::<f32>() / SECTORS as f32;
@@ -333,7 +353,8 @@ fn trigger_calibration(
     track: &TriggerTrack,
     values: impl Iterator<Item = f32>,
 ) -> Option<TriggerCalibration> {
-    if track.presses < PRESSES {
+    // apertos leves não calibram um gatilho curto
+    if track.presses < PRESSES || track.max < MIN_TRIGGER_PEAK {
         return None;
     }
     let threshold = track.min + (track.max - track.min) * REST_BAND;
@@ -383,9 +404,15 @@ fn angle(v: Vec2) -> f32 {
     if a < 0.0 { a + TAU } else { a }
 }
 
-/// Índice de setor como em `calibrate`.
-fn sector(a: f32) -> usize {
-    (a / (TAU / SECTORS as f32)).floor() as usize % SECTORS
+/// Nó de `calibrate` mais próximo do ângulo `a` (janela de ±½ passo).
+fn nearest_node(a: f32) -> usize {
+    (a / NODE_STEP).round() as usize % SECTORS
+}
+
+/// Distância angular absoluta de `a` ao nó `i`, em [0, π].
+fn node_distance(a: f32, i: usize) -> f32 {
+    let d = (a - i as f32 * NODE_STEP).rem_euclid(TAU);
+    d.min(TAU - d)
 }
 
 #[cfg(test)]
@@ -522,8 +549,9 @@ mod tests {
         assert!(c.is_done());
         assert_eq!(c.progress(), 1.0);
         let r = range_report(&c);
-        let diagonal = [1, 2, 5, 6, 9, 10, 13, 14];
-        let cardinal = [0, 3, 4, 7, 8, 11, 12, 15];
+        // nós em i·22,5°: diagonais em 45°, 135°…; cardeais em 0°, 90°…
+        let diagonal = [2, 6, 10, 14];
+        let cardinal = [0, 4, 8, 12];
         let min_diag = diagonal
             .iter()
             .map(|&i| r.outer_radius[i])
@@ -542,6 +570,94 @@ mod tests {
             assert!((v - 0.95).abs() < 0.01, "{r:?}");
         }
         assert!(r.circularity_pct < 1.0, "{r:?}");
+    }
+
+    fn square_gate(a: f32) -> f32 {
+        (1.0 / a.cos().abs().max(a.sin().abs())).min(1.3)
+    }
+
+    #[test]
+    fn range_nodes_match_calibration() {
+        use crate::stages::calibration::{CalibrationParams, calibrate};
+        let mut c = Capture::new(CaptureKind::Range(Stick::Left), Vec2::default());
+        spin(&mut c, 3.05, Vec2::default(), square_gate);
+        let r = range_report(&c);
+        let p = CalibrationParams {
+            center: Vec2::default(),
+            outer_radius: r.outer_radius,
+        };
+        for deg in [0.0f32, 22.5, 45.0, 67.5] {
+            let a = deg.to_radians();
+            let g = square_gate(a);
+            let raw = Vec2 {
+                x: g * a.cos(),
+                y: g * a.sin(),
+            };
+            let out = calibrate(raw, &p).length();
+            assert!((out - 1.0).abs() <= 0.02, "{deg}° → {out}; {r:?}");
+        }
+    }
+
+    #[test]
+    fn range_sparse_capture_falls_back_to_wider_windows() {
+        let mut c = Capture::new(CaptureKind::Range(Stick::Left), Vec2::default());
+        // 20 amostras por volta (18°), deslocadas dos nós: várias janelas ±1/16 vazias
+        let per_turn = 20;
+        let mut i = 0;
+        while !c.is_done() && i < 200 {
+            let a = (i as f32 + 0.37) / per_turn as f32 * TAU;
+            c.push(&left(0.9 * a.cos(), 0.9 * a.sin()), i as f32 / 20.0);
+            i += 1;
+        }
+        let empty_tight = (0..SECTORS)
+            .filter(|&n| {
+                !c.samples
+                    .iter()
+                    .any(|s| node_distance(angle(*s), n) <= NODE_STEP / 16.0)
+            })
+            .count();
+        assert!(
+            empty_tight > 0,
+            "o teste precisa de nós sem amostra a ±1/16"
+        );
+        assert!(c.is_done());
+        let r = range_report(&c);
+        for v in r.outer_radius {
+            assert!((0.3..=1.5).contains(&v), "{r:?}");
+            assert!((v - 0.9).abs() < 0.01, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn range_incomplete_when_a_node_is_never_reached() {
+        let mut c = Capture::new(CaptureKind::Range(Stick::Left), Vec2::default());
+        // perto de 90° (nó 4) o analógico nunca passa de 0,3
+        spin(&mut c, 3.5, Vec2::default(), |a| {
+            if (a.rem_euclid(TAU) - TAU / 4.0).abs() < 12f32.to_radians() {
+                0.3
+            } else {
+                0.95
+            }
+        });
+        assert!(c.turns() >= 3.0, "voltas: {}", c.turns());
+        assert_eq!(c.finish(), Outcome::Incomplete(MSG_RANGE));
+    }
+
+    #[test]
+    fn range_completes_when_the_third_turn_is_beyond_capacity() {
+        let mut c = Capture::new(CaptureKind::Range(Stick::Left), Vec2::default());
+        let per_turn = 6000;
+        let n = (3.05 * per_turn as f32) as usize;
+        assert!(n > RANGE_CAPACITY && n < 20_000);
+        for i in 0..20_000 {
+            let a = i as f32 / per_turn as f32 * TAU;
+            c.push(&left(0.95 * a.cos(), 0.95 * a.sin()), i as f32 / 1000.0);
+            if i == RANGE_CAPACITY {
+                assert!(c.turns() < 3.0);
+            }
+        }
+        assert!(c.is_done());
+        assert!(matches!(c.finish(), Outcome::Range(_)));
     }
 
     #[test]
@@ -632,6 +748,22 @@ mod tests {
     }
 
     #[test]
+    fn triggers_light_presses_do_not_calibrate() {
+        let mut c = Capture::new(CaptureKind::Triggers, Vec2::default());
+        for i in 0..=(30 * HZ as usize) {
+            let l2 = press_pattern(i, 3, 0.0, 0.4);
+            let r2 = press_pattern(i, 3, 0.0, 1.0);
+            c.push(&triggers(l2, r2), i as f32 / HZ);
+        }
+        let Outcome::Triggers(r) = c.finish() else {
+            panic!("esperava Triggers");
+        };
+        assert_eq!(r.l2_presses, 3);
+        assert_eq!(r.l2, None);
+        assert!(r.r2.is_some());
+    }
+
+    #[test]
     fn triggers_finish_early_after_three_presses_each() {
         let mut c = Capture::new(CaptureKind::Triggers, Vec2::default());
         let mut i = 0;
@@ -686,6 +818,14 @@ mod tests {
         let mut c = Capture::new(CaptureKind::Triggers, Vec2::default());
         c.push(&triggers(f32::NAN, 0.5), 0.0);
         c.push(&triggers(0.0, f32::NEG_INFINITY), 0.0);
+        c.push(&triggers(f32::INFINITY, 0.5), 0.0);
         assert_eq!(c.progress(), 0.0);
+        assert!(c.samples.is_empty());
+        for t in [c.l2, c.r2] {
+            assert_eq!((t.min, t.max), (f32::INFINITY, f32::NEG_INFINITY));
+        }
+        c.push(&triggers(0.2, 0.3), 0.01);
+        assert_eq!((c.l2.min, c.l2.max), (0.2, 0.2));
+        assert_eq!((c.r2.min, c.r2.max), (0.3, 0.3));
     }
 }
