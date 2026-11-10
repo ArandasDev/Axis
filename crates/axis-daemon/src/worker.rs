@@ -19,6 +19,8 @@ pub enum WorkerCommand {
     },
     Rumble(Rumble),
     SetPaused(bool),
+    /// Troca (ou solta, com `None`) o controle virtual sem reiniciar o worker.
+    SetPad(Option<SharedPad>),
     Shutdown,
 }
 
@@ -36,6 +38,8 @@ pub struct WorkerStatus {
 }
 
 const READ_TIMEOUT_MS: i32 = 50;
+/// Sem reports por este tempo = controle sem sinal (o DS4 manda ~200 reports/s parado).
+pub const SILENCE_THRESHOLD: Duration = Duration::from_millis(500);
 const STATUS_EVERY: u64 = 64;
 const WARN_INTERVAL: Duration = Duration::from_secs(1);
 const LATENCY_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -117,8 +121,12 @@ struct Worker {
     pipeline: Pipeline,
     status: Arc<Mutex<WorkerStatus>>,
     out: OutputState,
-    written: OutputState,
+    /// Última saída escrita; `None` força reescrever (o controle religado perdeu a luz).
+    written: Option<OutputState>,
     paused: bool,
+    on_link: Box<dyn Fn(bool) + Send>,
+    link_up: bool,
+    last_report: Instant,
     reports: u64,
     last_status: DeviceStatus,
     last_warn: Option<Instant>,
@@ -157,6 +165,7 @@ impl Worker {
                     }
                     self.paused = p;
                 }
+                Ok(WorkerCommand::SetPad(p)) => self.pad = p,
                 Ok(WorkerCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
                     return Some(WorkerExit::Shutdown);
                 }
@@ -166,17 +175,17 @@ impl Worker {
     }
 
     fn flush_output(&mut self) -> Option<WorkerExit> {
-        if self.out == self.written {
+        if !self.link_up || self.written == Some(self.out) {
             return None;
         }
         match self.controller.write_output(&self.out) {
             Ok(()) => {
-                self.written = self.out;
+                self.written = Some(self.out);
                 None
             }
             Err(DeviceError::Disconnected) => Some(WorkerExit::Disconnected),
             Err(e) => {
-                self.written = self.out;
+                self.written = Some(self.out);
                 if rate_limited_ok(&mut self.last_out_warn) {
                     log::warn!("falha ao escrever a saída do controle: {e}");
                 }
@@ -203,6 +212,11 @@ impl Worker {
             match self.controller.read(READ_TIMEOUT_MS) {
                 Ok(Some(report)) => {
                     let started = Instant::now();
+                    self.last_report = started;
+                    if !self.link_up {
+                        self.link_up = true;
+                        (self.on_link)(true);
+                    }
                     self.reports += 1;
                     self.last_status = report.status;
                     if !self.paused && self.pad.is_some() {
@@ -224,7 +238,14 @@ impl Worker {
                         self.latency_since = started;
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if self.link_up && self.last_report.elapsed() >= SILENCE_THRESHOLD {
+                        self.link_up = false;
+                        self.written = None;
+                        self.send_pad(&InputState::default());
+                        (self.on_link)(false);
+                    }
+                }
                 Err(e) => return exit_for(e),
             }
         }
@@ -240,12 +261,15 @@ fn exit_for(e: DeviceError) -> WorkerExit {
 }
 
 /// Inicia a thread do controle. `pad = None` é o modo visualização (sem virtual).
+/// `on_link` é chamado na própria thread (não pode bloquear): `false` após
+/// `SILENCE_THRESHOLD` sem reports, `true` quando os reports voltam.
 pub fn spawn_worker(
     controller: Box<dyn Controller>,
     pad: Option<SharedPad>,
     pipeline: Pipeline,
     status: Arc<Mutex<WorkerStatus>>,
     on_exit: impl FnOnce(WorkerExit) + Send + 'static,
+    on_link: impl Fn(bool) + Send + 'static,
 ) -> (Sender<WorkerCommand>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
@@ -255,8 +279,11 @@ pub fn spawn_worker(
             pipeline,
             status,
             out: OutputState::default(),
-            written: OutputState::default(),
+            written: Some(OutputState::default()),
             paused: false,
+            on_link: Box::new(on_link),
+            link_up: true,
+            last_report: Instant::now(),
             reports: 0,
             last_status: DeviceStatus::default(),
             last_warn: None,
@@ -312,6 +339,7 @@ mod tests {
         reads: ReadQueue,
         status: Arc<Mutex<WorkerStatus>>,
         exit: Arc<Mutex<Option<WorkerExit>>>,
+        links: Arc<Mutex<Vec<bool>>>,
     }
 
     fn start(script: Vec<Result<Option<Report>, DeviceError>>, with_pad: bool) -> Harness {
@@ -330,6 +358,8 @@ mod tests {
         let status = Arc::new(Mutex::new(WorkerStatus::default()));
         let exit = Arc::new(Mutex::new(None));
         let exit2 = exit.clone();
+        let links = Arc::new(Mutex::new(Vec::new()));
+        let links2 = links.clone();
         let (tx, handle) = spawn_worker(
             Box::new(ctl),
             shared,
@@ -340,6 +370,7 @@ mod tests {
                 assert!(slot.is_none(), "on_exit chamado mais de uma vez");
                 *slot = Some(e);
             },
+            move |up| links2.lock().unwrap().push(up),
         );
         Harness {
             tx,
@@ -349,6 +380,7 @@ mod tests {
             reads,
             status,
             exit,
+            links,
         }
     }
 
@@ -477,6 +509,47 @@ mod tests {
         let h = start(script, false);
         wait_until(|| h.status.lock().unwrap().reports >= 64);
         assert!(h.received.lock().unwrap().is_empty());
+        h.finish();
+    }
+
+    #[test]
+    fn silence_sends_neutral_once_and_signals_link_down_then_up() {
+        let h = start(vec![report_x(1.0), report_x(1.0)], true);
+        wait_until(|| h.received.lock().unwrap().len() == 2);
+        // Fila vazia: cada leitura dorme o timeout; passa do limiar de silêncio.
+        wait_until(|| *h.links.lock().unwrap() == vec![false]);
+        std::thread::sleep(SILENCE_THRESHOLD + Duration::from_millis(100));
+        {
+            let got = h.received.lock().unwrap();
+            assert_eq!(got.len(), 3, "neutro uma única vez");
+            assert_eq!(got[2], InputState::default());
+        }
+        assert_eq!(*h.links.lock().unwrap(), vec![false]);
+        h.reads.lock().unwrap().push_back(report_x(1.0));
+        wait_until(|| h.received.lock().unwrap().len() == 4);
+        assert!((h.received.lock().unwrap()[3].left.x - 1.0).abs() < 1e-3);
+        assert_eq!(*h.links.lock().unwrap(), vec![false, true]);
+        h.finish();
+    }
+
+    #[test]
+    fn set_pad_none_stops_forwarding_and_some_resumes() {
+        let h = start(vec![report_x(1.0)], true);
+        wait_until(|| h.received.lock().unwrap().len() == 1);
+        h.tx.send(WorkerCommand::SetPad(None)).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        h.reads.lock().unwrap().push_back(report_x(1.0));
+        wait_until(|| h.reads.lock().unwrap().is_empty());
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(h.received.lock().unwrap().len(), 1);
+        let (pad2, received2) = FakePad::new();
+        let shared: SharedPad = Arc::new(Mutex::new(Box::new(pad2) as Box<dyn VirtualPad>));
+        h.tx.send(WorkerCommand::SetPad(Some(shared))).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        h.reads.lock().unwrap().push_back(report_x(1.0));
+        wait_until(|| received2.lock().unwrap().len() == 1);
+        assert!((received2.lock().unwrap()[0].left.x - 1.0).abs() < 1e-3);
+        assert_eq!(h.received.lock().unwrap().len(), 1);
         h.finish();
     }
 

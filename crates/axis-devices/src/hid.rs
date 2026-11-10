@@ -53,6 +53,8 @@ pub struct HidController {
     transport: Transport,
     id: String,
     buf: [u8; 128],
+    /// Último pedido de modo completo feito durante a leitura (DS4 Bluetooth).
+    last_full_request: Option<Instant>,
 }
 
 fn is_disconnect_message(msg: &str) -> bool {
@@ -116,6 +118,7 @@ impl HidController {
             transport: c.transport,
             id,
             buf: [0; 128],
+            last_full_request: None,
         })
     }
 
@@ -142,6 +145,24 @@ pub(crate) fn sanitize_status(
         report.status = DeviceStatus::default();
     }
     report
+}
+
+/// Intervalo mínimo entre dois pedidos de modo completo feitos durante a leitura.
+const FULL_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+
+/// DS4 Bluetooth que voltou (ex.: religado) pode reportar no modo reduzido `0x01`;
+/// pede o modo completo de novo, no máximo uma vez por segundo.
+pub(crate) fn should_request_full_mode(
+    family: DeviceFamily,
+    transport: Transport,
+    report_id: u8,
+    last: Option<Instant>,
+    now: Instant,
+) -> bool {
+    family == DeviceFamily::DualShock4
+        && transport == Transport::Bluetooth
+        && report_id == 0x01
+        && last.is_none_or(|t| now.saturating_duration_since(t) >= FULL_REQUEST_INTERVAL)
 }
 
 impl Controller for HidController {
@@ -173,6 +194,20 @@ impl Controller for HidController {
             if n > 0
                 && let Some(r) = self.parse(n)
             {
+                let now = Instant::now();
+                if should_request_full_mode(
+                    self.family,
+                    self.transport,
+                    self.buf[0],
+                    self.last_full_request,
+                    now,
+                ) {
+                    self.last_full_request = Some(now);
+                    // Buffer na pilha (sem alocação); a resposta não interessa.
+                    let mut feature = [0u8; 64];
+                    feature[0] = ds4::FEATURE_ENABLE_FULL_BT;
+                    let _ = self.dev.get_feature_report(&mut feature);
+                }
                 return Ok(Some(sanitize_status(
                     self.family,
                     self.transport,
@@ -275,6 +310,38 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+    }
+
+    #[test]
+    fn full_mode_is_re_requested_at_most_once_per_second_for_ds4_bt_reduced_reports() {
+        use DeviceFamily::{DualSense, DualShock4};
+        use Transport::{Bluetooth, Usb};
+        let now = Instant::now();
+        let ago = |ms| now.checked_sub(Duration::from_millis(ms)).unwrap();
+        assert!(should_request_full_mode(
+            DualShock4, Bluetooth, 0x01, None, now
+        ));
+        assert!(should_request_full_mode(
+            DualShock4,
+            Bluetooth,
+            0x01,
+            Some(ago(1000)),
+            now
+        ));
+        assert!(!should_request_full_mode(
+            DualShock4,
+            Bluetooth,
+            0x01,
+            Some(ago(400)),
+            now
+        ));
+        assert!(!should_request_full_mode(
+            DualShock4, Bluetooth, 0x11, None, now
+        ));
+        assert!(!should_request_full_mode(DualShock4, Usb, 0x01, None, now));
+        assert!(!should_request_full_mode(
+            DualSense, Bluetooth, 0x01, None, now
+        ));
     }
 
     #[test]

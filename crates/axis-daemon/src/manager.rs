@@ -23,9 +23,28 @@ const ERROR_REOPEN_COOLDOWN: std::time::Duration = std::time::Duration::from_sec
 pub enum Event {
     DeviceArrived(String),
     DeviceRemoved(String),
-    WorkerExited { session: u64, exit: WorkerExit },
-    GraceExpired { id: String, generation: u64 },
-    Rumble { id: String, rumble: Rumble },
+    WorkerExited {
+        session: u64,
+        exit: WorkerExit,
+    },
+    GraceExpired {
+        id: String,
+        generation: u64,
+    },
+    /// O worker detectou silêncio (`up = false`) ou a volta dos reports.
+    LinkChanged {
+        session: u64,
+        up: bool,
+    },
+    /// Fim da graça de uma sessão sem sinal (validado pela geração).
+    SilenceExpired {
+        session: u64,
+        generation: u64,
+    },
+    Rumble {
+        id: String,
+        rumble: Rumble,
+    },
     SetPaused(bool),
     RestoreControllers,
     Quit,
@@ -54,7 +73,8 @@ pub struct ManagerDeps {
     pub events: Sender<Event>,
 }
 
-/// Estado de um controle conhecido. `connected = false` significa período de graça.
+/// Estado de um controle conhecido. `connected = false` significa período de graça
+/// (worker encerrado); `link_up = false`, controle sem sinal com o worker vivo.
 struct Session {
     number: u64,
     id: String,
@@ -64,6 +84,8 @@ struct Session {
     family: DeviceFamily,
     player: Option<u8>,
     connected: bool,
+    /// Falso enquanto o worker não recebe reports (ex.: DS4 desligado no Bluetooth).
+    link_up: bool,
     experimental: bool,
     view_only: bool,
     tx: Sender<WorkerCommand>,
@@ -71,7 +93,7 @@ struct Session {
     #[allow(dead_code)] // lido pela bandeja/UI nas próximas tasks
     status: Arc<Mutex<WorkerStatus>>,
     pad: Option<SharedPad>,
-    /// Geração da última desconexão (valida o `GraceExpired`).
+    /// Geração da última desconexão ou perda de sinal (valida `GraceExpired`/`SilenceExpired`).
     generation: u64,
     /// Quando ocorreu a última reabertura automática após erro.
     last_error_reopen: Option<std::time::Instant>,
@@ -159,6 +181,11 @@ impl Manager {
             Event::DeviceRemoved(path) => log::info!("dispositivo removido: {path}"),
             Event::WorkerExited { session, exit } => self.worker_exited(session, exit),
             Event::GraceExpired { id, generation } => self.grace_expired(&id, generation),
+            Event::LinkChanged { session, up } => self.link_changed(session, up),
+            Event::SilenceExpired {
+                session,
+                generation,
+            } => self.silence_expired(session, generation),
             Event::Rumble { id, rumble } => {
                 if let Some(s) = self.sessions.iter().find(|s| s.connected && s.id == id) {
                     let _ = s.tx.send(WorkerCommand::Rumble(rumble));
@@ -316,7 +343,11 @@ impl Manager {
         let session = self.sessions.remove(index);
         let Session { pad, instances, .. } = session;
         drop(pad); // desconecta o virtual antes de desocultar o físico
-        // Um físico ainda emulado por uma sessão conectada continua oculto.
+        self.release_instances(instances);
+    }
+
+    /// Desoculta os `instances` que nenhuma sessão conectada ainda emula.
+    fn release_instances(&mut self, instances: Vec<String>) {
         let free: Vec<String> = instances
             .into_iter()
             .filter(|i| {
@@ -327,6 +358,131 @@ impl Manager {
             })
             .collect();
         self.unhide_ids(&free);
+    }
+
+    fn link_changed(&mut self, session: u64, up: bool) {
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|s| s.number == session && s.connected)
+        else {
+            return;
+        };
+        if self.sessions[index].link_up == up {
+            return;
+        }
+        if !up {
+            log::info!("sessão {session} sem sinal");
+            let grace = std::time::Duration::from_secs(self.store.load_settings().grace_secs);
+            self.grace_generation += 1;
+            let generation = self.grace_generation;
+            let s = &mut self.sessions[index];
+            s.link_up = false;
+            s.generation = generation;
+            self.scheduler.after(
+                grace,
+                Event::SilenceExpired {
+                    session,
+                    generation,
+                },
+            );
+            return;
+        }
+        log::info!("sessão {session} voltou");
+        self.sessions[index].link_up = true;
+        let s = &self.sessions[index];
+        if s.pad.is_some() {
+            // Dentro da graça: mesmo virtual e mesmo Player; o DS4 religado perdeu a luz.
+            let _ = s.tx.send(WorkerCommand::SetLight {
+                lightbar: s.color,
+                player: s.player,
+            });
+            let notice = format!("{} reconectou", s.owner);
+            self.notifier.notify("Axis", &notice);
+            return;
+        }
+        if s.view_only || self.emulation_disabled || self.bus.is_none() {
+            let _ = s.tx.send(WorkerCommand::SetLight {
+                lightbar: s.color,
+                player: None,
+            });
+            return;
+        }
+        // Depois da graça: um virtual novo (o Player pode ser outro).
+        let id = s.id.clone();
+        match self.plug(&id) {
+            Some(pad) => {
+                let player = player_of(&pad);
+                let s = &mut self.sessions[index];
+                let _ = s.tx.send(WorkerCommand::SetPad(Some(pad.clone())));
+                let _ = s.tx.send(WorkerCommand::SetLight {
+                    lightbar: s.color,
+                    player: Some(player),
+                });
+                s.pad = Some(pad);
+                s.player = Some(player);
+                log::info!("sessão {session}: novo controle virtual, player {player}");
+                let notice = arrival_message(&s.owner, s.color, player);
+                self.notifier.notify("Axis", &notice);
+            }
+            None => {
+                // Sem virtual, o físico não pode continuar oculto.
+                let s = &mut self.sessions[index];
+                s.view_only = true;
+                let _ = s.tx.send(WorkerCommand::SetLight {
+                    lightbar: s.color,
+                    player: None,
+                });
+                let instances = std::mem::take(&mut s.instances);
+                self.release_instances(instances);
+            }
+        }
+    }
+
+    fn silence_expired(&mut self, session: u64, generation: u64) {
+        let Some(s) = self.sessions.iter_mut().find(|s| {
+            s.number == session && s.connected && !s.link_up && s.generation == generation
+        }) else {
+            return;
+        };
+        let Some(pad) = s.pad.take() else {
+            return;
+        };
+        log::info!("sessão {session}: silêncio além da graça, controle virtual liberado");
+        // O worker solta o clone dele; com o nosso, o virtual é desconectado.
+        // O físico continua oculto: o mesmo handle volta quando o controle religar.
+        let _ = s.tx.send(WorkerCommand::SetPad(None));
+        s.player = None;
+        drop(pad);
+    }
+
+    /// Cria um virtual para `id`; em falha, avisa uma vez por execução.
+    fn plug(&mut self, id: &str) -> Option<SharedPad> {
+        let bus = self.bus.clone()?;
+        let tx = self.events.clone();
+        let rumble_id = id.to_string();
+        let sink = Box::new(move |rumble| {
+            let _ = tx.send(Event::Rumble {
+                id: rumble_id.clone(),
+                rumble,
+            });
+        });
+        match bus.plug_x360(sink) {
+            Ok(p) => Some(Arc::new(Mutex::new(p))),
+            Err(e) => {
+                log::warn!("não foi possível criar o controle virtual de {id}: {e}");
+                if !self.warned_plug_failure {
+                    self.warned_plug_failure = true;
+                    self.notifier.notify(
+                        "Axis",
+                        &format!(
+                            "Não foi possível criar o controle virtual ({e}); o controle fica só em visualização."
+                        ),
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// Desoculta `ids` e os remove de `hidden.toml` (só depois do sucesso).
@@ -366,7 +522,7 @@ impl Manager {
                 color: s.color,
                 family: s.family,
                 player: s.player,
-                connected: s.connected,
+                connected: s.connected && s.link_up,
                 experimental: s.experimental,
                 view_only: s.view_only,
             })
@@ -497,31 +653,13 @@ impl Manager {
         if let Some(i) = grace_index {
             view_only = self.sessions[i].view_only;
             pad = self.sessions[i].pad.clone();
-        } else if !view_only && let Some(bus) = &self.bus {
-            let tx = self.events.clone();
-            let rumble_id = id.clone();
-            let sink = Box::new(move |rumble| {
-                let _ = tx.send(Event::Rumble {
-                    id: rumble_id.clone(),
-                    rumble,
-                });
-            });
-            match bus.plug_x360(sink) {
-                Ok(p) => pad = Some(Arc::new(Mutex::new(p))),
-                Err(e) => {
-                    log::warn!("não foi possível criar o controle virtual de {id}: {e}");
-                    view_only = true;
-                    if !self.warned_plug_failure {
-                        self.warned_plug_failure = true;
-                        self.notifier.notify(
-                            "Axis",
-                            &format!(
-                                "Não foi possível criar o controle virtual ({e}); o controle fica só em visualização."
-                            ),
-                        );
-                    }
-                }
-            }
+        }
+        // Sessão nova, ou em graça cujo virtual já foi liberado pelo silêncio.
+        let mut plugged_new = false;
+        if pad.is_none() && !view_only {
+            pad = self.plug(&id);
+            plugged_new = pad.is_some();
+            view_only = pad.is_none();
         }
         let mut instances: Vec<String> = grace_index
             .map(|i| self.sessions[i].instances.clone())
@@ -554,14 +692,16 @@ impl Manager {
                 }
             }
         }
-        let player = pad.as_ref().map(|p| {
-            let index = p.lock().unwrap_or_else(|e| e.into_inner()).user_index();
-            (index + 1) as u8
-        });
+        if pad.is_none() && !instances.is_empty() {
+            // Graça sem virtual (falha ao criar): o físico não pode ficar oculto.
+            self.release_instances(std::mem::take(&mut instances));
+        }
+        let player = pad.as_ref().map(player_of);
 
         let number = self.next_session;
         self.next_session += 1;
         let status = Arc::new(Mutex::new(WorkerStatus::default()));
+        let link_events = self.events.clone();
         let events = self.events.clone();
         let (tx, handle) = spawn_worker(
             controller,
@@ -572,6 +712,12 @@ impl Manager {
                 let _ = events.send(Event::WorkerExited {
                     session: number,
                     exit,
+                });
+            },
+            move |up| {
+                let _ = link_events.send(Event::LinkChanged {
+                    session: number,
+                    up,
                 });
             },
         );
@@ -587,7 +733,7 @@ impl Manager {
             c.path,
             grace_index.is_some()
         );
-        if grace_index.is_some() {
+        if grace_index.is_some() && !plugged_new {
             if !error_reopen {
                 self.notifier
                     .notify("Axis", &format!("{} reconectou", record.owner_name));
@@ -607,6 +753,7 @@ impl Manager {
             family,
             player,
             connected: true,
+            link_up: true,
             experimental,
             view_only,
             tx,
@@ -667,6 +814,12 @@ fn load_hidden(store: &ConfigStore) -> (Vec<String>, bool, Vec<String>) {
             ],
         ),
     }
+}
+
+/// Player (1..) mostrado para o virtual.
+fn player_of(pad: &SharedPad) -> u8 {
+    let index = pad.lock().unwrap_or_else(|e| e.into_inner()).user_index();
+    (index + 1) as u8
 }
 
 fn arrival_message(owner: &str, color: [u8; 3], player: u8) -> String {
@@ -1348,6 +1501,199 @@ mod tests {
         );
         assert!(m.contains(&notice.to_string()), "{m:?}");
         assert!(r.log.lock().unwrap().is_empty(), "sem plug nem ocultação");
+    }
+
+    fn next_link(r: &Rig, up: bool) -> Event {
+        loop {
+            let e =
+                r.rx.recv_timeout(Duration::from_secs(3))
+                    .expect("sem LinkChanged");
+            if matches!(e, Event::LinkChanged { up: u, .. } if u == up) {
+                return e;
+            }
+        }
+    }
+
+    /// O controle falso fica sem reports: o worker detecta o silêncio sozinho.
+    fn go_silent(r: &mut Rig) {
+        let e = next_link(r, false);
+        r.mgr.handle(e);
+    }
+
+    fn come_back(r: &mut Rig, path: &str) {
+        r.opener
+            .reads_of(path)
+            .lock()
+            .unwrap()
+            .push_back(Ok(Some(axis_devices::Report::default())));
+        let e = next_link(r, true);
+        r.mgr.handle(e);
+    }
+
+    fn last_scheduled(r: &Rig) -> (Duration, u64, u64) {
+        let sched = r.scheduler.scheduled.lock().unwrap();
+        match sched.last() {
+            Some((
+                d,
+                Event::SilenceExpired {
+                    session,
+                    generation,
+                },
+            )) => (*d, *session, *generation),
+            other => panic!("esperava SilenceExpired, veio {other:?}"),
+        }
+    }
+
+    fn expire_silence(r: &mut Rig) {
+        let (_, session, generation) = last_scheduled(r);
+        r.mgr.handle(Event::SilenceExpired {
+            session,
+            generation,
+        });
+    }
+
+    #[test]
+    fn link_down_then_up_within_grace_keeps_pad_and_notifies_reconnect() {
+        let mut r = one_controller("linkgrace");
+        let writes = r.opener.writes_of(P1);
+        wait_until(|| writes.lock().unwrap().len() == 1);
+        go_silent(&mut r);
+        let s = r.mgr.sessions();
+        assert!(!s[0].connected, "a bandeja mostra reconectando…");
+        assert_eq!(s[0].player, Some(1));
+        assert_eq!(last_scheduled(&r), (Duration::from_secs(5), 0, 1));
+        assert_eq!(
+            *r.bus.as_ref().unwrap().last_input.lock().unwrap(),
+            Some(axis_core::InputState::default())
+        );
+        come_back(&mut r, P1);
+        let s = r.mgr.sessions();
+        assert!(s[0].connected);
+        assert_eq!(s[0].player, Some(1));
+        assert_eq!(plugs(&r), 1);
+        assert_eq!(live(&r), 1);
+        assert_eq!(messages(&r).last().unwrap(), "Controle 1 reconectou");
+        // A luz é reenviada: o DS4 desligado a perdeu.
+        wait_until(|| writes.lock().unwrap().len() == 2);
+        let w = writes.lock().unwrap()[1];
+        assert_eq!((w.lightbar, w.player), (OWNER_PALETTE[0], Some(1)));
+    }
+
+    #[test]
+    fn silence_beyond_grace_releases_pad_but_keeps_hidden_and_worker() {
+        let mut r = one_controller("silexp");
+        go_silent(&mut r);
+        expire_silence(&mut r);
+        wait_until(|| live(&r) == 0);
+        assert!(hidden_text(&r).contains(INST1));
+        assert!(
+            !r.log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("unhide")),
+            "{:?}",
+            r.log.lock().unwrap()
+        );
+        let s = r.mgr.sessions();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].player, None);
+        assert!(!s[0].connected && !s[0].view_only);
+        // O worker continua lendo o mesmo handle: um report volta a sinalizar o link.
+        r.opener
+            .reads_of(P1)
+            .lock()
+            .unwrap()
+            .push_back(Ok(Some(axis_devices::Report::default())));
+        loop {
+            match r
+                .rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("sem evento")
+            {
+                Event::WorkerExited { .. } => panic!("o worker não deveria sair"),
+                Event::LinkChanged { up: true, .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(r.opener.state.lock().unwrap().opened.len(), 1);
+    }
+
+    #[test]
+    fn link_up_after_expiry_plugs_new_pad_and_announces_player() {
+        let mut r = one_controller("silback");
+        let writes = r.opener.writes_of(P1);
+        go_silent(&mut r);
+        expire_silence(&mut r);
+        wait_until(|| live(&r) == 0);
+        come_back(&mut r, P1);
+        assert_eq!(plugs(&r), 2);
+        assert_eq!(live(&r), 1);
+        let s = r.mgr.sessions();
+        assert!(s[0].connected && !s[0].view_only);
+        assert_eq!(s[0].player, Some(2));
+        assert_eq!(
+            messages(&r).last().unwrap(),
+            "Controle 1 (verde) → Player 2"
+        );
+        wait_until(|| writes.lock().unwrap().iter().any(|w| w.player == Some(2)));
+        // O virtual novo recebe a entrada.
+        r.opener
+            .reads_of(P1)
+            .lock()
+            .unwrap()
+            .push_back(Ok(Some(axis_devices::Report::default())));
+        let last = r.bus.as_ref().unwrap().last_input.clone();
+        *last.lock().unwrap() = None;
+        wait_until(|| last.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn link_up_after_expiry_with_plug_failure_goes_view_only_and_unhides() {
+        let mut r = one_controller("silfail");
+        go_silent(&mut r);
+        expire_silence(&mut r);
+        wait_until(|| live(&r) == 0);
+        r.bus
+            .as_ref()
+            .unwrap()
+            .fail_plug
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        come_back(&mut r, P1);
+        let s = r.mgr.sessions();
+        assert!(s[0].connected && s[0].view_only && s[0].player.is_none());
+        assert!(r.log.lock().unwrap().contains(&format!("unhide:{INST1}")));
+        assert!(!hidden_text(&r).contains(INST1));
+        assert!(
+            messages(&r)
+                .last()
+                .unwrap()
+                .starts_with("Não foi possível criar o controle virtual"),
+            "{:?}",
+            messages(&r)
+        );
+    }
+
+    #[test]
+    fn stale_silence_expired_is_ignored() {
+        let mut r = one_controller("silstale");
+        go_silent(&mut r);
+        come_back(&mut r, P1);
+        r.mgr.handle(Event::SilenceExpired {
+            session: 0,
+            generation: 1,
+        });
+        assert_eq!(live(&r), 1);
+        assert_eq!(r.mgr.sessions()[0].player, Some(1));
+        // Novo silêncio: a geração antiga continua sem efeito.
+        go_silent(&mut r);
+        r.mgr.handle(Event::SilenceExpired {
+            session: 0,
+            generation: 1,
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(live(&r), 1);
+        assert_eq!(r.mgr.sessions()[0].player, Some(1));
     }
 
     #[test]
