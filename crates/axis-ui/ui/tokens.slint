@@ -1,0 +1,29 @@
+import "fonts/Barlow-Regular.ttf";
+import "fonts/Barlow-Medium.ttf";
+import "fonts/Barlow-SemiBold.ttf";
+import "fonts/BarlowCondensed-Regular.ttf";
+import "fonts/BarlowCondensed-SemiBold.ttf";
+
+export global Tokens {
+    in-out property <bool> dark: true;
+    in-out property <color> accent: #d97757;
+
+    out property <color> bg: dark ? #1c1b1a : #f2f2f3;
+    out property <color> surface: dark ? #262523 : #ffffff;
+    out property <color> text: dark ? #ecebe6 : #1c1b1a;
+    out property <color> muted: dark ? #96938c : #6b6a66;
+    out property <color> divider: text.with-alpha(0.15);
+    out property <color> grid: text.with-alpha(0.05);
+    out property <color> accent-soft: accent.with-alpha(0.15);
+
+    out property <length> radius-panel: 18px;
+    out property <length> radius-btn: 11px;
+    out property <length> radius-pill: 999px;
+
+    out property <string> font-heading: "Barlow Condensed";
+    out property <string> font-body: "Barlow";
+
+    out property <duration> dur-fast: 120ms;
+    out property <duration> dur-base: 200ms;
+    out property <duration> dur-slow: 320ms;
+}
