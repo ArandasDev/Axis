@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 axis-protocol = { path = "../axis-protocol" }
 slint = { version = "1.18", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2"] }
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_Pipes"] }
 
 [build-dependencies]
 slint-build = "1.18"
