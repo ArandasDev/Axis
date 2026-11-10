@@ -1110,7 +1110,7 @@ mod tests {
         h.tap.set_enabled(true);
         h.tx.send(WorkerCommand::StartCapture(drift_left()))
             .unwrap();
-        std::thread::sleep(ms(80));
+        wait_until(|| snapshot(&h).is_some());
         // 776 reports a cada 4 ms = 3,1 s de tempo simulado.
         push_reports(&h, 776, 0.04);
         wait_until(|| snapshot(&h).is_some_and(|s| s.outcome.is_some()));
@@ -1158,7 +1158,7 @@ mod tests {
         h.tap.set_enabled(true);
         h.tx.send(WorkerCommand::StartCapture(drift_left()))
             .unwrap();
-        std::thread::sleep(ms(80));
+        wait_until(|| snapshot(&h).is_some());
         push_reports(&h, 50, 0.04);
         wait_until(|| snapshot(&h).is_some_and(|s| s.progress > 0.0));
         // Fila vazia: o relógio simulado passa dos 500 ms de silêncio.
@@ -1182,7 +1182,7 @@ mod tests {
         h.tap.set_enabled(true);
         h.tx.send(WorkerCommand::StartCapture(drift_left()))
             .unwrap();
-        std::thread::sleep(ms(80));
+        wait_until(|| snapshot(&h).is_some());
         push_reports(&h, 20, 0.04);
         wait_until(|| snapshot(&h).is_some_and(|s| s.progress > 0.0));
         let tap = h.tap.clone();
@@ -1210,12 +1210,53 @@ mod tests {
     }
 
     #[test]
+    fn start_capture_replaces_a_running_one() {
+        let h = start_clocked(vec![ms(4)], true);
+        h.tap.set_enabled(true);
+        h.tx.send(WorkerCommand::StartCapture(drift_left()))
+            .unwrap();
+        wait_until(|| snapshot(&h).is_some());
+        push_reports(&h, 50, 0.04);
+        wait_until(|| snapshot(&h).is_some_and(|s| s.progress > 0.0));
+        let range = Capture::new(CaptureKind::Range(Stick::Left), Vec2::default());
+        h.tx.send(WorkerCommand::StartCapture(Box::new(range)))
+            .unwrap();
+        wait_until(|| snapshot(&h).is_some_and(|s| s.kind == CaptureKind::Range(Stick::Left)));
+        // 3,1 s parado: o drift teria terminado; o alcance segue sem resultado.
+        push_reports(&h, 776, 0.04);
+        wait_until(|| h.tap.latest().reports == 826);
+        let s = snapshot(&h).unwrap();
+        assert_eq!(s.kind, CaptureKind::Range(Stick::Left));
+        assert_eq!((s.progress, s.outcome), (0.0, None));
+        h.finish();
+    }
+
+    #[test]
+    fn capture_runs_while_paused() {
+        let h = start_clocked(vec![ms(4)], true);
+        h.tap.set_enabled(true);
+        h.tx.send(WorkerCommand::SetPaused(true)).unwrap();
+        h.tx.send(WorkerCommand::StartCapture(drift_left()))
+            .unwrap();
+        wait_until(|| snapshot(&h).is_some());
+        push_reports(&h, 776, 0.04);
+        wait_until(|| snapshot(&h).is_some_and(|s| s.outcome.is_some()));
+        let Some(Outcome::Drift(r)) = snapshot(&h).and_then(|s| s.outcome) else {
+            panic!("esperava Drift");
+        };
+        assert!((r.center.x - 0.04).abs() < 1e-3, "{r:?}");
+        let got = h.received.lock().unwrap().clone();
+        assert_eq!(got, vec![InputState::default()], "pausado: só o neutro");
+        h.finish();
+    }
+
+    #[test]
     fn cancel_clears_capture() {
         let h = start_clocked(vec![ms(4)], true);
         h.tap.set_enabled(true);
         h.tx.send(WorkerCommand::StartCapture(drift_left()))
             .unwrap();
-        std::thread::sleep(ms(80));
+        wait_until(|| snapshot(&h).is_some());
         push_reports(&h, 50, 0.04);
         wait_until(|| snapshot(&h).is_some_and(|s| s.progress > 0.0));
         h.tx.send(WorkerCommand::CancelCapture).unwrap();
