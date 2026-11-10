@@ -321,7 +321,18 @@ fn card_data(c: &PadCard) -> PadCardData {
     }
 }
 
+/// A conexão caiu ou voltou: o último quadro ao vivo não vale mais.
+fn clears_stage(update: &UiUpdate) -> bool {
+    matches!(update, UiUpdate::Connected { .. } | UiUpdate::Disconnected)
+}
+
 fn apply(app: &App, update: UiUpdate, first_failure: bool) {
+    if clears_stage(&update) {
+        // Nada de "Ao vivo" congelado: o palco espera o próximo quadro.
+        SHELL.with(|s| s.borrow_mut().has_live = false);
+        app.set_live(neutral_live());
+        refresh_overview(app);
+    }
     match update {
         UiUpdate::Connected { paused, emulation } => {
             set_connection(app, Connection::Connected);
@@ -497,5 +508,26 @@ fn demo_frame(id: String, t: f32) -> LiveFrame {
         latency_p99_us: 48 + (6.0 * (t * 0.7).sin().abs()) as u32,
         battery: Some(64),
         charging: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_changes_clear_the_stage() {
+        assert!(clears_stage(&UiUpdate::Connected {
+            paused: false,
+            emulation: true
+        }));
+        assert!(clears_stage(&UiUpdate::Disconnected));
+        assert!(!clears_stage(&UiUpdate::Incompatible));
+        assert!(!clears_stage(&UiUpdate::Sessions(Vec::new())));
+        assert!(!clears_stage(&UiUpdate::State {
+            paused: true,
+            emulation: true
+        }));
+        assert!(!clears_stage(&UiUpdate::Notice(String::new())));
     }
 }
