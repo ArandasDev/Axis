@@ -242,6 +242,9 @@ impl Manager {
                 }
             }
             Event::SetPaused(p) => {
+                if let Some(m) = pause_log(self.paused, p) {
+                    log::info!("{m}");
+                }
                 self.paused = p;
                 for s in self.sessions.iter().filter(|s| s.connected) {
                     let _ = s.tx.send(WorkerCommand::SetPaused(p));
@@ -875,6 +878,15 @@ fn load_hidden(store: &ConfigStore) -> (Vec<String>, bool, Vec<String>) {
 }
 
 /// Player (1..) mostrado para o virtual.
+/// Linha do log quando a pausa muda; repetir o mesmo estado não registra nada.
+fn pause_log(was: bool, now: bool) -> Option<&'static str> {
+    match (was, now) {
+        (false, true) => Some("emulação pausada"),
+        (true, false) => Some("emulação retomada"),
+        _ => None,
+    }
+}
+
 fn player_of(pad: &SharedPad) -> u8 {
     let index = pad.lock().unwrap_or_else(|e| e.into_inner()).user_index();
     (index + 1) as u8
@@ -899,6 +911,14 @@ mod tests {
     use std::sync::mpsc::{Receiver, channel};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn pause_log_only_on_change() {
+        assert_eq!(pause_log(false, true), Some("emulação pausada"));
+        assert_eq!(pause_log(true, false), Some("emulação retomada"));
+        assert_eq!(pause_log(true, true), None);
+        assert_eq!(pause_log(false, false), None);
+    }
 
     struct TempDir(PathBuf);
     impl TempDir {
