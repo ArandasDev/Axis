@@ -10,6 +10,7 @@ use axis_virtual::{DeviceHider, Rumble, VirtualBus, instance_id_from_path};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigStore, OWNER_PALETTE};
+use crate::live::LiveTap;
 use crate::ports::{ControllerOpener, Notifier, Scheduler};
 use crate::store::{Loaded, load_toml, write_atomic};
 use crate::worker::{SharedPad, WorkerCommand, WorkerExit, WorkerStatus, spawn_worker};
@@ -723,6 +724,7 @@ impl Manager {
                     up,
                 });
             },
+            LiveTap::new(),
         );
         let _ = tx.send(WorkerCommand::SetLight {
             lightbar: record.owner_color,
