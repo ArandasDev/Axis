@@ -19,12 +19,12 @@ use axis_protocol::{
     ClientMsg, LineReader, LiveFrame, PROTOCOL_VERSION, ServerMsg, decode_client, encode,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
-    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA,
+    ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
@@ -44,6 +44,8 @@ const BUFFER: u32 = 64 * 1024;
 const BUSY_BACKOFF: Duration = Duration::from_millis(200);
 /// Espera entre tentativas após outra falha ao criar a instância.
 const ERROR_BACKOFF: Duration = Duration::from_secs(1);
+/// Espera após falhas seguidas do `ConnectNamedPipe` (exceto `ERROR_NO_DATA`).
+const CONNECT_BACKOFF: Duration = Duration::from_millis(50);
 /// Prazo para o cliente mandar o `Hello`.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cliente que não lê por este tempo (buffer cheio) é desconectado.
@@ -130,13 +132,20 @@ impl Conn {
         })
     }
 
-    /// Cria uma instância do servidor; `Err(código)` do Win32 na falha.
-    fn create_server(name: &[u16]) -> Result<Conn, u32> {
+    /// Cria uma instância do servidor; `Err(código)` do Win32 na falha. Com
+    /// `first`, falha (`ERROR_ACCESS_DENIED`) se o nome já existir: o pipe não
+    /// é dividido com outro processo.
+    fn create_server(name: &[u16], first: bool) -> Result<Conn, u32> {
+        let first_flag = if first {
+            FILE_FLAG_FIRST_PIPE_INSTANCE
+        } else {
+            0
+        };
         // SAFETY: `name` termina em 0; segurança padrão (usuário local).
         let h = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | first_flag,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 MAX_INSTANCES,
                 BUFFER,
@@ -328,28 +337,55 @@ fn accept_loop(name: &[u16], ui: &Arc<UiRegistry>, events: &Sender<Event>) {
             return;
         }
     };
+    // Até a primeira instância sair, o nome não pode existir: outro processo
+    // (ou o núcleo anterior ainda saindo) não divide o pipe com este.
+    let mut owned = false;
+    let mut busy_logged = false;
     let mut last_err = 0;
+    let mut connect_failures = 0u32;
     loop {
-        let conn = match Conn::create_server(name) {
+        let conn = match Conn::create_server(name, !owned) {
             Ok(c) => c,
             Err(ERROR_PIPE_BUSY) => {
                 // As 4 instâncias estão em uso: tenta de novo em breve.
+                if !busy_logged {
+                    log::warn!("as 4 conexões da interface estão em uso; aguardando uma livre");
+                    busy_logged = true;
+                }
                 std::thread::sleep(BUSY_BACKOFF);
                 continue;
             }
             Err(e) => {
                 if e != last_err {
-                    log::warn!("não foi possível criar o pipe da interface: {}", win_err(e));
+                    if e == ERROR_ACCESS_DENIED && !owned {
+                        log::warn!(
+                            "nome do pipe da interface já em uso por outro processo; tentando de novo"
+                        );
+                    } else {
+                        log::warn!("não foi possível criar o pipe da interface: {}", win_err(e));
+                    }
                     last_err = e;
                 }
                 std::thread::sleep(ERROR_BACKOFF);
                 continue;
             }
         };
+        owned = true;
+        busy_logged = false;
         last_err = 0;
-        if let Err(e) = conn.connect(&ev) {
-            log::info!("conexão da interface falhou: {}", win_err(e));
-            continue;
+        match conn.connect(&ev) {
+            Ok(()) => connect_failures = 0,
+            // O cliente entrou e saiu antes do ConnectNamedPipe: comum, sem espera.
+            Err(ERROR_NO_DATA) => continue,
+            Err(e) => {
+                log::info!("conexão da interface falhou: {}", win_err(e));
+                connect_failures += 1;
+                if connect_failures > 1 {
+                    // Falha repetida: não gira a CPU criando instâncias.
+                    std::thread::sleep(CONNECT_BACKOFF);
+                }
+                continue;
+            }
         }
         *conn.read_deadline.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(Instant::now() + HANDSHAKE_TIMEOUT);
@@ -752,7 +788,11 @@ mod tests {
 
     impl TestClient {
         fn connect(name: &str) -> TestClient {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            TestClient::connect_within(name, Duration::from_secs(1))
+        }
+
+        fn connect_within(name: &str, wait: Duration) -> TestClient {
+            let deadline = Instant::now() + wait;
             let conn = loop {
                 match Conn::open_client(name) {
                     Ok(c) => break Arc::new(c),
@@ -1119,6 +1159,47 @@ mod tests {
         );
         // Um cliente novo ainda é aceito.
         let _d = TestClient::hello(&name);
+    }
+
+    #[test]
+    fn fifth_client_waits_for_a_free_instance() {
+        let ui = UiRegistry::new();
+        let (name, _rx) = server(&ui);
+        let mut clients: Vec<TestClient> = (0..4).map(|_| TestClient::hello(&name)).collect();
+        // As 4 instâncias estão em uso: o quinto ouve PIPE_BUSY.
+        let busy = Conn::open_client(&name)
+            .err()
+            .and_then(|e| e.raw_os_error());
+        assert_eq!(busy, Some(ERROR_PIPE_BUSY as i32));
+        // Um sai: o servidor cria outra instância e o quinto entra.
+        drop(clients.remove(0));
+        let fifth = TestClient::connect_within(&name, Duration::from_secs(2));
+        fifth.send(&ClientMsg::Hello { version: 1 });
+        assert!(matches!(fifth.recv(), Some(ServerMsg::Welcome { .. })));
+    }
+
+    #[test]
+    fn name_held_by_another_server_is_not_shared_then_taken_over() {
+        let name = pipe_name();
+        // Outro servidor já tem o nome (ex.: o núcleo anterior ainda saindo).
+        let squatter = Conn::create_server(&wide(&name), true).expect("instância alheia");
+        let ui = UiRegistry::new();
+        let (tx, _rx) = mpsc::channel();
+        spawn_ipc_server(&name, ui.clone(), tx);
+        thread::sleep(Duration::from_millis(150));
+        // Só a instância alheia existe: o primeiro cliente a ocupa e o segundo
+        // não acha outra (o servidor não divide o nome).
+        let a = Conn::open_client(&name).expect("instância alheia livre");
+        let second = Conn::open_client(&name)
+            .err()
+            .and_then(|e| e.raw_os_error());
+        assert_eq!(second, Some(ERROR_PIPE_BUSY as i32));
+        // O dono anterior sai: o servidor assume o nome com a nova tentativa.
+        drop(a);
+        drop(squatter);
+        let c = TestClient::connect_within(&name, Duration::from_secs(3));
+        c.send(&ClientMsg::Hello { version: 1 });
+        assert!(matches!(c.recv(), Some(ServerMsg::Welcome { .. })));
     }
 
     #[test]
