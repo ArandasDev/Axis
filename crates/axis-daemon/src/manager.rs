@@ -793,8 +793,7 @@ impl Manager {
         );
         if grace_index.is_some() && !plugged_new {
             if !error_reopen {
-                self.notifier
-                    .notify("Axis", &format!("{} reconectou", record.owner_name));
+                self.notify("Axis", &format!("{} reconectou", record.owner_name));
             }
         } else if let Some(n) = player {
             self.notify(
@@ -1332,6 +1331,7 @@ mod tests {
         let snap = r.ui.snapshot();
         assert!(snap.sessions[0].connected);
         assert!(Arc::ptr_eq(&tap, &snap.taps["aa:01"]));
+        assert!(snap.notices.iter().any(|n| n == "Controle 1 reconectou"));
     }
 
     #[test]
