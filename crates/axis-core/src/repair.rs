@@ -7,7 +7,8 @@ use crate::stages::calibration::SECTORS;
 use std::f32::consts::{PI, TAU};
 
 const DRIFT_CAPACITY: usize = 4096;
-const RANGE_CAPACITY: usize = 16384;
+/// O alcance não guarda amostras: os máximos por nó são mantidos em `push`.
+const RANGE_CAPACITY: usize = 0;
 const TRIGGER_CAPACITY: usize = 16384;
 
 const DRIFT_SECS: f32 = 3.0;
@@ -17,6 +18,8 @@ const RANGE_MIN_MAGNITUDE: f32 = 0.5;
 const ALL_SECTORS: u16 = u16::MAX;
 /// Ângulo entre nós de `calibrate`.
 const NODE_STEP: f32 = TAU / SECTORS as f32;
+/// Janelas por nó, da mais estreita à mais larga: ±1/16, ±¼ e ±½ passo (= nó mais próximo).
+const TIERS: [f32; 3] = [NODE_STEP / 16.0, NODE_STEP / 4.0, NODE_STEP / 2.0];
 const PRESSES: u8 = 3;
 const PRESS_HIGH: f32 = 0.8;
 const PRESS_LOW: f32 = 0.2;
@@ -126,6 +129,8 @@ pub struct Capture {
     covered: u16,
     angle_acc: f32,
     last_angle: Option<f32>,
+    /// Máximo do raio por nó em cada janela de `TIERS`.
+    tiers: [[f32; SECTORS]; 3],
     // gatilhos
     l2: TriggerTrack,
     r2: TriggerTrack,
@@ -151,6 +156,7 @@ impl Capture {
             covered: 0,
             angle_acc: 0.0,
             last_angle: None,
+            tiers: [[0.0; SECTORS]; 3],
             l2: TriggerTrack::new(),
             r2: TriggerTrack::new(),
         }
@@ -210,7 +216,15 @@ impl Capture {
             return;
         }
         let a = angle(v);
-        self.covered |= 1 << nearest_node(a);
+        let m = v.length();
+        let i = nearest_node(a);
+        let d = node_distance(a, i);
+        for (tier, width) in self.tiers.iter_mut().zip(TIERS) {
+            if d <= width {
+                tier[i] = tier[i].max(m);
+            }
+        }
+        self.covered |= 1 << i;
         if let Some(last) = self.last_angle {
             let mut d = a - last;
             if d > PI {
@@ -309,25 +323,15 @@ impl Capture {
         // entre nós: o valor do nó é o máximo na janela mais estreita com amostras,
         // entre ±1/16, ±¼ e ±½ passo (esta última = nó mais próximo). Janela larga
         // num gate não circular pega o raio da borda da janela, não o do nó.
-        const TIERS: [f32; 3] = [NODE_STEP / 16.0, NODE_STEP / 4.0, NODE_STEP / 2.0];
-        let mut tiers = [[0.0f32; SECTORS]; 3];
-        for s in &self.samples {
-            let v = sub(*s, self.center);
-            let m = v.length();
-            if m > RANGE_MIN_MAGNITUDE {
-                let a = angle(v);
-                let i = nearest_node(a);
-                let d = node_distance(a, i);
-                for (tier, width) in tiers.iter_mut().zip(TIERS) {
-                    if d <= width {
-                        tier[i] = tier[i].max(m);
-                    }
-                }
-            }
-        }
+        // Os máximos vêm de `track_range`, que vale para a captura inteira.
         let mut outer = [0.0f32; SECTORS];
         for (i, r) in outer.iter_mut().enumerate() {
-            let best = tiers.iter().map(|t| t[i]).find(|v| *v > 0.0).unwrap_or(0.0);
+            let best = self
+                .tiers
+                .iter()
+                .map(|t| t[i])
+                .find(|v| *v > 0.0)
+                .unwrap_or(0.0);
             *r = best.clamp(0.3, 1.5);
         }
         let mean = outer.iter().sum::<f32>() / SECTORS as f32;
@@ -613,13 +617,7 @@ mod tests {
             c.push(&left(0.9 * a.cos(), 0.9 * a.sin()), i as f32 / 20.0);
             i += 1;
         }
-        let empty_tight = (0..SECTORS)
-            .filter(|&n| {
-                !c.samples
-                    .iter()
-                    .any(|s| node_distance(angle(*s), n) <= NODE_STEP / 16.0)
-            })
-            .count();
+        let empty_tight = (0..SECTORS).filter(|&n| c.tiers[0][n] == 0.0).count();
         assert!(
             empty_tight > 0,
             "o teste precisa de nós sem amostra a ±1/16"
@@ -652,16 +650,41 @@ mod tests {
         let mut c = Capture::new(CaptureKind::Range(Stick::Left), Vec2::default());
         let per_turn = 6000;
         let n = (3.05 * per_turn as f32) as usize;
-        assert!(n > RANGE_CAPACITY && n < 20_000);
+        assert!(n > 16_384 && n < 20_000);
         for i in 0..20_000 {
             let a = i as f32 / per_turn as f32 * TAU;
             c.push(&left(0.95 * a.cos(), 0.95 * a.sin()), i as f32 / 1000.0);
-            if i == RANGE_CAPACITY {
+            if i == 16_384 {
                 assert!(c.turns() < 3.0);
             }
         }
         assert!(c.is_done());
         assert!(matches!(c.finish(), Outcome::Range(_)));
+    }
+
+    #[test]
+    fn range_node_first_reached_past_capacity_reads_true_radius() {
+        let mut c = Capture::new(CaptureKind::Range(Stick::Left), Vec2::default());
+        // bem além de 16384 amostras girando a 0,95 sem chegar perto do nó 4 (90°)…
+        let per_turn = 1000;
+        let near_node4 = |a: f32| (a.rem_euclid(TAU) - TAU / 4.0).abs() < 20f32.to_radians();
+        let mut i = 0usize;
+        while i < 20_000 {
+            let a = i as f32 / per_turn as f32 * TAU;
+            let r = if near_node4(a) { 0.3 } else { 0.95 };
+            c.push(&left(r * a.cos(), r * a.sin()), i as f32 * 1e-4);
+            i += 1;
+        }
+        assert!(!c.is_done(), "o nó 4 ainda não foi coberto");
+        // …e só então alcança o nó 4
+        while !c.is_done() && i < 40_000 {
+            let a = i as f32 / per_turn as f32 * TAU;
+            c.push(&left(0.95 * a.cos(), 0.95 * a.sin()), i as f32 * 1e-4);
+            i += 1;
+        }
+        assert!(c.is_done());
+        let r = range_report(&c);
+        assert!((r.outer_radius[4] - 0.95).abs() < 0.01, "{r:?}");
     }
 
     #[test]
