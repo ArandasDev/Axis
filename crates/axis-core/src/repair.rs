@@ -18,6 +18,7 @@ const ALL_SECTORS: u16 = u16::MAX;
 const PRESSES: u8 = 3;
 const PRESS_HIGH: f32 = 0.8;
 const PRESS_LOW: f32 = 0.2;
+const REST_BAND: f32 = 0.1;
 const MIN_TRIGGER_SPAN: f32 = 0.3;
 
 const MSG_DRIFT_MOVED: &str = "O analógico mexeu durante a medição. Solte e tente de novo.";
@@ -275,9 +276,7 @@ impl Capture {
             .iter()
             .map(|s| sub(*s, center).length())
             .collect();
-        dist.sort_unstable_by(f32::total_cmp);
-        let p99 = ((dist.len() as f32 * 0.99).ceil() as usize).clamp(1, dist.len()) - 1;
-        let noise = dist[p99];
+        let noise = percentile(&mut dist, 0.99).unwrap_or(0.0);
         if noise > 0.25 || center.length() >= 0.5 {
             return Outcome::Rejected(MSG_DRIFT_MOVED);
         }
@@ -337,12 +336,23 @@ fn trigger_calibration(
     if track.presses < PRESSES {
         return None;
     }
-    let span = track.max - track.min;
-    let threshold = track.min + span * PRESS_LOW;
-    let rest_peak = values.filter(|v| *v < threshold).fold(track.min, f32::max);
+    let threshold = track.min + (track.max - track.min) * REST_BAND;
+    // p95 da faixa baixa: as poucas amostras das rampas do aperto não puxam o repouso
+    let mut low: Vec<f32> = values.filter(|v| *v < threshold).collect();
+    let rest_peak = percentile(&mut low, 0.95).unwrap_or(track.min);
     let rest = (rest_peak + 0.01).clamp(0.0, 1.0);
     let max = (track.max - 0.01).clamp(0.0, 1.0);
     (max - rest >= MIN_TRIGGER_SPAN).then_some(TriggerCalibration { rest, max })
+}
+
+/// Percentil `p` (0..=1) por ordenação; `None` se vazio.
+fn percentile(values: &mut [f32], p: f32) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable_by(f32::total_cmp);
+    let i = ((values.len() as f32 * p).ceil() as usize).clamp(1, values.len()) - 1;
+    Some(values[i])
 }
 
 fn stick(input: &InputState, s: Stick) -> Vec2 {
@@ -589,6 +599,36 @@ mod tests {
         assert!((l2.rest - 0.05).abs() < 1e-4, "{l2:?}");
         assert!((l2.max - 0.96).abs() < 1e-4, "{l2:?}");
         assert_eq!(r.r2, None);
+    }
+
+    #[test]
+    fn triggers_rest_ignores_press_ramps() {
+        // ciclo de 250 amostras: repouso 0,04 ± 0,005, rampa de 12 até 0,97, 12 de volta
+        fn ramp(i: usize, rng: &mut Lcg) -> f32 {
+            let k = i % 250;
+            if i / 250 < 3 && (200..212).contains(&k) {
+                0.04 + (0.97 - 0.04) * (k - 199) as f32 / 12.0
+            } else if i / 250 < 3 && (212..224).contains(&k) {
+                0.97 - (0.97 - 0.04) * (k - 211) as f32 / 12.0
+            } else {
+                0.04 + rng.next() * 0.005
+            }
+        }
+        let mut c = Capture::new(CaptureKind::Triggers, Vec2::default());
+        let mut rng = Lcg(3);
+        let mut i = 0;
+        while !c.is_done() {
+            let v = ramp(i, &mut rng);
+            c.push(&triggers(v, v), i as f32 / HZ);
+            i += 1;
+        }
+        let Outcome::Triggers(r) = c.finish() else {
+            panic!("esperava Triggers");
+        };
+        assert_eq!((r.l2_presses, r.r2_presses), (3, 3));
+        for cal in [r.l2.expect("L2"), r.r2.expect("R2")] {
+            assert!((0.04..=0.07).contains(&cal.rest), "{cal:?}");
+        }
     }
 
     #[test]
