@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod client;
+mod single;
 mod theme;
 mod view;
 
@@ -44,6 +45,12 @@ thread_local! {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Uma interface só (também no modo demo): a segunda traz a primeira para
+    // frente e sai, antes de criar qualquer janela.
+    let Some(_single) = single::SingleUi::acquire() else {
+        single::focus_existing();
+        return Ok(());
+    };
     let app = App::new()?;
     setup_appearance(&app);
     setup_window_controls(&app);

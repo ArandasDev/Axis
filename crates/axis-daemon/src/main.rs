@@ -76,7 +76,13 @@ fn main() {
 
     let sessions = Arc::new(Mutex::new(Vec::new()));
     let autostart = Arc::new(AtomicBool::new(settings.autostart));
-    let on_command = command_handler(tx.clone(), settings_store.clone(), exe, autostart.clone());
+    let on_command = command_handler(
+        tx.clone(),
+        settings_store.clone(),
+        exe,
+        autostart.clone(),
+        notifier.clone(),
+    );
     let quit_done = QuitDone::default();
     let (tray, tray_thread) =
         Tray::spawn(on_command, sessions.clone(), autostart, quit_done.clone());
