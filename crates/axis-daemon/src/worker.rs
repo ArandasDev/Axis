@@ -245,11 +245,16 @@ impl Worker {
         }
     }
 
-    /// Entrega o report cru à captura; ao terminar, guarda o resultado e solta o buffer.
+    /// Entrega o report cru à captura; ao terminar, guarda o resultado. A captura
+    /// terminada fica guardada (sem efeito) e só é solta no próximo comando, na queda
+    /// do link ou na saída — nunca no caminho do report.
     fn feed_capture(&mut self, input: &InputState, now: Instant) {
         let Some((cap, since)) = self.capture.as_mut() else {
             return;
         };
+        if cap.is_done() {
+            return;
+        }
         cap.push(input, now.saturating_duration_since(*since).as_secs_f32());
         let done = cap.is_done();
         let snap = CaptureSnapshot {
@@ -258,14 +263,12 @@ impl Worker {
             outcome: done.then(|| cap.finish()),
         };
         self.capture_snapshot = Some(snap);
-        if done {
-            self.capture = None;
-        }
     }
 
-    /// Link caído ou saída com captura ativa: resultado `Aborted`.
+    /// Link caído ou saída com captura ativa: resultado `Aborted` (um resultado já
+    /// pronto fica).
     fn abort_capture(&mut self) {
-        if self.capture.take().is_some() {
+        if self.capture.take().is_some_and(|(c, _)| !c.is_done()) {
             if let Some(s) = &mut self.capture_snapshot {
                 s.outcome = Some(Outcome::Aborted);
             }
@@ -1187,6 +1190,23 @@ mod tests {
         let s = tap.latest();
         assert_eq!(s.output, InputState::default());
         assert_eq!(s.capture.and_then(|c| c.outcome), Some(Outcome::Aborted));
+    }
+
+    #[test]
+    fn finished_outcome_survives_link_down() {
+        let h = start_clocked(vec![ms(4)], true);
+        h.tap.set_enabled(true);
+        h.tx.send(WorkerCommand::StartCapture(drift_left()))
+            .unwrap();
+        wait_until(|| snapshot(&h).is_some());
+        push_reports(&h, 776, 0.04);
+        wait_until(|| snapshot(&h).is_some_and(|s| s.outcome.is_some()));
+        wait_until(|| *h.links.lock().unwrap() == vec![false]);
+        assert!(matches!(
+            snapshot(&h).and_then(|s| s.outcome),
+            Some(Outcome::Drift(_))
+        ));
+        h.finish();
     }
 
     #[test]

@@ -121,6 +121,8 @@ pub struct Capture {
     kind: CaptureKind,
     center: Vec2,
     samples: Vec<Vec2>,
+    /// Rascunho de `finish` (distâncias, faixa baixa dos gatilhos), alocado em `new`.
+    scratch: Vec<f32>,
     capacity: usize,
     t0: Option<f32>,
     elapsed: f32,
@@ -149,6 +151,7 @@ impl Capture {
             kind,
             center,
             samples: Vec::with_capacity(capacity),
+            scratch: Vec::with_capacity(capacity),
             capacity,
             t0: None,
             elapsed: 0.0,
@@ -278,7 +281,7 @@ impl Capture {
     }
 
     /// Analisa o que foi capturado. Nunca devolve `Outcome::Aborted`.
-    pub fn finish(&self) -> Outcome {
+    pub fn finish(&mut self) -> Outcome {
         match self.kind {
             CaptureKind::Drift(_) => self.finish_drift(),
             CaptureKind::Range(_) => self.finish_range(),
@@ -286,7 +289,7 @@ impl Capture {
         }
     }
 
-    fn finish_drift(&self) -> Outcome {
+    fn finish_drift(&mut self) -> Outcome {
         if self.samples.is_empty() {
             return Outcome::Incomplete(MSG_NO_SAMPLES);
         }
@@ -296,12 +299,10 @@ impl Capture {
             y: a.y + s.y,
         });
         let center = sum.scale(1.0 / n);
-        let mut dist: Vec<f32> = self
-            .samples
-            .iter()
-            .map(|s| sub(*s, center).length())
-            .collect();
-        let noise = percentile(&mut dist, 0.99).unwrap_or(0.0);
+        self.scratch.clear();
+        self.scratch
+            .extend(self.samples.iter().map(|s| sub(*s, center).length()));
+        let noise = percentile(&mut self.scratch, 0.99).unwrap_or(0.0);
         if noise > 0.25 || center.length() >= 0.5 {
             return Outcome::Rejected(MSG_DRIFT_MOVED);
         }
@@ -342,9 +343,10 @@ impl Capture {
         })
     }
 
-    fn finish_triggers(&self) -> Outcome {
-        let l2 = trigger_calibration(&self.l2, self.samples.iter().map(|s| s.x));
-        let r2 = trigger_calibration(&self.r2, self.samples.iter().map(|s| s.y));
+    fn finish_triggers(&mut self) -> Outcome {
+        let scratch = &mut self.scratch;
+        let l2 = trigger_calibration(&self.l2, self.samples.iter().map(|s| s.x), scratch);
+        let r2 = trigger_calibration(&self.r2, self.samples.iter().map(|s| s.y), scratch);
         if l2.is_none() && r2.is_none() {
             return Outcome::Incomplete(MSG_TRIGGERS);
         }
@@ -360,6 +362,7 @@ impl Capture {
 fn trigger_calibration(
     track: &TriggerTrack,
     values: impl Iterator<Item = f32>,
+    scratch: &mut Vec<f32>,
 ) -> Option<TriggerCalibration> {
     // apertos leves não calibram um gatilho curto
     if track.presses < PRESSES || track.max < MIN_TRIGGER_PEAK {
@@ -367,8 +370,9 @@ fn trigger_calibration(
     }
     let threshold = track.min + (track.max - track.min) * REST_BAND;
     // p95 da faixa baixa: as poucas amostras das rampas do aperto não puxam o repouso
-    let mut low: Vec<f32> = values.filter(|v| *v < threshold).collect();
-    let rest_peak = percentile(&mut low, 0.95).unwrap_or(track.min);
+    scratch.clear();
+    scratch.extend(values.filter(|v| *v < threshold));
+    let rest_peak = percentile(scratch, 0.95).unwrap_or(track.min);
     let rest = (rest_peak + 0.01).clamp(0.0, 1.0);
     let max = (track.max - 0.01).clamp(0.0, 1.0);
     (max - rest >= MIN_TRIGGER_SPAN).then_some(TriggerCalibration { rest, max })
@@ -467,7 +471,7 @@ mod tests {
 
     #[test]
     fn drift_finds_offset_and_noise() {
-        let c = drift_capture(0.04, -0.03, 0.01, 7);
+        let mut c = drift_capture(0.04, -0.03, 0.01, 7);
         assert!(c.is_done());
         assert_eq!(c.progress(), 1.0);
         let Outcome::Drift(r) = c.finish() else {
@@ -491,7 +495,7 @@ mod tests {
 
     #[test]
     fn drift_flags_worn_stick() {
-        let c = drift_capture(0.12, 0.0, 0.03, 11);
+        let mut c = drift_capture(0.12, 0.0, 0.03, 11);
         let Outcome::Drift(r) = c.finish() else {
             panic!("esperava Drift");
         };
@@ -541,7 +545,7 @@ mod tests {
         t
     }
 
-    fn range_report(c: &Capture) -> RangeReport {
+    fn range_report(c: &mut Capture) -> RangeReport {
         match c.finish() {
             Outcome::Range(r) => r,
             other => panic!("esperava Range, veio {other:?}"),
@@ -556,7 +560,7 @@ mod tests {
         });
         assert!(c.is_done());
         assert_eq!(c.progress(), 1.0);
-        let r = range_report(&c);
+        let r = range_report(&mut c);
         // nós em i·22,5°: diagonais em 45°, 135°…; cardeais em 0°, 90°…
         let diagonal = [2, 6, 10, 14];
         let cardinal = [0, 4, 8, 12];
@@ -573,7 +577,7 @@ mod tests {
 
         let mut c = Capture::new(CaptureKind::Range(Stick::Left), Vec2::default());
         spin(&mut c, 3.05, Vec2::default(), |_| 0.95);
-        let r = range_report(&c);
+        let r = range_report(&mut c);
         for v in r.outer_radius {
             assert!((v - 0.95).abs() < 0.01, "{r:?}");
         }
@@ -589,7 +593,7 @@ mod tests {
         use crate::stages::calibration::{CalibrationParams, calibrate};
         let mut c = Capture::new(CaptureKind::Range(Stick::Left), Vec2::default());
         spin(&mut c, 3.05, Vec2::default(), square_gate);
-        let r = range_report(&c);
+        let r = range_report(&mut c);
         let p = CalibrationParams {
             center: Vec2::default(),
             outer_radius: r.outer_radius,
@@ -623,7 +627,7 @@ mod tests {
             "o teste precisa de nós sem amostra a ±1/16"
         );
         assert!(c.is_done());
-        let r = range_report(&c);
+        let r = range_report(&mut c);
         for v in r.outer_radius {
             assert!((0.3..=1.5).contains(&v), "{r:?}");
             assert!((v - 0.9).abs() < 0.01, "{r:?}");
@@ -683,7 +687,7 @@ mod tests {
             i += 1;
         }
         assert!(c.is_done());
-        let r = range_report(&c);
+        let r = range_report(&mut c);
         assert!((r.outer_radius[4] - 0.95).abs() < 0.01, "{r:?}");
     }
 
@@ -708,7 +712,7 @@ mod tests {
         let center = Vec2 { x: 0.05, y: 0.0 };
         let mut c = Capture::new(CaptureKind::Range(Stick::Left), center);
         spin(&mut c, 3.05, center, |_| 0.9);
-        let r = range_report(&c);
+        let r = range_report(&mut c);
         for v in r.outer_radius {
             assert!((v - 0.9).abs() < 0.01, "{r:?}");
         }
@@ -854,5 +858,67 @@ mod tests {
         c.push(&triggers(0.2, 0.3), 0.01);
         assert_eq!((c.l2.min, c.l2.max), (0.2, 0.2));
         assert_eq!((c.r2.min, c.r2.max), (0.3, 0.3));
+    }
+
+    /// Conta alocações da thread atual (só no binário de teste).
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            pub static ALLOCS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub struct Counting;
+
+        // SAFETY: delega tudo ao alocador do sistema; só conta as chamadas.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let _ = ALLOCS.try_with(|a| a.set(a.get() + 1));
+                // SAFETY: mesmo contrato de `GlobalAlloc::alloc`.
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                // SAFETY: `ptr` veio de `System.alloc` com este `layout`.
+                unsafe { System.dealloc(ptr, layout) }
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let _ = ALLOCS.try_with(|a| a.set(a.get() + 1));
+                // SAFETY: mesmo contrato de `GlobalAlloc::realloc`.
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: Counting = Counting;
+
+        pub fn count<T>(f: impl FnOnce() -> T) -> (T, usize) {
+            let before = ALLOCS.with(Cell::get);
+            let out = f();
+            (out, ALLOCS.with(Cell::get) - before)
+        }
+    }
+
+    #[test]
+    fn finish_does_not_allocate() {
+        let mut c = drift_capture(0.04, -0.03, 0.01, 7);
+        let (o, n) = counting::count(|| c.finish());
+        assert!(matches!(o, Outcome::Drift(_)));
+        assert_eq!(n, 0, "drift");
+
+        let mut c = Capture::new(CaptureKind::Range(Stick::Left), Vec2::default());
+        spin(&mut c, 3.05, Vec2::default(), square_gate);
+        let (o, n) = counting::count(|| c.finish());
+        assert!(matches!(o, Outcome::Range(_)));
+        assert_eq!(n, 0, "alcance");
+
+        let mut c = Capture::new(CaptureKind::Triggers, Vec2::default());
+        for i in 0..=(30 * HZ as usize) {
+            let v = press_pattern(i, 3, 0.02, 0.97);
+            c.push(&triggers(v, v), i as f32 / HZ);
+        }
+        let (o, n) = counting::count(|| c.finish());
+        assert!(matches!(o, Outcome::Triggers(_)));
+        assert_eq!(n, 0, "gatilhos");
     }
 }
