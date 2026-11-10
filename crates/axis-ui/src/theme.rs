@@ -1,5 +1,4 @@
 //! Paleta de destaque em OKLCH.
-#![allow(dead_code)] // ACCENTS e o resto da paleta serão usados pelas próximas telas
 
 /// Destaques disponíveis: (id, rótulo). O laranja é fixo; os demais usam L 0,67.
 pub const ACCENTS: [(&str, &str); 7] = [

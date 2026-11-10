@@ -139,7 +139,6 @@ impl Client {
     }
 
     /// Envia ao núcleo; desconectado, a mensagem é descartada.
-    #[allow(dead_code)] // usado pelas telas de controle (próximas tarefas)
     pub fn send(&self, m: ClientMsg) {
         let _ = self.tx.send(m);
     }

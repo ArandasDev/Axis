@@ -1,0 +1,238 @@
+import { Tokens } from "tokens.slint";
+
+/// Um cartão da barra lateral (montado em `view::pad_card`).
+export struct PadCardData {
+    id: string,
+    owner: string,
+    line: string,
+    label: string,
+    color: color,
+}
+
+/// Uma bolinha de destaque (de `theme::ACCENTS`).
+export struct AccentData {
+    label: string,
+    color: color,
+}
+
+export component PrimaryButton inherits Rectangle {
+    in property <string> text;
+    callback clicked();
+
+    border-radius: Tokens.radius-btn;
+    background: touch.pressed ? Tokens.accent.darker(0.15) : touch.has-hover ? Tokens.accent.brighter(0.08) : Tokens.accent;
+    min-width: label.preferred-width + 2 * Tokens.space-l;
+    height: label.preferred-height + Tokens.space-m;
+    animate background { duration: Tokens.dur-fast; }
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+
+    label := Text {
+        text: root.text;
+        color: Tokens.bg;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// Título de seção pequeno, em caixa alta e na cor de destaque.
+export component Kicker inherits Text {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1.2px;
+    color: Tokens.accent;
+}
+
+/// Item da navegação; desabilitado mostra "em breve" e não responde.
+export component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <string> key;
+    in property <bool> active;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 38px;
+    border-radius: Tokens.radius-btn;
+    background: active ? Tokens.accent-soft : touch.has-hover && enabled ? Tokens.hover : transparent;
+    border-width: active ? 1px : 0px;
+    border-color: Tokens.accent.with-alpha(0.32);
+    accessible-role: button;
+    accessible-label: enabled ? label : label + " (em breve)";
+    accessible-enabled: enabled;
+    animate background { duration: Tokens.dur-fast; }
+
+    HorizontalLayout {
+        padding-left: Tokens.space-sm;
+        padding-right: Tokens.space-sm;
+        spacing: Tokens.space-s;
+        Text {
+            text: root.label;
+            color: root.active ? Tokens.accent : root.enabled ? Tokens.text : Tokens.muted;
+            font-size: 14px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+        Rectangle { }
+        Text {
+            text: root.enabled ? root.key : "em breve";
+            color: Tokens.muted;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// Cartão de um controle: bolinha na cor do dono, nome e linha da sessão.
+export component PadCard inherits Rectangle {
+    in property <PadCardData> data;
+    in property <bool> active;
+    callback clicked();
+
+    height: 54px;
+    border-radius: Tokens.radius-card;
+    border-width: 1px;
+    border-color: active ? Tokens.accent.with-alpha(0.55) : Tokens.divider;
+    background: active ? Tokens.accent-soft : touch.has-hover ? Tokens.hover : transparent;
+    accessible-role: button;
+    accessible-label: data.label;
+    accessible-action-default => { root.clicked(); }
+    animate background, border-color { duration: Tokens.dur-fast; }
+
+    HorizontalLayout {
+        padding: Tokens.space-s;
+        spacing: Tokens.space-s;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 10px;
+                height: 10px;
+                border-radius: self.width / 2;
+                background: root.data.color;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: Tokens.space-xxs;
+            Text {
+                text: root.data.owner;
+                color: Tokens.text;
+                font-size: 13px;
+                font-weight: 500;
+                overflow: elide;
+            }
+            Text {
+                text: root.data.line;
+                color: Tokens.muted;
+                font-size: 11px;
+                overflow: elide;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// Botão da barra de título (minimizar, maximizar, fechar), desenhado em linha.
+export component WindowButton inherits Rectangle {
+    /// Comandos SVG num quadro de 10×10.
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> danger;
+    callback clicked();
+
+    width: 46px;
+    background: touch.has-hover ? (danger ? Tokens.danger : Tokens.hover) : transparent;
+    accessible-role: button;
+    accessible-label: label;
+    accessible-action-default => { root.clicked(); }
+    animate background { duration: Tokens.dur-fast; }
+
+    Path {
+        width: 10px;
+        height: 10px;
+        viewbox-width: 10;
+        viewbox-height: 10;
+        commands: root.icon;
+        stroke: touch.has-hover && root.danger ? Tokens.on-danger : Tokens.text;
+        stroke-width: 1px;
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+/// Metade de um seletor de duas opções (Escuro / Claro).
+export component SegmentButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked();
+
+    height: 30px;
+    border-radius: Tokens.radius-btn;
+    background: active ? Tokens.surface : transparent;
+    border-width: active ? 1px : 0px;
+    border-color: Tokens.divider;
+    accessible-role: button;
+    accessible-label: text;
+    accessible-checked: active;
+    accessible-action-default => { root.clicked(); }
+
+    Text {
+        text: root.text;
+        color: root.active ? Tokens.text : Tokens.muted;
+        font-size: 12px;
+        font-weight: 500;
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// Bolinha de cor de destaque; a escolhida ganha um anel.
+export component Swatch inherits Rectangle {
+    in property <AccentData> data;
+    in property <bool> active;
+    callback clicked();
+
+    width: 22px;
+    height: 22px;
+    border-radius: self.width / 2;
+    border-width: active ? 2px : 0px;
+    border-color: Tokens.text;
+    accessible-role: button;
+    accessible-label: data.label;
+    accessible-checked: active;
+    accessible-action-default => { root.clicked(); }
+
+    Rectangle {
+        width: root.active ? 14px : touch.has-hover ? 20px : 18px;
+        height: self.width;
+        border-radius: self.width / 2;
+        background: root.data.color;
+        animate width { duration: Tokens.dur-fast; }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}

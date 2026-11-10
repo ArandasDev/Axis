@@ -33,7 +33,6 @@ pub fn connection_message(state: Connection) -> &'static str {
     }
 }
 
-#[allow(dead_code)] // usado pela lista de controles (próxima tarefa)
 pub fn family_label(f: &Family) -> &'static str {
     match f {
         Family::DualShock4 => "DS4",
@@ -44,9 +43,13 @@ pub fn family_label(f: &Family) -> &'static str {
 
 /// "Maria · DS4 · Player 1 · 64%"; desconectado: "… · reconectando…";
 /// sem controle virtual: "… · só visualização".
-#[allow(dead_code)] // usado pela lista de controles (próxima tarefa)
 pub fn session_line(s: &SessionInfo) -> String {
-    let mut parts = vec![s.owner.clone(), family_label(&s.family).to_string()];
+    format!("{} · {}", s.owner, details_line(s))
+}
+
+/// A linha da sessão sem o nome do dono: "DS4 · Player 1 · 64%".
+fn details_line(s: &SessionInfo) -> String {
+    let mut parts = vec![family_label(&s.family).to_string()];
     if let Some(p) = s.player {
         parts.push(format!("Player {p}"));
     }
@@ -61,6 +64,51 @@ pub fn session_line(s: &SessionInfo) -> String {
         }
     }
     parts.join(" · ")
+}
+
+/// Cartão da barra lateral: bolinha na cor do dono, nome e a linha da sessão
+/// (sem repetir o nome, que já fica em cima).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PadCard {
+    pub id: String,
+    pub color: [u8; 3],
+    pub owner: String,
+    pub line: String,
+    /// Linha completa, com o nome, para leitores de tela.
+    pub label: String,
+}
+
+pub fn pad_card(s: &SessionInfo) -> PadCard {
+    PadCard {
+        id: s.id.clone(),
+        color: s.color,
+        owner: s.owner.clone(),
+        line: details_line(s),
+        label: session_line(s),
+    }
+}
+
+/// O primeiro controle conectado, se houver.
+pub fn default_selection(sessions: &[SessionInfo]) -> Option<String> {
+    sessions.iter().find(|s| s.connected).map(|s| s.id.clone())
+}
+
+/// Seleção depois de uma nova lista: mantém a atual enquanto o controle
+/// existir; senão, o primeiro conectado.
+pub fn next_selection(current: Option<&str>, sessions: &[SessionInfo]) -> Option<String> {
+    match current {
+        Some(id) if sessions.iter().any(|s| s.id == id) => Some(id.to_string()),
+        _ => default_selection(sessions),
+    }
+}
+
+/// Estado na barra de título: "pausado" ou "ativo · N controles".
+pub fn status_line(paused: bool, controllers: usize) -> String {
+    match (paused, controllers) {
+        (true, _) => "pausado".into(),
+        (false, 1) => "ativo · 1 controle".into(),
+        (false, n) => format!("ativo · {n} controles"),
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +193,61 @@ mod tests {
         ]
         .map(Connection::code);
         assert_eq!(codes, [0, 1, 2, 3]);
+    }
+
+    fn session(id: &str, connected: bool) -> SessionInfo {
+        SessionInfo {
+            id: id.into(),
+            connected,
+            ..maria()
+        }
+    }
+
+    #[test]
+    fn selected_defaults_to_first_connected() {
+        assert_eq!(default_selection(&[]), None);
+        let all_down = [session("a", false), session("b", false)];
+        assert_eq!(default_selection(&all_down), None);
+        let mixed = [session("a", false), session("b", true), session("c", true)];
+        assert_eq!(default_selection(&mixed), Some("b".to_string()));
+    }
+
+    #[test]
+    fn selection_survives_session_updates() {
+        let list = [session("a", true), session("b", false)];
+        // A escolha do usuário fica enquanto o controle existir, mesmo reconectando.
+        assert_eq!(next_selection(Some("b"), &list), Some("b".to_string()));
+        // Sem escolha ou com o controle removido, volta ao primeiro conectado.
+        assert_eq!(next_selection(None, &list), Some("a".to_string()));
+        assert_eq!(next_selection(Some("zz"), &list), Some("a".to_string()));
+        assert_eq!(next_selection(Some("a"), &[]), None);
+    }
+
+    #[test]
+    fn pad_card_data_from_session() {
+        let card = pad_card(&maria());
+        assert_eq!(
+            card,
+            PadCard {
+                id: "aa:01".into(),
+                color: [1, 2, 3],
+                owner: "Maria".into(),
+                line: "DS4 · Player 1 · 64%".into(),
+                label: "Maria · DS4 · Player 1 · 64%".into(),
+            }
+        );
+        let reconnecting = pad_card(&SessionInfo {
+            connected: false,
+            ..maria()
+        });
+        assert_eq!(reconnecting.line, "DS4 · Player 1 · reconectando…");
+    }
+
+    #[test]
+    fn status_texts() {
+        assert_eq!(status_line(true, 2), "pausado");
+        assert_eq!(status_line(false, 0), "ativo · 0 controles");
+        assert_eq!(status_line(false, 1), "ativo · 1 controle");
+        assert_eq!(status_line(false, 3), "ativo · 3 controles");
     }
 }

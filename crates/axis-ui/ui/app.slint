@@ -1,29 +1,6 @@
 import { Tokens } from "tokens.slint";
-export { Tokens }
-
-component PrimaryButton inherits Rectangle {
-    in property <string> text;
-    callback clicked();
-
-    border-radius: Tokens.radius-btn;
-    background: touch.pressed ? Tokens.accent.darker(0.15) : touch.has-hover ? Tokens.accent.brighter(0.08) : Tokens.accent;
-    min-width: label.preferred-width + 2 * Tokens.space-l;
-    height: label.preferred-height + Tokens.space-m;
-    animate background { duration: Tokens.dur-fast; }
-
-    label := Text {
-        text: root.text;
-        color: Tokens.bg;
-        font-weight: 600;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-
-    touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
-    }
-}
+import { AccentData, Kicker, NavItem, PadCard, PadCardData, PrimaryButton, SegmentButton, Swatch, WindowButton } from "components.slint";
+export { Tokens, PadCardData, AccentData }
 
 /// Tela sobre o conteúdo enquanto não há conexão com o núcleo.
 component ConnectionScreen inherits Rectangle {
@@ -65,23 +42,239 @@ component ConnectionScreen inherits Rectangle {
     }
 }
 
+/// Barra de título própria: arrasta a janela, duplo clique maximiza.
+component TitleBar inherits Rectangle {
+    in property <string> status;
+    in property <bool> paused;
+    callback minimize();
+    callback toggle-maximize();
+    callback close-window();
+
+    height: 40px;
+
+    WindowMoveArea {
+        TouchArea {
+            double-clicked => { root.toggle-maximize(); }
+        }
+    }
+
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Tokens.divider;
+    }
+
+    HorizontalLayout {
+        padding-left: Tokens.space-sm;
+        spacing: Tokens.space-s;
+
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 14px;
+                height: 14px;
+                border-radius: Tokens.radius-s;
+                background: Tokens.accent;
+            }
+        }
+        Text {
+            text: "AXIS";
+            font-family: Tokens.font-heading;
+            font-weight: 600;
+            font-size: 18px;
+            letter-spacing: 1.8px;
+            color: Tokens.text;
+            vertical-alignment: center;
+        }
+        Text {
+            text: "Controller Bridge";
+            font-size: 12px;
+            color: Tokens.muted;
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; }
+        if root.status != "": HorizontalLayout {
+            horizontal-stretch: 0;
+            spacing: Tokens.space-s;
+            padding-right: Tokens.space-sm;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 7px;
+                    height: 7px;
+                    border-radius: self.width / 2;
+                    background: root.paused ? Tokens.muted : Tokens.accent;
+                }
+            }
+            Text {
+                text: root.status;
+                font-size: 12px;
+                color: root.paused ? Tokens.muted : Tokens.text;
+                vertical-alignment: center;
+            }
+        }
+        WindowButton {
+            label: "Minimizar";
+            icon: "M 0 5 L 10 5";
+            clicked => { root.minimize(); }
+        }
+        WindowButton {
+            label: "Maximizar";
+            icon: "M 0.5 0.5 L 9.5 0.5 L 9.5 9.5 L 0.5 9.5 Z";
+            clicked => { root.toggle-maximize(); }
+        }
+        WindowButton {
+            label: "Fechar";
+            icon: "M 0 0 L 10 10 M 10 0 L 0 10";
+            danger: true;
+            clicked => { root.close-window(); }
+        }
+    }
+}
+
+/// Barra lateral: navegação, controles e aparência.
+component Sidebar inherits Rectangle {
+    in property <[PadCardData]> pads;
+    in property <string> selected-id;
+    in property <[AccentData]> accents;
+    in-out property <int> accent-index;
+    callback select-pad(string);
+
+    width: 232px;
+
+    Rectangle {
+        x: parent.width - 1px;
+        width: 1px;
+        background: Tokens.divider;
+    }
+
+    VerticalLayout {
+        padding: Tokens.space-sm;
+        padding-top: Tokens.space-m;
+        spacing: Tokens.space-xxs;
+
+        NavItem { label: "Visão geral"; key: "1"; active: true; }
+        NavItem { label: "Mapeamento"; key: "2"; enabled: false; }
+        NavItem { label: "Correção"; key: "3"; enabled: false; }
+        NavItem { label: "Perfis"; key: "4"; enabled: false; }
+
+        Rectangle { height: Tokens.space-l; }
+        Kicker { text: "CONTROLES"; }
+        Rectangle { height: Tokens.space-s; }
+
+        VerticalLayout {
+            spacing: Tokens.space-s;
+            for pad in root.pads: PadCard {
+                data: pad;
+                active: pad.id == root.selected-id;
+                clicked => { root.select-pad(pad.id); }
+            }
+            if root.pads.length == 0: Text {
+                text: "Nenhum controle conectado";
+                color: Tokens.muted;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+
+        Rectangle { }
+
+        Kicker { text: "APARÊNCIA"; }
+        Rectangle { height: Tokens.space-s; }
+        Rectangle {
+            height: 38px;
+            border-radius: Tokens.radius-btn + Tokens.space-xs;
+            background: Tokens.hover;
+            HorizontalLayout {
+                padding: Tokens.space-xs;
+                spacing: Tokens.space-xs;
+                SegmentButton {
+                    text: "Escuro";
+                    active: Tokens.dark;
+                    clicked => { Tokens.dark = true; }
+                }
+                SegmentButton {
+                    text: "Claro";
+                    active: !Tokens.dark;
+                    clicked => { Tokens.dark = false; }
+                }
+            }
+        }
+        Rectangle { height: Tokens.space-sm; }
+        HorizontalLayout {
+            alignment: space-between;
+            padding-bottom: Tokens.space-xs;
+            for accent[i] in root.accents: Swatch {
+                data: accent;
+                active: i == root.accent-index;
+                clicked => {
+                    root.accent-index = i;
+                    Tokens.accent = accent.color;
+                }
+            }
+        }
+    }
+}
+
 export component App inherits Window {
     /// 0 conectando, 1 conectado, 2 núcleo parado, 3 incompatível.
     in property <int> connection: 0;
     in property <string> connection-message: "Conectando ao núcleo…";
+    /// "ativo · N controles" ou "pausado"; vazio fora de conexão.
+    in property <string> status;
+    in property <bool> paused;
+    in property <[PadCardData]> pads;
+    in property <string> selected-id;
+    in property <[AccentData]> accents;
+    in-out property <int> accent-index: 0;
     callback start-daemon();
+    callback select-pad(string);
+    callback minimize();
+    callback toggle-maximize();
+    callback close-window();
 
     title: "Axis";
+    no-frame: true;
     background: Tokens.bg;
     default-font-family: Tokens.font-body;
     preferred-width: 1100px;
     preferred-height: 720px;
 
-    if root.connection != 1: ConnectionScreen {
-        width: 100%;
-        height: 100%;
-        connection: root.connection;
-        message: root.connection-message;
-        start-daemon => { root.start-daemon(); }
+    VerticalLayout {
+        TitleBar {
+            status: root.connection == 1 ? root.status : "";
+            paused: root.paused;
+            minimize => { root.minimize(); }
+            toggle-maximize => { root.toggle-maximize(); }
+            close-window => { root.close-window(); }
+        }
+
+        Rectangle {
+            HorizontalLayout {
+                Sidebar {
+                    pads: root.pads;
+                    selected-id: root.selected-id;
+                    accents: root.accents;
+                    accent-index <=> root.accent-index;
+                    select-pad(id) => { root.select-pad(id); }
+                }
+                // Conteúdo da tela escolhida (Visão geral: próxima tarefa).
+                Rectangle { }
+            }
+
+            if root.connection != 1: ConnectionScreen {
+                width: 100%;
+                height: 100%;
+                connection: root.connection;
+                message: root.connection-message;
+                start-daemon => { root.start-daemon(); }
+            }
+        }
+    }
+
+    // Contorno da janela sem moldura do sistema.
+    Rectangle {
+        border-width: 1px;
+        border-color: Tokens.divider;
     }
 }
