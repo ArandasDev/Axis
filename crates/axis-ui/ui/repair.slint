@@ -1,7 +1,7 @@
 import { Tokens } from "tokens.slint";
 import { GridBackdrop, Kicker, Panel, PanelTitle, PrimaryButton, SecondaryButton, SegmentButton, SegmentGroup } from "components.slint";
 import { OverviewHeader } from "overview.slint";
-import { DriftPlot, PlotPoint, RangePlot } from "repair-plots.slint";
+import { DriftPlot, PlotPoint, RangePlot, TriggerBars } from "repair-plots.slint";
 
 export { PlotPoint }
 
@@ -47,6 +47,27 @@ export global RepairWork {
     callback apply-fields();
     callback restore-default();
     callback undo();
+
+    /// Gatilhos: valores crus ao vivo (0 a 1, saneados).
+    in property <float> l2;
+    in property <float> r2;
+    /// Gatilhos: o que o resultado mediu (marcas de repouso e máximo).
+    in property <bool> l2-measured;
+    in property <bool> r2-measured;
+    in property <float> l2-rest;
+    in property <float> l2-max;
+    in property <float> r2-rest;
+    in property <float> r2-max;
+    /// Legenda de cada barra ("medindo…", "repouso 0,05 …", "não medido").
+    in property <string> l2-caption;
+    in property <string> r2-caption;
+
+    /// Conexão (passiva): textos prontos, trocados só quando mudam.
+    in property <string> link-transport;
+    in property <string> link-rate;
+    in property <string> link-jitter;
+    in property <string> link-disconnects;
+    in property <string> link-battery;
 }
 
 /// Cartão de um assistente: nome e o que está aplicado agora.
@@ -192,6 +213,113 @@ component WarningBox inherits Rectangle {
     }
 }
 
+/// Barras dos gatilhos ligadas ao `RepairWork` (as marcas só com resultado).
+component Bars inherits TriggerBars {
+    l2: RepairWork.l2;
+    r2: RepairWork.r2;
+    l2-measured: RepairWork.l2-measured;
+    r2-measured: RepairWork.r2-measured;
+    l2-rest: RepairWork.l2-rest;
+    l2-max: RepairWork.l2-max;
+    r2-rest: RepairWork.r2-rest;
+    r2-max: RepairWork.r2-max;
+    l2-caption: RepairWork.l2-caption;
+    r2-caption: RepairWork.r2-caption;
+}
+
+/// Um número da conexão: rótulo, valor grande e uma nota opcional.
+component MetricTile inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <string> note;
+
+    // Mesma largura preferida em todos: as colunas dividem por igual.
+    preferred-width: 120px;
+    horizontal-stretch: 1;
+    border-radius: Tokens.radius-card;
+    border-width: 1px;
+    border-color: Tokens.divider;
+    background: Tokens.surface;
+    accessible-role: text;
+    accessible-label: root.label + ": " + root.value;
+
+    VerticalLayout {
+        padding: Tokens.space-m;
+        padding-top: Tokens.space-sm;
+        padding-bottom: Tokens.space-sm;
+        spacing: Tokens.space-xxs;
+        Kicker { text: root.label; }
+        Text {
+            text: root.value;
+            font-family: Tokens.font-heading;
+            font-size: 26px;
+            font-weight: 600;
+            color: Tokens.text;
+            overflow: elide;
+        }
+        Text {
+            text: root.note;
+            font-size: 11px;
+            color: Tokens.muted;
+            wrap: word-wrap;
+        }
+    }
+}
+
+/// Conexão: o que o núcleo já mede durante o uso, sem botão de medir.
+component LinkView inherits VerticalLayout {
+    spacing: Tokens.space-sm;
+    Kicker { text: "AO VIVO"; }
+    Text {
+        text: "A conexão é acompanhada durante o uso, sem medição";
+        font-family: Tokens.font-heading;
+        font-size: 28px;
+        font-weight: 600;
+        color: Tokens.text;
+        wrap: word-wrap;
+    }
+    // Três colunas iguais; a bateria ocupa duas (largura preferida e
+    // esticamento em dobro, mais um espaço: as bordas se alinham).
+    HorizontalLayout {
+        padding-top: Tokens.space-xs;
+        spacing: Tokens.space-sm;
+        MetricTile {
+            label: "CONEXÃO";
+            value: RepairWork.link-transport;
+        }
+        MetricTile {
+            label: "TAXA";
+            value: RepairWork.link-rate;
+            note: "reports por segundo";
+        }
+        MetricTile {
+            label: "JITTER";
+            value: RepairWork.link-jitter;
+            note: "variação entre reports";
+        }
+    }
+    HorizontalLayout {
+        spacing: Tokens.space-sm;
+        MetricTile {
+            label: "DESCONEXÕES";
+            value: RepairWork.link-disconnects;
+            note: "desde que o núcleo iniciou";
+        }
+        MetricTile {
+            preferred-width: 2 * 120px + Tokens.space-sm;
+            horizontal-stretch: 2;
+            label: "BATERIA";
+            value: RepairWork.link-battery;
+        }
+    }
+    Text {
+        text: "O Windows não informa a força do sinal Bluetooth de forma confiável.";
+        font-size: 12px;
+        color: Tokens.muted;
+        wrap: word-wrap;
+    }
+}
+
 /// Painel do assistente escolhido: cabeçalho sólido sobre a grade e o passo
 /// atual; drift e alcance desenham a nuvem/rastro ao lado do texto.
 component WizardPanel inherits Panel {
@@ -208,11 +336,13 @@ component WizardPanel inherits Panel {
     callback reset();
 
     property <length> header-height: 46px;
-    /// Drift e alcance têm gráfico; gatilhos e conexão ainda não.
-    property <bool> plotted: root.wizard <= 1;
+    /// Drift e alcance têm gráfico e os gatilhos, as barras; a conexão é
+    /// passiva e não mede.
+    property <bool> plotted: root.wizard <= 2;
     property <length> plot-size: 220px;
-    /// Colunas da grade de números: drift 3, alcance 4×4.
-    property <int> field-cols: root.wizard == 0 ? 3 : 4;
+    /// Colunas da grade de números: drift 3, alcance 4×4, gatilhos 2 (um
+    /// gatilho por linha).
+    property <int> field-cols: root.wizard == 0 ? 3 : root.wizard == 1 ? 4 : 2;
     /// No resultado do alcance em modo especialista a grade 4×4 divide a
     /// altura com o gráfico.
     property <length> result-plot-size: RepairWork.editing && root.wizard == 1 ? 168px : 200px;
@@ -271,9 +401,12 @@ component WizardPanel inherits Panel {
             spacing: Tokens.space-sm;
             alignment: center;
 
-            if root.step == 0: VerticalLayout {
+            // Conexão: passiva, sempre ao vivo (sem medir).
+            if root.wizard == 3: LinkView { }
+
+            if root.step == 0 && root.wizard != 3: VerticalLayout {
                 spacing: Tokens.space-sm;
-                Kicker { text: root.wizard == 3 ? "AO VIVO" : "COMO MEDIR"; }
+                Kicker { text: "COMO MEDIR"; }
                 Text {
                     text: root.instruction;
                     font-family: Tokens.font-heading;
@@ -283,12 +416,12 @@ component WizardPanel inherits Panel {
                     wrap: word-wrap;
                 }
                 Text {
-                    text: root.wizard == 3 ? "Taxa, jitter, desconexões e bateria do controle selecionado." : root.mode-line;
+                    text: root.mode-line;
                     font-size: 13px;
                     color: Tokens.muted;
                     wrap: word-wrap;
                 }
-                if root.wizard != 3: HorizontalLayout {
+                HorizontalLayout {
                     alignment: start;
                     padding-top: Tokens.space-s;
                     spacing: Tokens.space-sm;
@@ -326,6 +459,11 @@ component WizardPanel inherits Panel {
                         width: root.plot-size;
                         height: root.plot-size;
                         points: RepairWork.points;
+                    }
+                    // Gatilhos: barras cruas ao vivo, sem marcas até o
+                    // resultado (o núcleo não manda marcas parciais).
+                    if root.wizard == 2: Bars {
+                        height: root.plot-size;
                     }
                 }
                 VerticalLayout {
@@ -385,6 +523,10 @@ component WizardPanel inherits Panel {
                             has-result: RepairWork.has-result;
                             polygon: RepairWork.polygon;
                         }
+                        if root.wizard == 2: Bars {
+                            height: root.result-plot-size;
+                            has-result: RepairWork.has-result;
+                        }
                     }
                     VerticalLayout {
                         alignment: start;
@@ -413,7 +555,7 @@ component WizardPanel inherits Panel {
                             visible: self.index < RepairWork.fields.length;
                             label: RepairWork.fields[self.index].label;
                             value: RepairWork.fields[self.index].value;
-                            label-width: root.wizard == 0 ? 82px : 44px;
+                            label-width: root.wizard == 1 ? 44px : 82px;
                             invalid: RepairWork.error-index == self.index;
                             edited(text) => { RepairWork.field-edited(self.index, text); }
                         }
@@ -437,52 +579,6 @@ component WizardPanel inherits Panel {
                         text: "Restaurar padrão";
                         clicked => { RepairWork.restore-default(); }
                     }
-                    SecondaryButton {
-                        text: "Medir de novo";
-                        clicked => { root.reset(); }
-                    }
-                }
-            }
-
-            if root.step == 1 && !root.plotted: VerticalLayout {
-                spacing: Tokens.space-sm;
-                Kicker { text: "MEDINDO"; }
-                Text {
-                    text: root.instruction;
-                    font-family: Tokens.font-heading;
-                    font-size: 28px;
-                    font-weight: 600;
-                    color: Tokens.text;
-                    wrap: word-wrap;
-                }
-                HorizontalLayout {
-                    spacing: Tokens.space-sm;
-                    VerticalLayout {
-                        alignment: center;
-                        Progress { value: root.progress; }
-                    }
-                    Text {
-                        text: round(max(0, min(1, root.progress)) * 100) + "%";
-                        width: 40px;
-                        font-size: 12px;
-                        color: Tokens.text;
-                        horizontal-alignment: right;
-                    }
-                }
-            }
-
-            if root.step == 2 && !root.plotted: VerticalLayout {
-                spacing: Tokens.space-sm;
-                Kicker { text: "RESULTADO"; }
-                Text {
-                    text: root.message;
-                    font-size: 15px;
-                    color: Tokens.text;
-                    wrap: word-wrap;
-                }
-                HorizontalLayout {
-                    alignment: start;
-                    padding-top: Tokens.space-s;
                     SecondaryButton {
                         text: "Medir de novo";
                         clicked => { root.reset(); }

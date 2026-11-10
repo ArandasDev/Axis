@@ -76,6 +76,9 @@ struct Shell {
     undo: Option<(String, CorrectionsDto)>,
     /// O que está digitado nos campos do especialista.
     fields: Vec<String>,
+    /// Último resultado mostrado (o "Aplicar" dos gatilhos sabe quais foram
+    /// medidos).
+    result: Option<CaptureResultDto>,
     /// Modo demo: lista de controles a republicar (como o núcleo faz depois
     /// de um `SetCorrections`).
     demo_sessions: Option<Vec<SessionInfo>>,
@@ -86,7 +89,16 @@ thread_local! {
     /// um temporizador antigo não encerra uma espera mais nova.
     static GRACE: Cell<u32> = const { Cell::new(0) };
     static SHELL: RefCell<Shell> = RefCell::default();
+    /// Últimos números da Conexão mostrados (taxa, jitter, bateria,
+    /// carregando): os textos só são refeitos quando mudam, não a cada quadro.
+    static LINK: Cell<Option<LinkStats>> = const { Cell::new(None) };
 }
+
+/// Números da conexão que vêm em cada quadro ao vivo.
+type LinkStats = (u32, u32, Option<u8>, bool);
+
+/// Sem quadro ao vivo: tudo "—".
+const NO_LINK: LinkStats = (0, 0, None, false);
 
 fn main() -> Result<(), slint::PlatformError> {
     // Uma interface só (também no modo demo): a segunda traz a primeira para
@@ -364,9 +376,16 @@ fn apply_fields(app: &App) {
     let Some((id, wizard, stick, cur)) = target() else {
         return;
     };
-    let texts = SHELL.with(|s| s.borrow().fields.clone());
+    let (texts, result) = SHELL.with(|s| {
+        let s = s.borrow();
+        (s.fields.clone(), s.result.clone())
+    });
     let work = app.global::<RepairWork>();
-    match repair_view::corrections_from_fields(&cur, wizard, stick, &texts) {
+    let next = match (wizard, &result) {
+        (Wizard::Triggers, Some(r)) => repair_view::triggers_from_fields(&cur, r, &texts),
+        _ => repair_view::corrections_from_fields(&cur, wizard, stick, &texts),
+    };
+    match next {
         Ok(next) => {
             work.set_error_index(-1);
             work.set_field_error("".into());
@@ -395,6 +414,7 @@ fn reset_work(app: &App) {
         let mut s = s.borrow_mut();
         s.undo = None;
         s.fields.clear();
+        s.result = None;
         s.head = 0;
         // Uma notificação só (o modelo continua o mesmo).
         s.points.set_vec(vec![PlotPoint::default(); PLOT_POINTS]);
@@ -410,30 +430,58 @@ fn reset_work(app: &App) {
     work.set_field_error("".into());
     work.set_error_index(-1);
     work.set_lap(repair_view::lap_text(0.0).into());
+    work.set_l2_measured(false);
+    work.set_r2_measured(false);
+    work.set_l2_caption("".into());
+    work.set_r2_caption("".into());
 }
 
-/// Resultado válido de drift ou alcance: desenha e, no modo leigo, aplica na
-/// hora; no especialista, abre os números para editar.
-fn show_result(app: &App, id: String, result: &CaptureResultDto) {
-    if !matches!(
-        result,
-        CaptureResultDto::Drift { .. } | CaptureResultDto::Range { .. }
-    ) {
-        // Gatilhos: assistente da próxima etapa.
-        return;
+/// Marcas e legendas das barras dos gatilhos no resultado; o não medido fica
+/// sem marca e com "não medido".
+fn show_trigger_marks(work: &RepairWork, l2: Option<&TriggerCalDto>, r2: Option<&TriggerCalDto>) {
+    work.set_l2_measured(l2.is_some());
+    work.set_r2_measured(r2.is_some());
+    if let Some(t) = l2 {
+        work.set_l2_rest(t.rest);
+        work.set_l2_max(t.max);
     }
+    if let Some(t) = r2 {
+        work.set_r2_rest(t.rest);
+        work.set_r2_max(t.max);
+    }
+    work.set_l2_caption(repair_view::trigger_caption(l2).into());
+    work.set_r2_caption(repair_view::trigger_caption(r2).into());
+}
+
+/// Resultado válido de drift, alcance ou gatilhos: desenha e, no modo leigo,
+/// aplica na hora; no especialista, abre os números para editar.
+fn show_result(app: &App, id: String, result: &CaptureResultDto) {
     let work = app.global::<RepairWork>();
     work.set_has_result(true);
-    if let CaptureResultDto::Drift { center, radius, .. } = result {
-        work.set_center_x(center[0]);
-        work.set_center_y(center[1]);
-        work.set_radius(*radius);
+    match result {
+        CaptureResultDto::Drift { center, radius, .. } => {
+            work.set_center_x(center[0]);
+            work.set_center_y(center[1]);
+            work.set_radius(*radius);
+        }
+        CaptureResultDto::Triggers { l2, r2, .. } => {
+            show_trigger_marks(&work, l2.as_ref(), r2.as_ref());
+        }
+        _ => {}
     }
     work.set_polygon(repair_view::range_polygon(result).into());
     work.set_warning(repair_view::capture_warning(result).unwrap_or("").into());
     if app.get_expert() {
         let fields = repair_view::fields_for(result);
-        SHELL.with(|s| s.borrow_mut().fields = fields.iter().map(|f| f.value.clone()).collect());
+        if fields.is_empty() {
+            // Nenhum gatilho medido: nada para editar.
+            return;
+        }
+        SHELL.with(|s| {
+            let mut s = s.borrow_mut();
+            s.fields = fields.iter().map(|f| f.value.clone()).collect();
+            s.result = Some(result.clone());
+        });
         let model: Vec<RepairField> = fields
             .into_iter()
             .map(|f| RepairField {
@@ -484,6 +532,18 @@ fn start_capture(app: &App) {
     });
     if let Some(msg) = msg {
         reset_work(app);
+        if matches!(
+            msg,
+            ClientMsg::StartCapture {
+                kind: CaptureKindDto::Triggers,
+                ..
+            }
+        ) {
+            // O núcleo não manda os apertos de cada gatilho, só o progresso.
+            let work = app.global::<RepairWork>();
+            work.set_l2_caption(repair_view::MEASURING.into());
+            work.set_r2_caption(repair_view::MEASURING.into());
+        }
         show_step(app, WizardStep::Measuring, 0.0, String::new());
         send(msg);
     }
@@ -643,6 +703,10 @@ fn refresh_overview(app: &App) {
         )));
         app.set_repair_header(header_data(view::repair_header(session)));
         app.set_repair_summary(repair_summary(&session.corrections));
+        // Conexão: só muda com a lista de controles, não a cada quadro.
+        let work = app.global::<RepairWork>();
+        work.set_link_transport(repair_view::transport_text(session.transport).into());
+        work.set_link_disconnects(session.disconnects.to_string().into());
         app.set_family(match session.family {
             Family::DualShock4 => 0,
             Family::DualSense => 1,
@@ -654,7 +718,7 @@ fn refresh_overview(app: &App) {
         if !connected {
             // Reconectando: palco esmaecido e valores em neutro.
             s.has_live = false;
-            app.set_live(neutral_live());
+            clear_live(app);
         }
         show_badge(
             app,
@@ -734,17 +798,63 @@ fn live_data(f: &LiveFrame) -> LiveData {
     }
 }
 
+/// Gatilho cru do pipe para a barra: em [0; 1], NaN vira 0.
+fn trigger_level(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Números da Conexão: os textos só são refeitos quando algum número muda
+/// (a taxa e o jitter mudam pouco; nada é alocado nos quadros iguais).
+fn show_link(app: &App, stats: LinkStats) {
+    if LINK.with(|l| l.replace(Some(stats))) == Some(stats) {
+        return;
+    }
+    let (rate, jitter, battery, charging) = stats;
+    let work = app.global::<RepairWork>();
+    work.set_link_rate(view::rate_text(rate).into());
+    work.set_link_jitter(repair_view::jitter_text(jitter).into());
+    work.set_link_battery(repair_view::battery_line(battery, charging).into());
+}
+
+/// Palco parado e Conexão sem números (sem quadro ao vivo válido).
+fn clear_live(app: &App) {
+    app.set_live(neutral_live());
+    show_link(app, NO_LINK);
+}
+
 /// Um quadro ao vivo: só propriedades, nada de recriar modelos.
 fn show_live(app: &App, frame: &LiveFrame) {
-    let first = SHELL.with(|s| {
+    let accepted = SHELL.with(|s| {
         let mut s = s.borrow_mut();
         if !view::live_accepted(s.selected.as_deref(), &s.sessions, &frame.id) {
             return None;
         }
-        Some(!std::mem::replace(&mut s.has_live, true))
+        let triggers = s.screen == SCREEN_REPAIR && s.wizard == Wizard::Triggers;
+        Some((!std::mem::replace(&mut s.has_live, true), triggers))
     });
-    let Some(first) = first else { return };
+    let Some((first, triggers)) = accepted else {
+        return;
+    };
     app.set_live(live_data(frame));
+    show_link(
+        app,
+        (
+            frame.rate_hz,
+            frame.jitter_us,
+            frame.battery,
+            frame.charging,
+        ),
+    );
+    if triggers {
+        // Barras dos gatilhos: o valor cru, como o núcleo mede.
+        let work = app.global::<RepairWork>();
+        work.set_l2(trigger_level(frame.input.l2));
+        work.set_r2(trigger_level(frame.input.r2));
+    }
     show_capture(app, frame);
     if first {
         // Primeiro quadro: o selo do palco sai de "Aguardando dados".
@@ -776,7 +886,7 @@ fn select(app: &App, id: Option<String>) {
     });
     if changed {
         app.set_selected_id(id.clone().unwrap_or_default().into());
-        app.set_live(neutral_live());
+        clear_live(app);
         send(ClientMsg::Inspect { id });
     }
     refresh_overview(app);
@@ -820,7 +930,7 @@ fn apply(app: &App, update: UiUpdate, first_failure: bool) {
     if clears_stage(&update) {
         // Nada de "Ao vivo" congelado: o palco espera o próximo quadro.
         SHELL.with(|s| s.borrow_mut().has_live = false);
-        app.set_live(neutral_live());
+        clear_live(app);
         refresh_overview(app);
     }
     match update {
@@ -970,7 +1080,7 @@ fn demo_capture_state(kind: CaptureKindDto, secs: f32) -> CaptureState {
 
 /// Analógico cru do controle de demonstração durante a medição: em repouso
 /// com ruído perto do centro (drift) ou girando 3 voltas num "gate" de
-/// diagonais mais longas (alcance).
+/// diagonais mais longas (alcance); nos gatilhos, `[l2, r2]`.
 fn demo_capture_input(kind: CaptureKindDto, secs: f32) -> Option<[f32; 2]> {
     use std::f32::consts::TAU;
     // Ruído determinístico em [−0,5; 0,5).
@@ -983,7 +1093,12 @@ fn demo_capture_input(kind: CaptureKindDto, secs: f32) -> Option<[f32; 2]> {
             let r = 0.97 + 0.09 * (2.0 * a).sin().abs().powi(3);
             Some([r * a.cos(), r * a.sin()])
         }
-        CaptureKindDto::Triggers => None,
+        // Gatilhos: L2 apertado 3 vezes e R2 só 2 nos 5 s (R2 fica sem
+        // medida, como no resultado).
+        CaptureKindDto::Triggers => {
+            let press = |n: f32| (std::f32::consts::PI * secs / 5.0 * n).sin().powi(2);
+            Some([0.03 + 0.95 * press(3.0), 0.04 + 0.9 * press(2.0)])
+        }
     }
 }
 
@@ -1046,6 +1161,7 @@ fn demo_live(app: &App) -> slint::Timer {
                         CaptureKindDto::DriftLeft | CaptureKindDto::RangeLeft => {
                             (frame.input.lx, frame.input.ly) = (x, y);
                         }
+                        CaptureKindDto::Triggers => (frame.input.l2, frame.input.r2) = (x, y),
                         _ => (frame.input.rx, frame.input.ry) = (x, y),
                     }
                 }
@@ -1111,9 +1227,9 @@ fn demo_frame(id: String, t: f32) -> LiveFrame {
         rate_hz: 1000,
         latency_p99_us: 48 + (6.0 * (t * 0.7).sin().abs()) as u32,
         battery: Some(64),
-        jitter_us: 0,
+        jitter_us: 180 + (40.0 * (t * 0.5).sin().abs()) as u32,
         capture: None,
-        charging: false,
+        charging: true,
     }
 }
 
@@ -1214,7 +1330,28 @@ mod tests {
             let r = x.hypot(y);
             assert!((0.96..=1.07).contains(&r), "{r}");
         }
-        assert!(demo_capture_input(CaptureKindDto::Triggers, 1.0).is_none());
+        // Gatilhos: L2 chega perto do fim 3 vezes e R2 2 vezes em 5 s.
+        let peaks = |pick: usize| {
+            let v: Vec<f32> = (0..=500)
+                .map(|i| {
+                    demo_capture_input(CaptureKindDto::Triggers, i as f32 * 0.01).unwrap()[pick]
+                })
+                .collect();
+            assert!(v.iter().all(|x| (0.0..=1.0).contains(x)));
+            v.windows(3)
+                .filter(|w| w[1] > 0.9 && w[1] >= w[0] && w[1] > w[2])
+                .count()
+        };
+        assert_eq!((peaks(0), peaks(1)), (3, 2));
+    }
+
+    #[test]
+    fn trigger_level_is_sanitized() {
+        assert_eq!(trigger_level(0.4), 0.4);
+        assert_eq!(trigger_level(-0.2), 0.0);
+        assert_eq!(trigger_level(1.7), 1.0);
+        assert_eq!(trigger_level(f32::NAN), 0.0);
+        assert_eq!(trigger_level(f32::INFINITY), 0.0);
     }
 
     #[test]

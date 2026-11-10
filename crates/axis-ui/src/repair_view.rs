@@ -1,7 +1,7 @@
 //! Textos e estados da tela Correção (puro, sem Slint).
 
 use axis_protocol::{
-    CaptureKindDto, CaptureResultDto, CaptureState, CorrectionsDto, StickCorrectionDto,
+    CaptureKindDto, CaptureResultDto, CaptureState, CorrectionsDto, StickCorrectionDto, Transport,
     TriggerCalDto,
 };
 
@@ -15,6 +15,12 @@ pub const CORE_GONE: &str = "O núcleo do Axis parou durante a medição.";
 const INVALID: &str = "Resultado inválido do núcleo.";
 const NONE: &str = "Sem correção";
 const NOT_A_NUMBER: &str = "digite um número, como 0,05";
+const TRIGGER_RANGE: &str = "repouso e máximo entre 0 e 1";
+const TRIGGER_ORDER: &str = "repouso precisa ser menor que o máximo";
+/// Medição em andamento dos gatilhos: o núcleo não manda os apertos de cada
+/// um, só o progresso somado.
+pub const MEASURING: &str = "medindo…";
+const NOT_MEASURED: &str = "não medido";
 /// Setores do alcance (`StickCorrectionDto::outer_radius`).
 const SECTORS: usize = 16;
 
@@ -67,6 +73,7 @@ pub fn validate_field(name: &str, v: f32) -> Result<(), String> {
         "center" => (v.abs() < 0.5, "centro precisa estar entre −0,49 e 0,49"),
         "drift_radius" => ((0.0..=0.5).contains(&v), "raio de drift entre 0 e 0,5"),
         "outer_radius" => ((0.3..=1.5).contains(&v), "raio entre 0,3 e 1,5"),
+        "trigger" => ((0.0..=1.0).contains(&v), TRIGGER_RANGE),
         _ => return Err(format!("campo desconhecido: {name}")),
     };
     // NaN falha nas comparações acima; infinito também fica fora.
@@ -77,10 +84,80 @@ pub fn validate_field(name: &str, v: f32) -> Result<(), String> {
     }
 }
 
+/// Repouso e máximo de um gatilho: os dois em [0; 1] e `rest < max` (a regra
+/// de `Corrections::validate` no núcleo).
+pub fn validate_trigger(rest: f32, max: f32) -> Result<(), String> {
+    validate_field("trigger", rest)?;
+    validate_field("trigger", max)?;
+    if rest < max {
+        Ok(())
+    } else {
+        Err(TRIGGER_ORDER.into())
+    }
+}
+
+/// As correções atuais com só os gatilhos medidos trocados; o que não foi
+/// medido (`None`) fica como estava.
+pub fn merge_triggers(
+    cur: &CorrectionsDto,
+    l2: Option<TriggerCalDto>,
+    r2: Option<TriggerCalDto>,
+) -> CorrectionsDto {
+    let mut out = cur.clone();
+    if let Some(t) = l2 {
+        out.l2 = t;
+    }
+    if let Some(t) = r2 {
+        out.r2 = t;
+    }
+    out
+}
+
+/// Legenda da barra de um gatilho no resultado.
+pub fn trigger_caption(cal: Option<&TriggerCalDto>) -> String {
+    cal.map_or_else(
+        || NOT_MEASURED.into(),
+        |t| format!("repouso {}\nmáximo {}", fmt2(t.rest), fmt2(t.max)),
+    )
+}
+
+/// Jitter do link em µs; 0 é "sem dado" (nenhum intervalo medido ainda).
+pub fn jitter_text(us: u32) -> String {
+    if us == 0 {
+        "—".into()
+    } else {
+        format!("{us} µs")
+    }
+}
+
+/// Como o controle chega: sem transporte no `SessionInfo` é um controle
+/// XInput (o Windows não conta qual é o link).
+pub fn transport_text(t: Option<Transport>) -> &'static str {
+    match t {
+        Some(Transport::Usb) => "USB",
+        Some(Transport::Bluetooth) => "Bluetooth",
+        None => "XInput",
+    }
+}
+
+/// Bateria do quadro ao vivo com "carregando".
+pub fn battery_line(battery: Option<u8>, charging: bool) -> String {
+    match (battery, charging) {
+        (Some(b), true) => format!("{b}% · carregando"),
+        (Some(b), false) => format!("{b}%"),
+        (None, true) => "carregando".into(),
+        (None, false) => "—".into(),
+    }
+}
+
 /// O resultado pode ser mostrado e aplicado: o núcleo é outro processo, então
 /// a lista de raios e os números vêm sem garantia.
 fn result_ok(r: &CaptureResultDto) -> bool {
     match r {
+        CaptureResultDto::Triggers { l2, r2, .. } => [l2, r2]
+            .into_iter()
+            .flatten()
+            .all(|t| validate_trigger(t.rest, t.max).is_ok()),
         CaptureResultDto::Drift {
             center,
             noise,
@@ -109,16 +186,25 @@ pub fn auto_apply(
             Some(merge_drift(cur, stick, *center, *radius))
         }
         CaptureResultDto::Range { outer_radius, .. } => Some(merge_range(cur, stick, outer_radius)),
+        // Gatilhos: só os medidos; nenhum medido não aplica nada.
+        CaptureResultDto::Triggers { l2, r2, .. } if l2.is_some() || r2.is_some() => {
+            Some(merge_triggers(cur, *l2, *r2))
+        }
         _ => None,
     }
 }
 
-/// "Restaurar padrão": valores neutros só daquele analógico e etapa.
+/// "Restaurar padrão": valores neutros só daquele analógico e etapa (nos
+/// gatilhos, os dois gatilhos).
 pub fn neutral(cur: &CorrectionsDto, w: Wizard, stick: Stick) -> Option<CorrectionsDto> {
     match w {
         Wizard::Drift => Some(merge_drift(cur, stick, [0.0, 0.0], 0.0)),
         Wizard::Range => Some(merge_range(cur, stick, &[1.0; SECTORS])),
-        Wizard::Triggers | Wizard::Connection => None,
+        Wizard::Triggers => {
+            let n = TriggerCalDto::default();
+            Some(merge_triggers(cur, Some(n), Some(n)))
+        }
+        Wizard::Connection => None,
     }
 }
 
@@ -164,8 +250,64 @@ pub fn fields_for(r: &CaptureResultDto) -> Vec<Field> {
                 value: fmt2(*v),
             })
             .collect(),
+        CaptureResultDto::Triggers { .. } if result_ok(r) => measured_triggers(r)
+            .into_iter()
+            .flat_map(|(name, t)| {
+                [("repouso", t.rest), ("máximo", t.max)].map(|(what, v)| Field {
+                    label: format!("{name} {what}"),
+                    value: fmt2(v),
+                })
+            })
+            .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Gatilhos medidos de um resultado, na ordem L2, R2.
+fn measured_triggers(r: &CaptureResultDto) -> Vec<(&'static str, TriggerCalDto)> {
+    let CaptureResultDto::Triggers { l2, r2, .. } = r else {
+        return Vec::new();
+    };
+    [("L2", l2), ("R2", r2)]
+        .into_iter()
+        .filter_map(|(name, t)| t.map(|t| (name, t)))
+        .collect()
+}
+
+/// "Aplicar" do especialista nos gatilhos: um par de campos (repouso,
+/// máximo) por gatilho medido; o não medido não muda. Todos valem ou nada.
+pub fn triggers_from_fields(
+    cur: &CorrectionsDto,
+    r: &CaptureResultDto,
+    texts: &[String],
+) -> Result<CorrectionsDto, (usize, String)> {
+    let measured = if result_ok(r) {
+        measured_triggers(r)
+    } else {
+        Vec::new()
+    };
+    if measured.is_empty() {
+        return Err((0, "nada para aplicar aqui".into()));
+    }
+    if texts.len() != measured.len() * 2 {
+        return Err((0, "campos incompletos; meça de novo".into()));
+    }
+    let (mut l2, mut r2) = (None, None);
+    for (k, ((name, _), pair)) in measured.iter().zip(texts.chunks(2)).enumerate() {
+        let (i_rest, i_max) = (2 * k, 2 * k + 1);
+        let rest = field_value("trigger", &pair[0])
+            .map_err(|e| (i_rest, format!("{name} repouso: {e}")))?;
+        let max =
+            field_value("trigger", &pair[1]).map_err(|e| (i_max, format!("{name} máximo: {e}")))?;
+        validate_trigger(rest, max).map_err(|e| (i_rest, format!("{name}: {e}")))?;
+        let t = Some(TriggerCalDto { rest, max });
+        if *name == "L2" {
+            l2 = t;
+        } else {
+            r2 = t;
+        }
+    }
+    Ok(merge_triggers(cur, l2, r2))
 }
 
 /// Um campo digitado: número (vírgula ou ponto) dentro da faixa.
@@ -478,7 +620,7 @@ pub fn capture_kind(w: Wizard, right: bool) -> Option<CaptureKindDto> {
 mod tests {
     use super::*;
     use axis_protocol::{
-        CaptureKindDto, CaptureResultDto, CaptureState, CorrectionsDto, TriggerCalDto,
+        CaptureKindDto, CaptureResultDto, CaptureState, CorrectionsDto, Transport, TriggerCalDto,
     };
 
     #[test]
@@ -843,7 +985,7 @@ mod tests {
         let n = neutral(&cur, Wizard::Range, Stick::Right).unwrap();
         assert_eq!(n.right.outer_radius, vec![1.0; 16]);
         assert_eq!(n.right.drift_radius, cur.right.drift_radius);
-        assert_eq!(neutral(&cur, Wizard::Triggers, Stick::Left), None);
+        assert_eq!(neutral(&cur, Wizard::Connection, Stick::Left), None);
     }
 
     #[test]
@@ -927,6 +1069,162 @@ mod tests {
         assert_eq!(lap_text(0.7), "volta 3 de 3");
         assert_eq!(lap_text(1.0), "volta 3 de 3");
         assert_eq!(lap_text(f32::NAN), "volta 1 de 3");
+    }
+
+    fn triggers(l2: Option<(f32, f32)>, r2: Option<(f32, f32)>) -> CaptureResultDto {
+        let cal = |t: Option<(f32, f32)>| t.map(|(rest, max)| TriggerCalDto { rest, max });
+        CaptureResultDto::Triggers {
+            l2: cal(l2),
+            r2: cal(r2),
+            l2_presses: if l2.is_some() { 3 } else { 1 },
+            r2_presses: if r2.is_some() { 3 } else { 2 },
+        }
+    }
+
+    #[test]
+    fn merge_triggers_skips_unmeasured() {
+        let cur = corrected();
+        let r2 = TriggerCalDto {
+            rest: 0.06,
+            max: 0.95,
+        };
+        let out = merge_triggers(&cur, None, Some(r2));
+        assert_eq!(out.r2, r2);
+        // L2 não medido continua como estava; analógicos intactos.
+        assert_eq!(out.l2, cur.l2);
+        assert_eq!((&out.left, &out.right), (&cur.left, &cur.right));
+        let both = merge_triggers(&cur, Some(r2), Some(r2));
+        assert_eq!((both.l2, both.r2), (r2, r2));
+        assert_eq!(merge_triggers(&cur, None, None), cur);
+        // Leigo: só o gatilho medido é aplicado; nenhum medido não aplica nada.
+        let r = triggers(Some((0.05, 0.96)), None);
+        let applied = auto_apply(&cur, Stick::Left, &r).unwrap();
+        assert_eq!(
+            applied.l2,
+            TriggerCalDto {
+                rest: 0.05,
+                max: 0.96
+            }
+        );
+        assert_eq!(applied.r2, cur.r2);
+        assert_eq!(auto_apply(&cur, Stick::Left, &triggers(None, None)), None);
+        // Restaurar padrão: os dois gatilhos neutros, analógicos intactos.
+        let n = neutral(&cur, Wizard::Triggers, Stick::Left).unwrap();
+        assert_eq!((n.l2, n.r2), Default::default());
+        assert_eq!((&n.left, &n.right), (&cur.left, &cur.right));
+        // Legendas das barras.
+        assert_eq!(
+            trigger_caption(Some(&TriggerCalDto {
+                rest: 0.05,
+                max: 0.96
+            })),
+            "repouso 0,05\nmáximo 0,96"
+        );
+        assert_eq!(trigger_caption(None), "não medido");
+        // Especialista: só os gatilhos medidos viram campos.
+        let f = fields_for(&r);
+        assert_eq!(
+            f.iter()
+                .map(|f| (f.label.as_str(), f.value.as_str()))
+                .collect::<Vec<_>>(),
+            [("L2 repouso", "0,05"), ("L2 máximo", "0,96")]
+        );
+        let texts = ["0,1".to_string(), "0.9".into()];
+        let out = triggers_from_fields(&cur, &r, &texts).unwrap();
+        assert_eq!(
+            out.l2,
+            TriggerCalDto {
+                rest: 0.1,
+                max: 0.9
+            }
+        );
+        assert_eq!(out.r2, cur.r2, "R2 não medido não muda");
+        let both = triggers(Some((0.05, 0.96)), Some((0.02, 0.9)));
+        assert_eq!(fields_for(&both).len(), 4);
+        assert_eq!(fields_for(&both)[2].label, "R2 repouso");
+    }
+
+    #[test]
+    fn trigger_field_rejects_rest_ge_max() {
+        let range = "repouso e máximo entre 0 e 1";
+        let order = "repouso precisa ser menor que o máximo";
+        assert_eq!(validate_trigger(0.0, 1.0), Ok(()));
+        assert_eq!(validate_trigger(0.05, 0.96), Ok(()));
+        assert_eq!(validate_trigger(0.5, 0.5), Err(order.into()));
+        assert_eq!(validate_trigger(0.9, 0.1), Err(order.into()));
+        for (rest, max) in [
+            (-0.01, 0.9),
+            (0.1, 1.01),
+            (f32::NAN, 0.9),
+            (0.1, f32::INFINITY),
+        ] {
+            assert_eq!(
+                validate_trigger(rest, max),
+                Err(range.into()),
+                "{rest} {max}"
+            );
+        }
+        assert_eq!(validate_field("trigger", 0.5), Ok(()));
+        assert_eq!(validate_field("trigger", 1.5), Err(range.into()));
+        // Campos digitados: o erro aponta o campo e diz qual gatilho.
+        let cur = corrected();
+        let r = triggers(Some((0.05, 0.96)), Some((0.02, 0.9)));
+        let ge = ["0,9".to_string(), "0,5".into(), "0,02".into(), "0,9".into()];
+        assert_eq!(
+            triggers_from_fields(&cur, &r, &ge),
+            Err((0, format!("L2: {order}")))
+        );
+        let out = [
+            "0,05".to_string(),
+            "0,96".into(),
+            "0,02".into(),
+            "1,2".into(),
+        ];
+        assert_eq!(
+            triggers_from_fields(&cur, &r, &out),
+            Err((3, format!("R2 máximo: {range}")))
+        );
+        let text = [
+            "0,05".to_string(),
+            "abc".into(),
+            "0,02".into(),
+            "0,9".into(),
+        ];
+        assert_eq!(
+            triggers_from_fields(&cur, &r, &text),
+            Err((1, "L2 máximo: digite um número, como 0,05".into()))
+        );
+        assert!(triggers_from_fields(&cur, &r, &ge[..2]).is_err());
+        assert!(triggers_from_fields(&cur, &CaptureResultDto::Aborted, &[]).is_err());
+        // Resultado do núcleo fora da regra: erro, nada aplicado.
+        for bad in [
+            triggers(Some((0.6, 0.4)), None),
+            triggers(None, Some((0.5, 0.5))),
+            triggers(Some((f32::NAN, 0.9)), None),
+            triggers(Some((0.1, 1.2)), Some((0.02, 0.9))),
+        ] {
+            assert_eq!(
+                step_for(Some(&state(Some(bad.clone()))), true),
+                WizardStep::Error
+            );
+            assert_eq!(capture_message(&bad), "Resultado inválido do núcleo.");
+            assert_eq!(auto_apply(&cur, Stick::Left, &bad), None);
+            assert!(fields_for(&bad).is_empty());
+        }
+    }
+
+    #[test]
+    fn jitter_and_transport_texts() {
+        assert_eq!(jitter_text(0), "—");
+        assert_eq!(jitter_text(180), "180 µs");
+        assert_eq!(jitter_text(1250), "1250 µs");
+        assert_eq!(transport_text(Some(Transport::Usb)), "USB");
+        assert_eq!(transport_text(Some(Transport::Bluetooth)), "Bluetooth");
+        assert_eq!(transport_text(None), "XInput");
+        assert_eq!(battery_line(Some(64), false), "64%");
+        assert_eq!(battery_line(Some(64), true), "64% · carregando");
+        assert_eq!(battery_line(None, false), "—");
+        assert_eq!(battery_line(None, true), "carregando");
     }
 
     #[test]
