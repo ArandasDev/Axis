@@ -11,6 +11,7 @@ use axis_daemon::app::{
 use axis_daemon::autostart::RunKey;
 use axis_daemon::config::ConfigStore;
 use axis_daemon::instance::SingleInstance;
+use axis_daemon::live::UiRegistry;
 use axis_daemon::logging::init_logging;
 use axis_daemon::manager::{Event, Manager, ManagerDeps, SessionView};
 use axis_daemon::paths::AppPaths;
@@ -58,6 +59,8 @@ fn main() {
         }
     };
     let notifier = DeferredNotifier::<TrayHandle>::new();
+    // A task do servidor IPC consome o registro; até lá só o gerente o alimenta.
+    let ui = UiRegistry::new();
     let mut manager = Manager::new(ManagerDeps {
         opener,
         bus,
@@ -66,6 +69,7 @@ fn main() {
         scheduler: Box::new(ThreadScheduler::new(tx.clone())),
         notifier: Box::new(notifier.clone()),
         events: tx.clone(),
+        ui: ui.clone(),
     });
 
     let sessions = Arc::new(Mutex::new(Vec::new()));

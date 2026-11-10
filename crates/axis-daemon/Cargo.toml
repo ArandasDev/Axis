@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 axis-core = { path = "../axis-core" }
+axis-protocol = { path = "../axis-protocol" }
 serde.workspace = true
 toml.workspace = true
 axis-devices = { path = "../axis-devices" }

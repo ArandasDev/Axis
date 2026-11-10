@@ -46,6 +46,7 @@ version = "0.1.0"
 dependencies = [
  "axis-core",
  "axis-devices",
+ "axis-protocol",
  "axis-virtual",
  "hidapi",
  "log",
