@@ -212,6 +212,9 @@ struct Worker {
     intervals: IntervalRing,
     /// Report anterior para o jitter; `None` no início e após o link cair.
     prev_report: Option<Instant>,
+    /// Entrada crua do último report: o XInput só entrega report quando algo muda,
+    /// então a captura segue com ela nas leituras ociosas. `None` após o link cair.
+    last_input: Option<InputState>,
 }
 
 impl Worker {
@@ -392,6 +395,7 @@ impl Worker {
                     self.prev_report = Some(started);
                     self.reports += 1;
                     self.last_status = report.status;
+                    self.last_input = Some(report.input);
                     // Entrada crua: vale pausado, só visualização e sem inspeção.
                     self.feed_capture(&report.input, started);
                     let live = self.tap.enabled();
@@ -436,6 +440,14 @@ impl Worker {
                     }
                 }
                 Ok(None) => {
+                    // Analógico parado no XInput: sem report novo, o tempo da captura anda.
+                    if self.link_up && self.capture.as_ref().is_some_and(|(c, _)| !c.is_done()) {
+                        if let Some(input) = self.last_input {
+                            let now = self.now();
+                            self.feed_capture(&input, now);
+                            self.capture_changed();
+                        }
+                    }
                     if let Some((input, out, trace)) = self.pending {
                         let now = self.now();
                         if self.last_publish.is_none_or(|t| now - t >= LIVE_INTERVAL) {
@@ -454,6 +466,7 @@ impl Worker {
                         self.link_up = false;
                         self.written = None;
                         self.prev_report = None;
+                        self.last_input = None;
                         self.stop_rumble();
                         self.send_pad(&InputState::default());
                         // O neutro já leva o `Aborted`: é a amostra que fica.
@@ -549,6 +562,7 @@ fn spawn_clocked(
             capture_snapshot: None,
             intervals: IntervalRing::default(),
             prev_report: None,
+            last_input: None,
         };
         let exit = w.run(&rx);
         w.abort_capture();
@@ -660,6 +674,8 @@ mod tests {
         clock: FakeClock,
         steps: Vec<Duration>,
         n: usize,
+        /// Leitura ociosa sem dormir (só o relógio simulado anda): 30 s simulados em ms.
+        fast_idle: bool,
     }
 
     impl Controller for ClockedController {
@@ -676,6 +692,12 @@ mod tests {
             self.inner.experimental()
         }
         fn read(&mut self, timeout_ms: i32) -> Result<Option<Report>, DeviceError> {
+            if self.fast_idle && self.inner.reads.lock().unwrap().is_empty() {
+                std::thread::yield_now();
+                self.clock
+                    .advance(Duration::from_millis(timeout_ms.max(0) as u64));
+                return Ok(None);
+            }
             let r = self.inner.read(timeout_ms);
             match &r {
                 Ok(Some(_)) => {
@@ -695,6 +717,17 @@ mod tests {
     }
 
     fn start_clocked(steps: Vec<Duration>, with_pad: bool) -> Harness {
+        start_clocked_opts(steps, with_pad, true, false)
+    }
+
+    /// `detect_silence = false` + `fast_idle`: um controle XInput, que só entrega report
+    /// quando algo muda.
+    fn start_clocked_opts(
+        steps: Vec<Duration>,
+        with_pad: bool,
+        detect_silence: bool,
+        fast_idle: bool,
+    ) -> Harness {
         let inner = FakeController::new(vec![]);
         let writes = inner.writes.clone();
         let reads = inner.reads.clone();
@@ -705,8 +738,9 @@ mod tests {
             clock,
             steps,
             n: 0,
+            fast_idle,
         };
-        launch(Box::new(ctl), writes, reads, with_pad, true, c)
+        launch(Box::new(ctl), writes, reads, with_pad, detect_silence, c)
     }
 
     fn launch(
@@ -1172,6 +1206,49 @@ mod tests {
         wait_until(|| h.tap.latest().reports == 826);
         assert_eq!(snapshot(&h), None);
         h.finish();
+    }
+
+    /// XInput parado: um único report e depois só `Ok(None)`; devolve o resultado.
+    fn still_xinput_outcome(capture: Box<Capture>, first: Report) -> Outcome {
+        let h = start_clocked_opts(vec![ms(4)], false, false, true);
+        h.tap.set_enabled(true);
+        h.tx.send(WorkerCommand::StartCapture(capture)).unwrap();
+        wait_until(|| snapshot(&h).is_some());
+        h.reads.lock().unwrap().push_back(Ok(Some(first)));
+        wait_until(|| snapshot(&h).is_some_and(|s| s.outcome.is_some()));
+        let outcome = snapshot(&h).and_then(|s| s.outcome).unwrap();
+        assert_eq!(h.tap.latest().reports, 1, "nenhum report novo");
+        h.finish();
+        outcome
+    }
+
+    #[test]
+    fn still_stick_without_new_reports_finishes_drift() {
+        let mut r = Report::default();
+        r.input.left = Vec2 { x: 0.04, y: 0.0 };
+        let Outcome::Drift(d) = still_xinput_outcome(drift_left(), r) else {
+            panic!("esperava Drift");
+        };
+        assert!((d.center.x - 0.04).abs() < 1e-3, "{d:?}");
+        // ~3 s a 50 ms por leitura ociosa
+        assert!((55..=70).contains(&d.samples), "{d:?}");
+    }
+
+    #[test]
+    fn still_stick_without_new_reports_times_out_range_and_triggers() {
+        let range = Box::new(Capture::new(
+            CaptureKind::Range(Stick::Left),
+            Vec2::default(),
+        ));
+        assert!(matches!(
+            still_xinput_outcome(range, Report::default()),
+            Outcome::Incomplete(_)
+        ));
+        let triggers = Box::new(Capture::new(CaptureKind::Triggers, Vec2::default()));
+        assert!(matches!(
+            still_xinput_outcome(triggers, Report::default()),
+            Outcome::Incomplete(_)
+        ));
     }
 
     #[test]
