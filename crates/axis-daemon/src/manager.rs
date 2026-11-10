@@ -148,8 +148,15 @@ impl Manager {
     /// Devolve `false` apenas em `Quit`.
     pub fn handle(&mut self, e: Event) -> bool {
         match e {
-            Event::DeviceArrived(_) | Event::Rescan => self.scan(),
-            Event::DeviceRemoved(path) => log::debug!("dispositivo removido: {path}"),
+            Event::DeviceArrived(path) => {
+                log::info!("chegada de dispositivo: {path}");
+                self.scan()
+            }
+            Event::Rescan => {
+                log::info!("nova varredura de controles");
+                self.scan()
+            }
+            Event::DeviceRemoved(path) => log::info!("dispositivo removido: {path}"),
             Event::WorkerExited { session, exit } => self.worker_exited(session, exit),
             Event::GraceExpired { id, generation } => self.grace_expired(&id, generation),
             Event::Rumble { id, rumble } => {
@@ -254,6 +261,7 @@ impl Manager {
     }
 
     fn worker_exited(&mut self, session: u64, exit: WorkerExit) {
+        log::info!("worker da sessão {session} saiu: {exit:?}");
         let Some(index) = self
             .sessions
             .iter()
@@ -297,6 +305,7 @@ impl Manager {
     }
 
     fn grace_expired(&mut self, id: &str, generation: u64) {
+        log::info!("período de graça de {id} (geração {generation}) chegou ao fim");
         let Some(index) = self
             .sessions
             .iter()
@@ -573,6 +582,11 @@ impl Manager {
         if self.paused {
             let _ = tx.send(WorkerCommand::SetPaused(true));
         }
+        log::info!(
+            "sessão {number} conectada: {id} em {} (player {player:?}, reaproveitada: {}, reabertura após erro: {error_reopen})",
+            c.path,
+            grace_index.is_some()
+        );
         if grace_index.is_some() {
             if !error_reopen {
                 self.notifier
