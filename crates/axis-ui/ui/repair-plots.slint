@@ -1,0 +1,160 @@
+import { Tokens } from "tokens.slint";
+
+/// Um ponto cru do analógico na nuvem (unidades do analógico, y para cima);
+/// `on` falso é uma posição do anel ainda vazia.
+export struct PlotPoint {
+    x: float,
+    y: float,
+    on: bool,
+}
+
+/// Quadro quadrado de ±`span` com cruz no centro e os pontos do anel por
+/// cima; o que sai do quadro é recortado.
+component PlotFrame inherits Rectangle {
+    in property <[PlotPoint]> points;
+    in property <float> span;
+    in property <color> dot-color: Tokens.accent;
+    in property <length> dot: 3px;
+    /// Pixels por unidade do analógico.
+    out property <float> scale: self.width / 1px / (2 * root.span);
+
+    border-radius: Tokens.radius-card;
+    border-width: 1px;
+    border-color: Tokens.divider;
+    background: Tokens.bg;
+    clip: true;
+
+    // Cruz no centro.
+    Rectangle {
+        x: parent.width / 2;
+        y: 0;
+        width: 1px;
+        height: parent.height;
+        background: Tokens.divider;
+    }
+    Rectangle {
+        x: 0;
+        y: parent.height / 2;
+        width: parent.width;
+        height: 1px;
+        background: Tokens.divider;
+    }
+
+    @children
+
+    for p in root.points: Rectangle {
+        visible: p.on;
+        x: root.width / 2 + p.x * root.scale * 1px - root.dot / 2;
+        y: root.height / 2 - p.y * root.scale * 1px - root.dot / 2;
+        width: root.dot;
+        height: root.dot;
+        border-radius: root.dot / 2;
+        background: root.dot-color;
+    }
+}
+
+/// Rótulo pequeno da escala no canto do quadro.
+component ScaleLabel inherits Text {
+    font-size: 10px;
+    color: Tokens.muted;
+}
+
+/// Drift: nuvem dos últimos pontos crus num quadro de ±0,25; no resultado, o
+/// centro medido e o círculo do raio sugerido.
+export component DriftPlot inherits Rectangle {
+    in property <[PlotPoint]> points;
+    in property <bool> has-result;
+    in property <float> center-x;
+    in property <float> center-y;
+    in property <float> radius;
+
+    accessible-role: image;
+    accessible-label: "Nuvem de pontos do analógico em repouso";
+
+    frame := PlotFrame {
+        width: 100%;
+        height: 100%;
+        points: root.points;
+        span: 0.25;
+        dot-color: Tokens.accent.with-alpha(0.7);
+
+        if root.has-result: Rectangle {
+            property <length> r: max(2px, root.radius * frame.scale * 1px);
+            x: frame.width / 2 + root.center-x * frame.scale * 1px - self.r;
+            y: frame.height / 2 - root.center-y * frame.scale * 1px - self.r;
+            width: 2 * self.r;
+            height: 2 * self.r;
+            border-radius: self.r;
+            border-width: 2px;
+            border-color: Tokens.text;
+            background: Tokens.text.with-alpha(0.06);
+        }
+        if root.has-result: Rectangle {
+            x: frame.width / 2 + root.center-x * frame.scale * 1px - 3px;
+            y: frame.height / 2 - root.center-y * frame.scale * 1px - 3px;
+            width: 6px;
+            height: 6px;
+            border-radius: 3px;
+            background: Tokens.text;
+        }
+    }
+
+    ScaleLabel {
+        x: Tokens.space-s;
+        y: Tokens.space-xs;
+        text: "±0,25";
+    }
+}
+
+/// Alcance: rastro dos pontos num quadro de ±1,3 sobre o círculo ideal; no
+/// resultado, o polígono dos 16 raios.
+export component RangePlot inherits Rectangle {
+    in property <[PlotPoint]> points;
+    in property <bool> has-result;
+    /// Comandos de `Path` em unidades do analógico (y para baixo).
+    in property <string> polygon;
+
+    accessible-role: image;
+    accessible-label: "Alcance do analógico em cada direção";
+
+    frame := PlotFrame {
+        width: 100%;
+        height: 100%;
+        points: root.points;
+        span: 1.3;
+        dot-color: root.has-result ? Tokens.muted.with-alpha(0.5) : Tokens.accent.with-alpha(0.8);
+        dot: 2px;
+
+        // Círculo ideal (raio 1).
+        Rectangle {
+            property <length> r: frame.scale * 1px;
+            x: frame.width / 2 - self.r;
+            y: frame.height / 2 - self.r;
+            width: 2 * self.r;
+            height: 2 * self.r;
+            border-radius: self.r;
+            border-width: 1px;
+            border-color: Tokens.line-soft;
+        }
+        if root.has-result && root.polygon != "": Path {
+            x: 0;
+            y: 0;
+            width: frame.width;
+            height: frame.height;
+            viewbox-x: -1.3;
+            viewbox-y: -1.3;
+            viewbox-width: 2.6;
+            viewbox-height: 2.6;
+            commands: root.polygon;
+            fill: Tokens.accent-soft;
+            stroke: Tokens.accent;
+            stroke-width: 2px;
+        }
+    }
+
+    ScaleLabel {
+        x: Tokens.space-s;
+        y: Tokens.space-xs;
+        text: "±1,3";
+    }
+}

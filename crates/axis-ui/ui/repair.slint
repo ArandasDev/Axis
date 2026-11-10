@@ -1,6 +1,9 @@
 import { Tokens } from "tokens.slint";
 import { GridBackdrop, Kicker, Panel, PanelTitle, PrimaryButton, SecondaryButton, SegmentButton, SegmentGroup } from "components.slint";
 import { OverviewHeader } from "overview.slint";
+import { DriftPlot, PlotPoint, RangePlot } from "repair-plots.slint";
+
+export { PlotPoint }
 
 /// Linha de estado de cada cartão (de `repair_view::summary`).
 export struct RepairSummary {
@@ -8,6 +11,42 @@ export struct RepairSummary {
     range: string,
     triggers: string,
     connection: string,
+}
+
+/// Um número editável do modo especialista (de `repair_view::fields_for`).
+export struct RepairField {
+    label: string,
+    value: string,
+}
+
+/// Gráficos, aplicação e edição dos assistentes de drift e alcance (escrito
+/// pelo Rust; global para não atravessar App → Repair → painel).
+export global RepairWork {
+    /// Anel dos últimos pontos crus do analógico medido.
+    in property <[PlotPoint]> points;
+    /// Contador do alcance ("volta 2 de 3").
+    in property <string> lap;
+    in property <bool> has-result;
+    /// Drift: centro medido e raio sugerido (unidades do analógico).
+    in property <float> center-x;
+    in property <float> center-y;
+    in property <float> radius;
+    /// Alcance: polígono dos 16 raios (comandos de `Path`).
+    in property <string> polygon;
+    /// Aviso de desgaste (vazio sem aviso).
+    in property <string> warning;
+    /// "Pronto: correção aplicada" e afins; vazio quando nada foi enviado.
+    in property <string> done;
+    in property <bool> can-undo;
+    /// Especialista: números editáveis no resultado.
+    in property <bool> editing;
+    in property <[RepairField]> fields;
+    in property <string> field-error;
+    in property <int> error-index: -1;
+    callback field-edited(int, string);
+    callback apply-fields();
+    callback restore-default();
+    callback undo();
 }
 
 /// Cartão de um assistente: nome e o que está aplicado agora.
@@ -73,8 +112,88 @@ component Progress inherits Rectangle {
     }
 }
 
+/// Um número do modo especialista: rótulo à esquerda e caixa de texto.
+component NumberField inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> invalid;
+    in property <length> label-width: 44px;
+    callback edited(string);
+
+    height: 30px;
+
+    HorizontalLayout {
+        spacing: Tokens.space-s;
+        Text {
+            text: root.label;
+            width: root.label-width;
+            font-size: 12px;
+            color: Tokens.muted;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            border-radius: Tokens.radius-s;
+            border-width: 1px;
+            border-color: root.invalid ? Tokens.warning : input.has-focus ? Tokens.accent : Tokens.divider;
+            background: Tokens.bg;
+            input := TextInput {
+                x: Tokens.space-s;
+                width: parent.width - 2 * Tokens.space-s;
+                height: parent.height;
+                text: root.value;
+                single-line: true;
+                font-size: 13px;
+                color: Tokens.text;
+                selection-background-color: Tokens.accent-soft;
+                vertical-alignment: center;
+                accessible-label: root.label;
+                edited => { root.edited(self.text); }
+            }
+        }
+    }
+}
+
+/// "Pronto: correção aplicada" com Desfazer, ou o aviso do núcleo.
+component DoneLine inherits HorizontalLayout {
+    spacing: Tokens.space-sm;
+    Text {
+        // O texto fica com a sobra; o botão, só com o tamanho dele.
+        horizontal-stretch: 1;
+        text: RepairWork.done;
+        font-size: 13px;
+        font-weight: 600;
+        color: RepairWork.can-undo ? Tokens.accent : Tokens.text;
+        vertical-alignment: center;
+        wrap: word-wrap;
+    }
+    if RepairWork.can-undo: SecondaryButton {
+        horizontal-stretch: 0;
+        text: "Desfazer";
+        clicked => { RepairWork.undo(); }
+    }
+}
+
+/// Caixa do aviso de desgaste.
+component WarningBox inherits Rectangle {
+    in property <string> text;
+    border-radius: Tokens.radius-s;
+    background: Tokens.warning-soft;
+    border-width: 1px;
+    border-color: Tokens.warning.with-alpha(0.4);
+    VerticalLayout {
+        padding: Tokens.space-s;
+        Text {
+            text: root.text;
+            font-size: 12px;
+            color: Tokens.warning;
+            wrap: word-wrap;
+        }
+    }
+}
+
 /// Painel do assistente escolhido: cabeçalho sólido sobre a grade e o passo
-/// atual (os gráficos de cada assistente entram por cima disso).
+/// atual; drift e alcance desenham a nuvem/rastro ao lado do texto.
 component WizardPanel inherits Panel {
     in property <int> wizard;
     in property <bool> right-stick;
@@ -89,6 +208,14 @@ component WizardPanel inherits Panel {
     callback reset();
 
     property <length> header-height: 46px;
+    /// Drift e alcance têm gráfico; gatilhos e conexão ainda não.
+    property <bool> plotted: root.wizard <= 1;
+    property <length> plot-size: 220px;
+    /// Colunas da grade de números: drift 3, alcance 4×4.
+    property <int> field-cols: root.wizard == 0 ? 3 : 4;
+    /// No resultado do alcance em modo especialista a grade 4×4 divide a
+    /// altura com o gráfico.
+    property <length> result-plot-size: RepairWork.editing && root.wizard == 1 ? 168px : 200px;
     property <string> stick-name: root.right-stick ? "direito" : "esquerdo";
     property <string> instruction: root.wizard == 0 ? "Solte o analógico " + root.stick-name + " e não toque nele"
         : root.wizard == 1 ? "Gire o analógico devagar encostando na borda, 3 voltas"
@@ -170,6 +297,11 @@ component WizardPanel inherits Panel {
                         enabled: root.connected;
                         clicked => { root.begin(); }
                     }
+                    // Especialista: volta ao neutro sem medir.
+                    if root.plotted && root.expert: SecondaryButton {
+                        text: "Restaurar padrão";
+                        clicked => { RepairWork.restore-default(); }
+                    }
                     if !root.connected: Text {
                         text: "Conecte o controle para medir";
                         font-size: 12px;
@@ -177,9 +309,142 @@ component WizardPanel inherits Panel {
                         vertical-alignment: center;
                     }
                 }
+                if RepairWork.done != "": DoneLine { }
             }
 
-            if root.step == 1: VerticalLayout {
+            // Drift e alcance: gráfico ao lado do texto.
+            if root.step == 1 && root.plotted: HorizontalLayout {
+                spacing: Tokens.space-l;
+                VerticalLayout {
+                    alignment: center;
+                    if root.wizard == 0: DriftPlot {
+                        width: root.plot-size;
+                        height: root.plot-size;
+                        points: RepairWork.points;
+                    }
+                    if root.wizard == 1: RangePlot {
+                        width: root.plot-size;
+                        height: root.plot-size;
+                        points: RepairWork.points;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: Tokens.space-sm;
+                    Kicker { text: "MEDINDO"; }
+                    Text {
+                        text: root.instruction;
+                        font-family: Tokens.font-heading;
+                        font-size: 22px;
+                        font-weight: 600;
+                        color: Tokens.text;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: Tokens.space-sm;
+                        VerticalLayout {
+                            alignment: center;
+                            Progress { value: root.progress; }
+                        }
+                        Text {
+                            text: round(max(0, min(1, root.progress)) * 100) + "%";
+                            width: 40px;
+                            font-size: 12px;
+                            color: Tokens.text;
+                            horizontal-alignment: right;
+                        }
+                    }
+                    if root.wizard == 1: Text {
+                        text: RepairWork.lap;
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: Tokens.accent;
+                    }
+                }
+            }
+
+            if root.step == 2 && root.plotted: VerticalLayout {
+                spacing: Tokens.space-sm;
+                HorizontalLayout {
+                    spacing: Tokens.space-l;
+                    VerticalLayout {
+                        alignment: start;
+                        if root.wizard == 0: DriftPlot {
+                            width: root.result-plot-size;
+                            height: root.result-plot-size;
+                            points: RepairWork.points;
+                            has-result: RepairWork.has-result;
+                            center-x: RepairWork.center-x;
+                            center-y: RepairWork.center-y;
+                            radius: RepairWork.radius;
+                        }
+                        if root.wizard == 1: RangePlot {
+                            width: root.result-plot-size;
+                            height: root.result-plot-size;
+                            points: RepairWork.points;
+                            has-result: RepairWork.has-result;
+                            polygon: RepairWork.polygon;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: start;
+                        spacing: Tokens.space-sm;
+                        Kicker { text: "RESULTADO"; }
+                        Text {
+                            text: root.message;
+                            font-size: 15px;
+                            color: Tokens.text;
+                            wrap: word-wrap;
+                        }
+                        if RepairWork.warning != "": WarningBox { text: RepairWork.warning; }
+                        if RepairWork.done != "": DoneLine { }
+                    }
+                }
+                if RepairWork.editing: VerticalLayout {
+                    spacing: Tokens.space-s;
+                    padding-top: Tokens.space-xs;
+                    // Drift: uma linha de 3; alcance: grade 4×4 (setor 0 = direita).
+
+                    for r in ceil(RepairWork.fields.length / root.field-cols): HorizontalLayout {
+                        spacing: Tokens.space-sm;
+                        for c in root.field-cols: NumberField {
+                            property <int> index: r * root.field-cols + c;
+                            horizontal-stretch: 1;
+                            visible: self.index < RepairWork.fields.length;
+                            label: RepairWork.fields[self.index].label;
+                            value: RepairWork.fields[self.index].value;
+                            label-width: root.wizard == 0 ? 82px : 44px;
+                            invalid: RepairWork.error-index == self.index;
+                            edited(text) => { RepairWork.field-edited(self.index, text); }
+                        }
+                    }
+                    if RepairWork.field-error != "": Text {
+                        text: RepairWork.field-error;
+                        font-size: 12px;
+                        color: Tokens.warning;
+                        wrap: word-wrap;
+                    }
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    padding-top: Tokens.space-xs;
+                    spacing: Tokens.space-sm;
+                    if RepairWork.editing: PrimaryButton {
+                        text: "Aplicar";
+                        clicked => { RepairWork.apply-fields(); }
+                    }
+                    if RepairWork.editing: SecondaryButton {
+                        text: "Restaurar padrão";
+                        clicked => { RepairWork.restore-default(); }
+                    }
+                    SecondaryButton {
+                        text: "Medir de novo";
+                        clicked => { root.reset(); }
+                    }
+                }
+            }
+
+            if root.step == 1 && !root.plotted: VerticalLayout {
                 spacing: Tokens.space-sm;
                 Kicker { text: "MEDINDO"; }
                 Text {
@@ -206,7 +471,7 @@ component WizardPanel inherits Panel {
                 }
             }
 
-            if root.step == 2: VerticalLayout {
+            if root.step == 2 && !root.plotted: VerticalLayout {
                 spacing: Tokens.space-sm;
                 Kicker { text: "RESULTADO"; }
                 Text {
