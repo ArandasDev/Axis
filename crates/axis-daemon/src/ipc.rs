@@ -570,6 +570,10 @@ fn read_loop(
             }
             ClientMsg::SetPaused { paused } => Some(Event::SetPaused(paused)),
             ClientMsg::Restore => Some(Event::RestoreControllers),
+            // Captura e correções chegam na Task 4; por ora são ignoradas.
+            ClientMsg::StartCapture { .. }
+            | ClientMsg::CancelCapture { .. }
+            | ClientMsg::SetCorrections { .. } => None,
         };
         if let Some(ev) = ev
             && events.send(ev).is_err()
@@ -697,6 +701,8 @@ fn frame(id: &str, s: &LiveSample, rate_hz: u32) -> LiveFrame {
         latency_p99_us: s.latency_p99_us,
         battery: s.status.battery_percent,
         charging: s.status.charging,
+        jitter_us: 0,
+        capture: None,
     }
 }
 
@@ -775,6 +781,9 @@ mod tests {
             view_only: false,
             battery: None,
             charging: false,
+            transport: None,
+            disconnects: 0,
+            corrections: Default::default(),
         }
     }
 
@@ -829,7 +838,9 @@ mod tests {
 
         fn hello(name: &str) -> TestClient {
             let c = TestClient::connect(name);
-            c.send(&ClientMsg::Hello { version: 1 });
+            c.send(&ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            });
             assert!(matches!(c.recv(), Some(ServerMsg::Welcome { .. })));
             assert!(matches!(c.recv(), Some(ServerMsg::Sessions { .. })));
             c
@@ -910,11 +921,13 @@ mod tests {
         }
         let (name, _rx) = server(&ui);
         let c = TestClient::connect(&name);
-        c.send(&ClientMsg::Hello { version: 1 });
+        c.send(&ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+        });
         assert_eq!(
             c.recv(),
             Some(ServerMsg::Welcome {
-                version: 1,
+                version: PROTOCOL_VERSION,
                 paused: true,
                 emulation: true
             })
@@ -1009,7 +1022,9 @@ mod tests {
         c.send(&ClientMsg::Hello { version: 99 });
         assert_eq!(
             c.recv(),
-            Some(ServerMsg::Incompatible { server_version: 1 })
+            Some(ServerMsg::Incompatible {
+                server_version: PROTOCOL_VERSION
+            })
         );
         assert_eq!(c.recv(), None);
     }
@@ -1174,7 +1189,9 @@ mod tests {
         // Um sai: o servidor cria outra instância e o quinto entra.
         drop(clients.remove(0));
         let fifth = TestClient::connect_within(&name, Duration::from_secs(2));
-        fifth.send(&ClientMsg::Hello { version: 1 });
+        fifth.send(&ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+        });
         assert!(matches!(fifth.recv(), Some(ServerMsg::Welcome { .. })));
     }
 
@@ -1198,7 +1215,9 @@ mod tests {
         drop(a);
         drop(squatter);
         let c = TestClient::connect_within(&name, Duration::from_secs(3));
-        c.send(&ClientMsg::Hello { version: 1 });
+        c.send(&ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+        });
         assert!(matches!(c.recv(), Some(ServerMsg::Welcome { .. })));
     }
 

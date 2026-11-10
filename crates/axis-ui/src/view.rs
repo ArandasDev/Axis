@@ -313,6 +313,9 @@ mod tests {
             view_only: false,
             battery: Some(64),
             charging: false,
+            transport: None,
+            disconnects: 0,
+            corrections: Default::default(),
         }
     }
 

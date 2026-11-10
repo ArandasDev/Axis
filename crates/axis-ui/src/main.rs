@@ -227,6 +227,8 @@ fn neutral_live() -> LiveData {
         rate_hz: 0,
         latency_p99_us: 0,
         battery: None,
+        jitter_us: 0,
+        capture: None,
         charging: false,
     })
 }
@@ -394,6 +396,9 @@ fn demo_updates() -> Vec<UiUpdate> {
         view_only: false,
         battery: None,
         charging: false,
+        transport: None,
+        disconnects: 0,
+        corrections: Default::default(),
     };
     vec![
         UiUpdate::Connected {
@@ -519,6 +524,8 @@ fn demo_frame(id: String, t: f32) -> LiveFrame {
         rate_hz: 1000,
         latency_p99_us: 48 + (6.0 * (t * 0.7).sin().abs()) as u32,
         battery: Some(64),
+        jitter_us: 0,
+        capture: None,
         charging: false,
     }
 }

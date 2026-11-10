@@ -206,6 +206,9 @@ impl Manager {
                     view_only: s.view_only,
                     battery: st.battery_percent,
                     charging: st.charging,
+                    transport: None,
+                    disconnects: 0,
+                    corrections: Default::default(),
                 }
             })
             .collect();

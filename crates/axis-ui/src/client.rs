@@ -47,6 +47,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// O que a thread do cliente entrega à interface.
+// `Live` carries the whole frame inline; updates are transient.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiUpdate {
     Connected {
@@ -559,6 +561,9 @@ mod tests {
             view_only: false,
             battery: Some(64),
             charging: false,
+            transport: None,
+            disconnects: 0,
+            corrections: Default::default(),
         }
     }
 

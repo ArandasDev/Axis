@@ -286,6 +286,9 @@ mod tests {
             view_only: false,
             battery: None,
             charging: false,
+            transport: None,
+            disconnects: 0,
+            corrections: Default::default(),
         }
     }
 
