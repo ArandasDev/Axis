@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const PIPE_NAME: &str = r"\.\pipe\axis-v1";
+pub const PIPE_NAME: &str = r"\\.\pipe\axis-v1";
 /// Maximum line length in bytes, counted before the terminating `\n`.
 pub const MAX_LINE: usize = 65_536;
 
@@ -356,6 +356,13 @@ mod tests {
         data.push(b'\n');
         let mut r = LineReader::new(Cursor::new(data));
         assert_eq!(r.next_line(), Err(ProtocolError::TooLong));
+    }
+
+    #[test]
+    fn pipe_name_is_in_the_win32_pipe_namespace() {
+        assert!(PIPE_NAME.starts_with("\\\\.\\pipe\\"));
+        assert!(PIPE_NAME.ends_with("axis-v1"));
+        assert_eq!(PIPE_NAME.len(), 16);
     }
 
     #[test]
