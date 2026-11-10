@@ -104,11 +104,16 @@ component WizardCard inherits Rectangle {
             font-weight: 600;
             color: root.active ? Tokens.accent : Tokens.text;
         }
+        // Altura fixa de duas linhas: o cartão não muda de tamanho quando o
+        // resumo muda (o renderizador por software deixava restos ao redimensionar).
         Text {
             text: root.status;
             font-size: 12px;
             color: Tokens.muted;
             wrap: word-wrap;
+            overflow: elide;
+            vertical-alignment: top;
+            height: 2 * (self.font-metrics.ascent - self.font-metrics.descent);
         }
     }
 }
@@ -629,6 +634,8 @@ export component Repair inherits Rectangle {
     callback choose-stick(bool);
     callback begin();
     callback reset();
+    /// Leigo/Especialista trocado pelo usuário.
+    callback mode-changed();
 
     property <length> side-width: 300px;
 
@@ -671,12 +678,18 @@ export component Repair inherits Rectangle {
                     SegmentButton {
                         text: "Leigo";
                         active: !root.expert;
-                        clicked => { root.expert = false; }
+                        clicked => {
+                            root.expert = false;
+                            root.mode-changed();
+                        }
                     }
                     SegmentButton {
                         text: "Especialista";
                         active: root.expert;
-                        clicked => { root.expert = true; }
+                        clicked => {
+                            root.expert = true;
+                            root.mode-changed();
+                        }
                     }
                 }
             }

@@ -604,6 +604,59 @@ pub fn step_for(state: Option<&CaptureState>, id_matches: bool) -> WizardStep {
     }
 }
 
+/// Aviso do núcleo quando o controle do pedido não tem link (medição ou
+/// correção recusada).
+pub const NOT_CONNECTED: &str = "Controle não está conectado";
+/// Começo do aviso do núcleo quando recusa um `SetCorrections`.
+pub const NOT_APPLIED: &str = "Ajuste não aplicado";
+
+/// O que um aviso do núcleo faz na Correção.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeAction {
+    Ignore,
+    /// A medição pedida foi recusada: passo Erro com o aviso.
+    ShowError,
+    /// As correções enviadas foram recusadas: o aviso substitui a linha de
+    /// "Pronto" e não há o que desfazer.
+    ReplaceDone,
+}
+
+/// `done` é a linha mostrada depois de enviar correções ("" se nenhuma).
+pub fn notice_action(text: &str, step: WizardStep, done: &str) -> NoticeAction {
+    let not_connected = text == NOT_CONNECTED;
+    if not_connected && step == WizardStep::Measuring {
+        NoticeAction::ShowError
+    } else if (not_connected || text.starts_with(NOT_APPLIED)) && !done.is_empty() {
+        NoticeAction::ReplaceDone
+    } else {
+        NoticeAction::Ignore
+    }
+}
+
+/// Analógico de uma medição (gatilhos não têm; vale o esquerdo).
+pub fn stick_of(kind: CaptureKindDto) -> Stick {
+    match kind {
+        CaptureKindDto::DriftRight | CaptureKindDto::RangeRight => Stick::Right,
+        _ => Stick::Left,
+    }
+}
+
+/// O Desfazer só vale enquanto as correções do controle forem as de antes
+/// (o núcleo ainda não aplicou) ou as enviadas; outra coisa veio de fora.
+pub fn undo_still_valid(
+    current: &CorrectionsDto,
+    before: &CorrectionsDto,
+    sent: &CorrectionsDto,
+) -> bool {
+    current == before || current == sent
+}
+
+/// Jitter mostrado: sem transporte (XInput) o intervalo é do polling, não do
+/// link, e vira "sem dado".
+pub fn link_jitter_us(transport: Option<Transport>, us: u32) -> u32 {
+    if transport.is_some() { us } else { 0 }
+}
+
 /// O que "Começar" mede; a Conexão é passiva e não mede nada.
 pub fn capture_kind(w: Wizard, right: bool) -> Option<CaptureKindDto> {
     match (w, right) {
@@ -1236,5 +1289,77 @@ mod tests {
         assert_eq!(capture_kind(Wizard::Range, true), Some(RangeRight));
         assert_eq!(capture_kind(Wizard::Triggers, true), Some(Triggers));
         assert_eq!(capture_kind(Wizard::Connection, false), None);
+    }
+
+    #[test]
+    fn summary_never_exceeds_two_lines() {
+        let mut c = corrected();
+        c.right.center = [0.1, 0.1];
+        c.right.drift_radius = 0.2;
+        c.left.outer_radius[0] = 0.8;
+        c.r2 = TriggerCalDto {
+            rest: 0.1,
+            max: 0.9,
+        };
+        for w in [
+            Wizard::Drift,
+            Wizard::Range,
+            Wizard::Triggers,
+            Wizard::Connection,
+        ] {
+            let s = summary(w, &c);
+            assert!(s.lines().count() <= 2, "{w:?}: {s}");
+        }
+    }
+
+    #[test]
+    fn notice_decides_error_or_done_replacement() {
+        use NoticeAction::*;
+        let m = WizardStep::Measuring;
+        let r = WizardStep::Result;
+        assert_eq!(notice_action(NOT_CONNECTED, m, ""), ShowError);
+        assert_eq!(
+            notice_action(NOT_CONNECTED, r, "Pronto: correção aplicada"),
+            ReplaceDone
+        );
+        assert_eq!(notice_action(NOT_CONNECTED, r, ""), Ignore);
+        assert_eq!(notice_action(NOT_CONNECTED, WizardStep::Intro, ""), Ignore);
+        let refused = "Ajuste não aplicado: valores inválidos";
+        assert_eq!(
+            notice_action(refused, r, "Pronto: correção aplicada"),
+            ReplaceDone
+        );
+        assert_eq!(notice_action(refused, r, ""), Ignore);
+        assert_eq!(notice_action(refused, m, ""), Ignore);
+        assert_eq!(notice_action("Controle 1 reconectou", r, "Pronto"), Ignore);
+    }
+
+    #[test]
+    fn stick_comes_from_the_capture_kind() {
+        use CaptureKindDto::*;
+        assert_eq!(stick_of(DriftLeft), Stick::Left);
+        assert_eq!(stick_of(RangeLeft), Stick::Left);
+        assert_eq!(stick_of(DriftRight), Stick::Right);
+        assert_eq!(stick_of(RangeRight), Stick::Right);
+        assert_eq!(stick_of(Triggers), Stick::Left);
+    }
+
+    #[test]
+    fn undo_survives_only_the_before_or_sent_value() {
+        let before = CorrectionsDto::default();
+        let sent = corrected();
+        assert!(undo_still_valid(&before, &before, &sent));
+        assert!(undo_still_valid(&sent, &before, &sent));
+        let mut other = sent.clone();
+        other.l2.rest = 0.2;
+        assert!(!undo_still_valid(&other, &before, &sent));
+    }
+
+    #[test]
+    fn jitter_is_unknown_without_transport() {
+        assert_eq!(link_jitter_us(None, 180), 0);
+        assert_eq!(jitter_text(link_jitter_us(None, 180)), "—");
+        assert_eq!(link_jitter_us(Some(Transport::Usb), 180), 180);
+        assert_eq!(link_jitter_us(Some(Transport::Bluetooth), 9), 9);
     }
 }

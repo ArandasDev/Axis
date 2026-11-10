@@ -267,6 +267,7 @@ export component App inherits Window {
     callback choose-stick(bool);
     callback start-capture();
     callback reset-wizard();
+    callback repair-mode-changed();
     callback minimize();
     callback toggle-maximize();
     callback close-window();
@@ -321,6 +322,7 @@ export component App inherits Window {
                     choose-stick(right) => { root.choose-stick(right); }
                     begin => { root.start-capture(); }
                     reset => { root.reset-wizard(); }
+                    mode-changed => { root.repair-mode-changed(); }
                 }
                 if root.screen != 2: Overview {
                     horizontal-stretch: 1;

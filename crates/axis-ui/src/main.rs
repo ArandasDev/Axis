@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod client;
+mod panic_log;
 mod repair_view;
 mod single;
 mod theme;
@@ -18,7 +19,7 @@ use axis_protocol::{
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 
 use client::{Client, UiUpdate};
-use repair_view::{Stick, Wizard, WizardStep};
+use repair_view::{NoticeAction, Stick, Wizard, WizardStep};
 use view::{Connection, PadCard};
 
 slint::include_modules!();
@@ -37,8 +38,6 @@ const PLOT_POINTS: usize = 240;
 const APPLIED: &str = "Pronto: correção aplicada";
 const UNDONE: &str = "Desfeito: as correções de antes voltaram";
 const RESTORED: &str = "Padrão restaurado";
-/// Começo do aviso do núcleo quando recusa um `SetCorrections`.
-const NOT_APPLIED: &str = "Ajuste não aplicado";
 
 /// Estado da interface que não mora no Slint (só na thread da interface).
 #[derive(Default)]
@@ -72,8 +71,9 @@ struct Shell {
     points: Rc<VecModel<PlotPoint>>,
     /// Próxima posição do anel.
     head: usize,
-    /// Desfazer: controle e as correções dele logo antes da última aplicação.
-    undo: Option<(String, CorrectionsDto)>,
+    /// Desfazer: controle, as correções dele logo antes da última aplicação e
+    /// as enviadas.
+    undo: Option<(String, CorrectionsDto, CorrectionsDto)>,
     /// O que está digitado nos campos do especialista.
     fields: Vec<String>,
     /// Último resultado mostrado (o "Aplicar" dos gatilhos sabe quais foram
@@ -101,6 +101,7 @@ type LinkStats = (u32, u32, Option<u8>, bool);
 const NO_LINK: LinkStats = (0, 0, None, false);
 
 fn main() -> Result<(), slint::PlatformError> {
+    panic_log::install();
     // Uma interface só (também no modo demo): a segunda traz a primeira para
     // frente e sai, antes de criar qualquer janela.
     let Some(_single) = single::SingleUi::acquire() else {
@@ -320,6 +321,12 @@ fn setup_repair(app: &App) {
             undo_correction(&app);
         }
     });
+    let weak = app.as_weak();
+    app.on_repair_mode_changed(move || {
+        if let Some(app) = weak.upgrade() {
+            mode_changed(&app);
+        }
+    });
 }
 
 /// Controle, assistente, analógico e correções atuais do selecionado.
@@ -341,7 +348,7 @@ fn send_corrections(
     next: CorrectionsDto,
     done: &str,
 ) {
-    SHELL.with(|s| s.borrow_mut().undo = Some((id.clone(), before)));
+    SHELL.with(|s| s.borrow_mut().undo = Some((id.clone(), before, next.clone())));
     send(ClientMsg::SetCorrections {
         id,
         corrections: next,
@@ -355,7 +362,7 @@ fn send_corrections(
 fn undo_correction(app: &App) {
     let msg = SHELL.with(|s| {
         let mut s = s.borrow_mut();
-        let (id, before) = s.undo.take()?;
+        let (id, before, _) = s.undo.take()?;
         (s.selected.as_deref() == Some(id.as_str())).then_some(ClientMsg::SetCorrections {
             id,
             corrections: before,
@@ -455,7 +462,7 @@ fn show_trigger_marks(work: &RepairWork, l2: Option<&TriggerCalDto>, r2: Option<
 
 /// Resultado válido de drift, alcance ou gatilhos: desenha e, no modo leigo,
 /// aplica na hora; no especialista, abre os números para editar.
-fn show_result(app: &App, id: String, result: &CaptureResultDto) {
+fn show_result(app: &App, id: String, kind: CaptureKindDto, result: &CaptureResultDto) {
     let work = app.global::<RepairWork>();
     work.set_has_result(true);
     match result {
@@ -471,47 +478,78 @@ fn show_result(app: &App, id: String, result: &CaptureResultDto) {
     }
     work.set_polygon(repair_view::range_polygon(result).into());
     work.set_warning(repair_view::capture_warning(result).unwrap_or("").into());
+    // Guardado também no leigo: trocar para o especialista abre os números.
+    SHELL.with(|s| s.borrow_mut().result = Some(result.clone()));
     if app.get_expert() {
-        let fields = repair_view::fields_for(result);
-        if fields.is_empty() {
-            // Nenhum gatilho medido: nada para editar.
-            return;
-        }
-        SHELL.with(|s| {
-            let mut s = s.borrow_mut();
-            s.fields = fields.iter().map(|f| f.value.clone()).collect();
-            s.result = Some(result.clone());
-        });
-        let model: Vec<RepairField> = fields
-            .into_iter()
-            .map(|f| RepairField {
-                label: f.label.into(),
-                value: f.value.into(),
-            })
-            .collect();
-        work.set_fields(ModelRc::new(VecModel::from(model)));
-        work.set_editing(true);
+        open_fields(app, result);
         return;
     }
-    let Some((selected, _, stick, cur)) = target() else {
+    let Some((selected, _, _, cur)) = target() else {
         return;
     };
     if selected != id {
         return;
     }
+    // O analógico é o da medição, não o escolhido agora na tela.
+    let stick = repair_view::stick_of(kind);
     if let Some(next) = repair_view::auto_apply(&cur, stick, result) {
         send_corrections(app, id, cur, next, APPLIED);
     }
 }
 
-/// O núcleo recusou correções: o aviso dele substitui o "Pronto" (e não há
-/// o que desfazer).
+/// Números do especialista para `result`; nenhum gatilho medido não abre nada.
+fn open_fields(app: &App, result: &CaptureResultDto) {
+    let fields = repair_view::fields_for(result);
+    if fields.is_empty() {
+        return;
+    }
+    SHELL.with(|s| s.borrow_mut().fields = fields.iter().map(|f| f.value.clone()).collect());
+    let model: Vec<RepairField> = fields
+        .into_iter()
+        .map(|f| RepairField {
+            label: f.label.into(),
+            value: f.value.into(),
+        })
+        .collect();
+    let work = app.global::<RepairWork>();
+    work.set_fields(ModelRc::new(VecModel::from(model)));
+    work.set_editing(true);
+}
+
+/// Leigo/Especialista mudou: num resultado, abre ou fecha os números.
+fn mode_changed(app: &App) {
+    let (step, result) = SHELL.with(|s| {
+        let s = s.borrow();
+        (s.step, s.result.clone())
+    });
+    if step != WizardStep::Result {
+        return;
+    }
+    let work = app.global::<RepairWork>();
+    if app.get_expert() {
+        if let Some(r) = result {
+            open_fields(app, &r);
+        }
+    } else {
+        work.set_editing(false);
+        work.set_field_error("".into());
+        work.set_error_index(-1);
+    }
+}
+
+/// Aviso do núcleo: medição recusada vira o passo Erro; correções recusadas
+/// trocam o "Pronto" pelo aviso (e não há o que desfazer).
 fn show_notice(app: &App, text: &str) {
     let work = app.global::<RepairWork>();
-    if text.starts_with(NOT_APPLIED) && !work.get_done().is_empty() {
-        SHELL.with(|s| s.borrow_mut().undo = None);
-        work.set_done(text.into());
-        work.set_can_undo(false);
+    let step = SHELL.with(|s| s.borrow().step);
+    match repair_view::notice_action(text, step, &work.get_done()) {
+        NoticeAction::ShowError => abort_measuring(app, text.into()),
+        NoticeAction::ReplaceDone => {
+            SHELL.with(|s| s.borrow_mut().undo = None);
+            work.set_done(text.into());
+            work.set_can_undo(false);
+        }
+        NoticeAction::Ignore => {}
     }
 }
 
@@ -623,13 +661,13 @@ fn show_capture(app: &App, frame: &LiveFrame) {
         // Só um resultado novo e válido é desenhado/aplicado, uma vez.
         let applied = result
             .filter(|_| step == WizardStep::Result)
-            .map(|r| (id.clone(), r.clone()));
+            .map(|r| (id.clone(), kind, r.clone()));
         (changed || step == WizardStep::Measuring).then_some((step, progress, message, applied))
     });
     if let Some((step, progress, message, applied)) = update {
         show_step(app, step, progress, message);
-        if let Some((id, result)) = applied {
-            show_result(app, id, &result);
+        if let Some((id, kind, result)) = applied {
+            show_result(app, id, kind, &result);
         }
     }
 }
@@ -834,9 +872,18 @@ fn show_live(app: &App, frame: &LiveFrame) {
             return None;
         }
         let triggers = s.screen == SCREEN_REPAIR && s.wizard == Wizard::Triggers;
-        Some((!std::mem::replace(&mut s.has_live, true), triggers))
+        let transport = s
+            .sessions
+            .iter()
+            .find(|x| x.id == frame.id)
+            .and_then(|x| x.transport);
+        Some((
+            !std::mem::replace(&mut s.has_live, true),
+            triggers,
+            transport,
+        ))
     });
-    let Some((first, triggers)) = accepted else {
+    let Some((first, triggers, transport)) = accepted else {
         return;
     };
     app.set_live(live_data(frame));
@@ -844,7 +891,8 @@ fn show_live(app: &App, frame: &LiveFrame) {
         app,
         (
             frame.rate_hz,
-            frame.jitter_us,
+            // XInput: o intervalo é do polling, não do link.
+            repair_view::link_jitter_us(transport, frame.jitter_us),
             frame.battery,
             frame.charging,
         ),
@@ -904,8 +952,30 @@ fn show_sessions(app: &App, sessions: &[SessionInfo]) {
         s.sessions = sessions.to_vec();
         s.selected.clone()
     });
+    drop_stale_undo(app);
     select(app, view::next_selection(current.as_deref(), sessions));
     refresh_status(app);
+}
+
+/// As correções do controle mudaram por fora (outra interface, o arquivo): o
+/// Desfazer voltaria a algo que ninguém pediu agora, então sai.
+fn drop_stale_undo(app: &App) {
+    let stale = SHELL.with(|s| {
+        let mut s = s.borrow_mut();
+        let stale = s.undo.as_ref().is_some_and(|(id, before, sent)| {
+            s.sessions
+                .iter()
+                .find(|x| &x.id == id)
+                .is_some_and(|x| !repair_view::undo_still_valid(&x.corrections, before, sent))
+        });
+        if stale {
+            s.undo = None;
+        }
+        stale
+    });
+    if stale {
+        app.global::<RepairWork>().set_can_undo(false);
+    }
 }
 
 fn card_data(c: &PadCard) -> PadCardData {
