@@ -25,7 +25,8 @@ Um controle passa a ser **verificado** (e perde o selo "experimental" na interfa
 | Lightbar muda de cor (`ds4_lightbar_turns_green_then_back`) | ✅ (confirmado visualmente) | ☐ |
 | Vibração | ☐ | ☐ |
 | Bateria e carregamento | ☐ (lida 50% no report `0x11`; não conferida com o real) | ☐ |
-| Desconexão gera `DeviceError::Disconnected` | ☐ | ☐ |
+| Desconexão gera `DeviceError::Disconnected` | ✗ não acontece: desligar no Bluetooth deixa o handle mudo (sem erro) e ele volta a funcionar ao religar; o núcleo detecta 500 ms de silêncio (verificado em 2026-11-10) | ☐ |
+| Desligar/religar com o núcleo: "reconectou" na graça, virtual liberado além dela | ✅ 2026-11-10 | ☐ |
 | Hotplug detecta remoção e chegada (`arrival_and_removal_are_reported`) | ✅ | ☐ |
 
 **Pontos de atenção encontrados:**
