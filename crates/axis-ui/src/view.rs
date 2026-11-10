@@ -208,8 +208,23 @@ pub fn header(index: usize, s: &SessionInfo, emulation: bool) -> Header {
             index + 1,
             family_label(&s.family).to_uppercase()
         ),
-        title: format!("Controle de {}", s.owner),
+        title: title(&s.owner),
         subtitle: subtitle.into(),
+    }
+}
+
+/// "Controle de Maria"; um nome que já começa com "Controle" (o padrão
+/// "Controle 1") fica como está.
+fn title(owner: &str) -> String {
+    let name = owner.trim();
+    let prefix = "controle";
+    let starts = name
+        .get(..prefix.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(prefix));
+    if starts {
+        name.to_string()
+    } else {
+        format!("Controle de {name}")
     }
 }
 
@@ -469,6 +484,27 @@ mod tests {
         let h = header(9, &gone, true);
         assert_eq!(h.kicker, "DISPOSITIVO 10 · XBOX");
         assert_eq!(h.subtitle, "Reconectando…");
+    }
+
+    #[test]
+    fn title_does_not_repeat_controle() {
+        let named = |owner: &str| SessionInfo {
+            owner: owner.into(),
+            ..maria()
+        };
+        // Nome padrão: "Controle 1", não "Controle de Controle 1".
+        assert_eq!(header(0, &named("Controle 1"), true).title, "Controle 1");
+        assert_eq!(
+            header(0, &named("  controle azul "), true).title,
+            "controle azul"
+        );
+        assert_eq!(header(0, &named("CONTROLE"), true).title, "CONTROLE");
+        assert_eq!(header(0, &named("Maria"), true).title, "Controle de Maria");
+        // Só o começo conta.
+        assert_eq!(
+            header(0, &named("Ana Controle"), true).title,
+            "Controle de Ana Controle"
+        );
     }
 
     #[test]
