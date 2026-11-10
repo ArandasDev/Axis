@@ -5,9 +5,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use axis_core::{InputState, Pipeline};
+use axis_core::{InputState, Pipeline, Trace};
 use axis_devices::{Controller, DeviceError, DeviceStatus, OutputState};
 use axis_virtual::{Rumble, VirtualPad};
+
+use crate::live::{LiveSample, LiveTap};
 
 pub type SharedPad = Arc<Mutex<Box<dyn VirtualPad>>>;
 
@@ -44,6 +46,9 @@ const STATUS_EVERY: u64 = 64;
 const WARN_INTERVAL: Duration = Duration::from_secs(1);
 const LATENCY_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BUCKETS: usize = 101;
+/// Intervalo mínimo entre amostras ao vivo: 17 ms garante no máximo ~59 por
+/// segundo (16 ms passaria de 60).
+const LIVE_INTERVAL: Duration = Duration::from_millis(17);
 
 /// Histograma de latência em buckets de 10 µs; o último acumula >= 1000 µs.
 pub(crate) struct LatencyHistogram {
@@ -135,9 +140,41 @@ struct Worker {
     last_out_warn: Option<Instant>,
     latency: LatencyHistogram,
     latency_since: Instant,
+    tap: Arc<LiveTap>,
+    last_publish: Option<Instant>,
+    /// Último report barrado pelo limitador de 17 ms; sai na próxima chance.
+    pending: Option<(InputState, InputState, Trace)>,
+    live_seq: u64,
+    /// p99 da última janela de 60 s do histograma (0 antes da primeira).
+    latency_p99_us: u32,
 }
 
 impl Worker {
+    fn publish_live(&mut self, input: InputState, output: InputState, trace: Trace) {
+        self.live_seq += 1;
+        self.tap.publish(LiveSample {
+            input,
+            output,
+            trace,
+            status: self.last_status,
+            reports: self.reports,
+            latency_p99_us: self.latency_p99_us,
+            seq: self.live_seq,
+        });
+    }
+
+    /// Amostra neutra (palco não congela), fora do limite de 17 ms; só com o tap ligado.
+    fn publish_neutral(&mut self) {
+        self.pending = None;
+        if self.tap.enabled() {
+            self.publish_live(
+                InputState::default(),
+                InputState::default(),
+                Trace::default(),
+            );
+        }
+    }
+
     fn send_pad(&mut self, input: &InputState) {
         let Some(pad) = &self.pad else { return };
         let result = lock(pad).update(input);
@@ -230,10 +267,30 @@ impl Worker {
                     }
                     self.reports += 1;
                     self.last_status = report.status;
-                    if !self.paused && self.pad.is_some() {
-                        let out = self.pipeline.process(&report.input);
-                        self.send_pad(&out);
-                        self.latency.record(started.elapsed().as_micros() as u64);
+                    let live = self.tap.enabled();
+                    let forward = !self.paused && self.pad.is_some();
+                    if live || forward {
+                        let (out, trace) = if live {
+                            self.pipeline.process_traced(&report.input)
+                        } else {
+                            (self.pipeline.process(&report.input), Trace::default())
+                        };
+                        if forward {
+                            self.send_pad(&out);
+                            self.latency.record(started.elapsed().as_micros() as u64);
+                        }
+                        if live {
+                            if self
+                                .last_publish
+                                .is_none_or(|t| started - t >= LIVE_INTERVAL)
+                            {
+                                self.last_publish = Some(started);
+                                self.pending = None;
+                                self.publish_live(report.input, out, trace);
+                            } else {
+                                self.pending = Some((report.input, out, trace));
+                            }
+                        }
                     }
                     if self.reports % STATUS_EVERY == 0 {
                         self.publish_status();
@@ -245,11 +302,22 @@ impl Worker {
                             self.latency.format_percentile(0.99),
                             self.latency.total()
                         );
+                        self.latency_p99_us = self.latency.percentile(0.99) as u32;
                         self.latency.reset();
                         self.latency_since = started;
                     }
                 }
                 Ok(None) => {
+                    if let Some((input, out, trace)) = self.pending {
+                        let now = Instant::now();
+                        if self.last_publish.is_none_or(|t| now - t >= LIVE_INTERVAL) {
+                            self.pending = None;
+                            self.last_publish = Some(now);
+                            if self.tap.enabled() {
+                                self.publish_live(input, out, trace);
+                            }
+                        }
+                    }
                     if self.detect_silence
                         && self.link_up
                         && self.last_report.elapsed() >= SILENCE_THRESHOLD
@@ -258,6 +326,7 @@ impl Worker {
                         self.written = None;
                         self.stop_rumble();
                         self.send_pad(&InputState::default());
+                        self.publish_neutral();
                         (self.on_link)(false);
                     }
                 }
@@ -279,6 +348,7 @@ fn exit_for(e: DeviceError) -> WorkerExit {
 /// `detect_silence` liga a detecção de silêncio (só para quem transmite sempre).
 /// `on_link` é chamado na própria thread (não pode bloquear): `false` após
 /// `SILENCE_THRESHOLD` sem reports, `true` quando os reports voltam.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_worker(
     controller: Box<dyn Controller>,
     pad: Option<SharedPad>,
@@ -287,6 +357,7 @@ pub fn spawn_worker(
     detect_silence: bool,
     on_exit: impl FnOnce(WorkerExit) + Send + 'static,
     on_link: impl Fn(bool) + Send + 'static,
+    tap: Arc<LiveTap>,
 ) -> (Sender<WorkerCommand>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
@@ -308,9 +379,15 @@ pub fn spawn_worker(
             last_out_warn: None,
             latency: LatencyHistogram::default(),
             latency_since: Instant::now(),
+            tap,
+            last_publish: None,
+            pending: None,
+            live_seq: 0,
+            latency_p99_us: 0,
         };
         let exit = w.run(&rx);
         w.publish_status();
+        w.publish_neutral();
         w.send_pad(&InputState::default());
         on_exit(exit);
     });
@@ -320,8 +397,9 @@ pub fn spawn_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live::LiveTap;
     use crate::testkit::{FakeController, FakePad, ReadQueue};
-    use axis_core::{Corrections, InputState, Pipeline, Profile, Vec2};
+    use axis_core::{Corrections, InputState, Pipeline, Profile, Trace, Vec2};
     use axis_devices::{DeviceError, OutputState, Report};
     use axis_virtual::{Rumble, VirtualPad};
     use std::sync::mpsc::Sender;
@@ -358,6 +436,7 @@ mod tests {
         status: Arc<Mutex<WorkerStatus>>,
         exit: Arc<Mutex<Option<WorkerExit>>>,
         links: Arc<Mutex<Vec<bool>>>,
+        tap: Arc<LiveTap>,
     }
 
     fn start(script: Vec<Result<Option<Report>, DeviceError>>, with_pad: bool) -> Harness {
@@ -382,6 +461,7 @@ mod tests {
         let exit2 = exit.clone();
         let links = Arc::new(Mutex::new(Vec::new()));
         let links2 = links.clone();
+        let tap = LiveTap::new();
         let (tx, handle) = spawn_worker(
             Box::new(ctl),
             shared,
@@ -394,6 +474,7 @@ mod tests {
                 *slot = Some(e);
             },
             move |up| links2.lock().unwrap().push(up),
+            tap.clone(),
         );
         Harness {
             tx,
@@ -404,6 +485,7 @@ mod tests {
             status,
             exit,
             links,
+            tap,
         }
     }
 
@@ -619,6 +701,79 @@ mod tests {
         assert!((received2.lock().unwrap()[0].left.x - 1.0).abs() < 1e-3);
         assert_eq!(h.received.lock().unwrap().len(), 1);
         h.finish();
+    }
+
+    #[test]
+    fn tap_disabled_publishes_nothing() {
+        let h = start(vec![], true);
+        for _ in 0..5 {
+            h.reads.lock().unwrap().push_back(report_x(1.0));
+        }
+        wait_until(|| h.received.lock().unwrap().len() == 5);
+        assert_eq!(h.tap.latest().seq, 0);
+        h.finish();
+    }
+
+    #[test]
+    fn tap_enabled_publishes_traced_samples_throttled() {
+        let h = start(vec![], true);
+        h.tap.set_enabled(true);
+        {
+            let mut q = h.reads.lock().unwrap();
+            for _ in 0..20 {
+                q.push_back(report_x(0.5));
+            }
+        }
+        wait_until(|| h.received.lock().unwrap().len() == 20);
+        let s = h.tap.latest();
+        assert_eq!(s.seq, 1);
+        assert_eq!(s.reports, 1);
+        assert_eq!(s.trace.left.raw, s.input.left);
+        assert!((s.input.left.x - 0.5).abs() < 1e-3);
+        // O 20º report, barrado pelo limitador, sai na leitura ociosa seguinte.
+        wait_until(|| h.tap.latest().seq == 2);
+        assert_eq!(h.tap.latest().reports, 20);
+        std::thread::sleep(Duration::from_millis(20));
+        h.reads.lock().unwrap().push_back(report_x(0.5));
+        wait_until(|| h.tap.latest().seq == 3);
+        assert_eq!(h.tap.latest().reports, 21);
+        h.finish();
+    }
+
+    #[test]
+    fn throttled_last_report_is_flushed_later() {
+        let h = start_opts(FakeController::new(vec![]), true, false);
+        h.tap.set_enabled(true);
+        {
+            let mut q = h.reads.lock().unwrap();
+            q.push_back(report_x(1.0));
+            q.push_back(report_x(0.0));
+        }
+        wait_until(|| h.received.lock().unwrap().len() == 2);
+        wait_until(|| h.tap.latest().output.left.x == 0.0 && h.tap.latest().seq >= 1);
+        assert_eq!(h.tap.latest().reports, 2);
+        h.finish();
+    }
+
+    #[test]
+    fn silence_or_exit_publishes_neutral_sample() {
+        let h = start(vec![], true);
+        h.tap.set_enabled(true);
+        h.reads.lock().unwrap().push_back(report_x(1.0));
+        wait_until(|| h.tap.latest().seq >= 1);
+        assert!((h.tap.latest().input.left.x - 1.0).abs() < 1e-3);
+        wait_until(|| *h.links.lock().unwrap() == vec![false]);
+        let s = h.tap.latest();
+        assert_eq!(s.output, InputState::default());
+        assert_eq!(s.input, InputState::default());
+        assert_eq!(s.trace, Trace::default());
+        assert!(s.reports >= 1);
+        // Volta o sinal e depois o worker sai: a saída também zera o palco.
+        let tap = h.tap.clone();
+        h.reads.lock().unwrap().push_back(report_x(1.0));
+        wait_until(|| tap.latest().input.left.x > 0.5);
+        h.finish();
+        assert_eq!(tap.latest().output, InputState::default());
     }
 
     #[test]

@@ -11,6 +11,8 @@ use axis_daemon::app::{
 use axis_daemon::autostart::RunKey;
 use axis_daemon::config::ConfigStore;
 use axis_daemon::instance::SingleInstance;
+use axis_daemon::ipc::spawn_ipc_server;
+use axis_daemon::live::UiRegistry;
 use axis_daemon::logging::init_logging;
 use axis_daemon::manager::{Event, Manager, ManagerDeps, SessionView};
 use axis_daemon::paths::AppPaths;
@@ -58,6 +60,8 @@ fn main() {
         }
     };
     let notifier = DeferredNotifier::<TrayHandle>::new();
+    // O gerente alimenta o registro; o servidor do pipe o entrega à interface.
+    let ui = UiRegistry::new();
     let mut manager = Manager::new(ManagerDeps {
         opener,
         bus,
@@ -66,11 +70,19 @@ fn main() {
         scheduler: Box::new(ThreadScheduler::new(tx.clone())),
         notifier: Box::new(notifier.clone()),
         events: tx.clone(),
+        ui: ui.clone(),
     });
+    let _ipc = spawn_ipc_server(axis_protocol::PIPE_NAME, ui.clone(), tx.clone());
 
     let sessions = Arc::new(Mutex::new(Vec::new()));
     let autostart = Arc::new(AtomicBool::new(settings.autostart));
-    let on_command = command_handler(tx.clone(), settings_store.clone(), exe, autostart.clone());
+    let on_command = command_handler(
+        tx.clone(),
+        settings_store.clone(),
+        exe,
+        autostart.clone(),
+        notifier.clone(),
+    );
     let quit_done = QuitDone::default();
     let (tray, tray_thread) =
         Tray::spawn(on_command, sessions.clone(), autostart, quit_done.clone());

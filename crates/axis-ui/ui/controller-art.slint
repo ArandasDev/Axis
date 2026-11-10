@@ -1,0 +1,390 @@
+import { Tokens } from "tokens.slint";
+
+/// Contorno de uma peça do controle; pressionada, enche na cor de destaque.
+component Part inherits Rectangle {
+    in property <bool> on;
+
+    border-width: 1.5px;
+    border-color: on ? Tokens.accent : Tokens.text;
+    background: on ? Tokens.accent : transparent;
+}
+
+/// Gatilho: contorno em pílula preenchido proporcionalmente ao valor.
+component Trigger inherits Rectangle {
+    in property <float> value;
+
+    border-radius: self.height / 2;
+    border-width: 1.5px;
+    border-color: Tokens.text;
+
+    Rectangle {
+        x: 0;
+        width: max(0, min(1, root.value)) * parent.width;
+        height: parent.height;
+        border-radius: parent.border-radius;
+        background: Tokens.accent;
+    }
+}
+
+/// Analógico: anel, anel interno e o ponto na posição atual (y para cima).
+component Stick inherits Rectangle {
+    in property <float> sx;
+    in property <float> sy;
+    /// Clique do analógico (L3/R3).
+    in property <bool> on;
+    in property <length> u;
+
+    width: 64 * u;
+    height: 64 * u;
+    border-radius: self.width / 2;
+    border-width: 1.5px;
+    border-color: on ? Tokens.accent : Tokens.text;
+    background: on ? Tokens.accent-soft : transparent;
+
+    Rectangle {
+        width: 44 * root.u;
+        height: 44 * root.u;
+        border-radius: self.width / 2;
+        border-width: 1px;
+        border-color: Tokens.line-soft;
+    }
+
+    Rectangle {
+        x: parent.width / 2 - 5 * root.u + max(-1, min(1, root.sx)) * 18 * root.u;
+        y: parent.height / 2 - 5 * root.u - max(-1, min(1, root.sy)) * 18 * root.u;
+        width: 10 * root.u;
+        height: 10 * root.u;
+        border-radius: self.width / 2;
+        background: Tokens.accent;
+        drop-shadow-blur: 8px;
+        drop-shadow-color: Tokens.accent;
+    }
+}
+
+/// Botão de face. PlayStation: símbolo desenhado (0 △, 1 ○, 2 □, 3 ✕);
+/// Xbox: a letra.
+component FaceButton inherits Rectangle {
+    in property <int> glyph;
+    in property <string> letter;
+    in property <bool> on;
+    in property <length> u;
+    property <color> ink: on ? Tokens.bg : Tokens.text;
+
+    width: 26 * u;
+    height: 26 * u;
+    border-radius: self.width / 2;
+    border-width: 1.5px;
+    border-color: on ? Tokens.accent : Tokens.text;
+    background: on ? Tokens.accent : transparent;
+
+    if root.letter == "" && root.glyph != 1: Path {
+        width: 10 * root.u;
+        height: 10 * root.u;
+        viewbox-width: 10;
+        viewbox-height: 10;
+        stroke: root.ink;
+        stroke-width: 1.4px;
+        commands: root.glyph == 0 ? "M 5 0.6 L 9.6 8.9 L 0.4 8.9 Z"
+            : root.glyph == 2 ? "M 0.8 0.8 L 9.2 0.8 L 9.2 9.2 L 0.8 9.2 Z"
+            : "M 0.8 0.8 L 9.2 9.2 M 9.2 0.8 L 0.8 9.2";
+    }
+    if root.letter == "" && root.glyph == 1: Rectangle {
+        width: 10 * root.u;
+        height: 10 * root.u;
+        border-radius: self.width / 2;
+        border-width: 1.4px;
+        border-color: root.ink;
+    }
+    if root.letter != "": Text {
+        text: root.letter;
+        font-family: Tokens.font-heading;
+        font-weight: 600;
+        font-size: 13 * root.u;
+        color: root.ink;
+    }
+}
+
+/// Desenho em linha do controle (quadro de 560×340 escalado por `k`), com os
+/// analógicos, gatilhos e botões vivos. As âncoras dizem onde as chamadas
+/// do palco encostam.
+export component ControllerArt inherits Rectangle {
+    /// 0 DualShock 4, 1 DualSense, 2 Xbox.
+    in property <int> family;
+    in property <float> k: 1;
+    in property <float> lx;
+    in property <float> ly;
+    in property <float> rx;
+    in property <float> ry;
+    in property <float> l2;
+    in property <float> r2;
+    /// Bits na ordem de `axis_core::Button`.
+    in property <int> buttons;
+
+    property <length> u: 1px * root.k;
+    property <bool> xbox: root.family == 2;
+    // Centros no quadro de 560×340.
+    property <float> ls-cx: xbox ? 150 : 205;
+    property <float> ls-cy: xbox ? 128 : root.family == 1 ? 196 : 192;
+    property <float> rs-cx: xbox ? 345 : 355;
+    property <float> rs-cy: xbox ? 205 : root.family == 1 ? 196 : 192;
+    property <float> dp-cx: xbox ? 215 : 130;
+    property <float> dp-cy: xbox ? 205 : 138;
+    property <float> fc-cx: xbox ? 420 : 430;
+    property <float> fc-cy: xbox ? 128 : 137;
+
+    /// Topo do meio de L2/R2 e base dos analógicos, em coordenadas locais.
+    out property <length> l2-ax: 158 * u;
+    out property <length> r2-ax: 402 * u;
+    out property <length> trigger-ay: 6 * u;
+    out property <length> ls-ax: ls-cx * u;
+    out property <length> ls-ay: (ls-cy + 32) * u;
+    out property <length> rs-ax: rs-cx * u;
+    out property <length> rs-ay: (rs-cy + 32) * u;
+
+    width: 560 * u;
+    height: 340 * u;
+
+    pure function pressed(bit: int) -> bool {
+        return mod(floor(root.buttons / pow(2, bit)), 2) == 1;
+    }
+
+    // Gatilhos e bumpers.
+    Trigger {
+        x: 112 * root.u;
+        y: 6 * root.u;
+        width: 92 * root.u;
+        height: 18 * root.u;
+        value: root.l2;
+    }
+    Trigger {
+        x: 356 * root.u;
+        y: 6 * root.u;
+        width: 92 * root.u;
+        height: 18 * root.u;
+        value: root.r2;
+    }
+    Part {
+        x: 118 * root.u;
+        y: 32 * root.u;
+        width: 80 * root.u;
+        height: 10 * root.u;
+        border-radius: self.height / 2;
+        on: root.pressed(4);
+    }
+    Part {
+        x: 362 * root.u;
+        y: 32 * root.u;
+        width: 80 * root.u;
+        height: 10 * root.u;
+        border-radius: self.height / 2;
+        on: root.pressed(5);
+    }
+
+    // Corpo.
+    Path {
+        x: 0;
+        y: 0;
+        width: 560 * root.u;
+        height: 340 * root.u;
+        viewbox-width: 560;
+        viewbox-height: 340;
+        stroke: Tokens.text;
+        stroke-width: 1.6px;
+        commands: root.family == 2
+            ? "M 140 66 C 200 54 360 54 420 66 C 478 76 516 124 534 204 C 550 278 528 326 490 322 C 458 318 440 282 408 266 C 340 254 220 254 152 266 C 120 282 102 318 70 322 C 32 326 10 278 26 204 C 44 124 82 76 140 66 Z"
+            : root.family == 1
+            ? "M 128 58 C 200 44 360 44 432 58 C 492 68 528 128 542 214 C 554 290 528 334 492 328 C 464 322 446 282 418 260 C 360 244 200 244 142 260 C 114 282 96 322 68 328 C 32 334 6 290 18 214 C 32 128 68 68 128 58 Z"
+            : "M 130 62 Q 280 42 430 62 C 482 70 520 120 535 210 C 548 285 522 330 488 322 C 462 316 440 270 410 248 Q 280 226 150 248 C 120 270 98 316 72 322 C 38 330 12 285 25 210 C 40 120 78 70 130 62 Z";
+    }
+
+    // DualShock 4: touchpad, barra de luz, share/options, PS.
+    if root.family == 0: Part {
+        x: 210 * root.u;
+        y: 64 * root.u;
+        width: 140 * root.u;
+        height: 78 * root.u;
+        border-radius: 10 * root.u;
+        on: root.pressed(11);
+        background: self.on ? Tokens.accent-soft : transparent;
+    }
+    if root.family == 0: Rectangle {
+        x: 250 * root.u;
+        y: 150 * root.u;
+        width: 60 * root.u;
+        height: 4 * root.u;
+        border-radius: self.height / 2;
+        background: Tokens.accent;
+    }
+
+    // DualSense: touchpad maior com as faixas de luz dos lados.
+    if root.family == 1: Part {
+        x: 198 * root.u;
+        y: 58 * root.u;
+        width: 164 * root.u;
+        height: 92 * root.u;
+        border-radius: 12 * root.u;
+        on: root.pressed(11);
+        background: self.on ? Tokens.accent-soft : transparent;
+    }
+    if root.family == 1: Rectangle {
+        x: 191 * root.u;
+        y: 68 * root.u;
+        width: 2px;
+        height: 72 * root.u;
+        background: Tokens.accent;
+    }
+    if root.family == 1: Rectangle {
+        x: 367 * root.u;
+        y: 68 * root.u;
+        width: 2px;
+        height: 72 * root.u;
+        background: Tokens.accent;
+    }
+    if root.family == 1: Rectangle {
+        x: 272 * root.u;
+        y: 214 * root.u;
+        width: 16 * root.u;
+        height: 5 * root.u;
+        border-radius: self.height / 2;
+        border-width: 1px;
+        border-color: Tokens.line-soft;
+    }
+
+    // Share/create e options (PlayStation).
+    if !root.xbox: Part {
+        x: (root.family == 1 ? 177 : 184) * root.u;
+        y: (root.family == 1 ? 70 : 74) * root.u;
+        width: 10 * root.u;
+        height: 18 * root.u;
+        border-radius: self.width / 2;
+        on: root.pressed(9);
+    }
+    if !root.xbox: Part {
+        x: (root.family == 1 ? 373 : 366) * root.u;
+        y: (root.family == 1 ? 70 : 74) * root.u;
+        width: 10 * root.u;
+        height: 18 * root.u;
+        border-radius: self.width / 2;
+        on: root.pressed(8);
+    }
+    if !root.xbox: Part {
+        x: 271 * root.u;
+        y: 183 * root.u;
+        width: 18 * root.u;
+        height: 18 * root.u;
+        border-radius: self.width / 2;
+        on: root.pressed(10);
+    }
+
+    // Xbox: guia, view e menu.
+    if root.xbox: Part {
+        x: 265 * root.u;
+        y: 81 * root.u;
+        width: 30 * root.u;
+        height: 30 * root.u;
+        border-radius: self.width / 2;
+        on: root.pressed(10);
+    }
+    if root.xbox: Part {
+        x: 236 * root.u;
+        y: 124 * root.u;
+        width: 16 * root.u;
+        height: 16 * root.u;
+        border-radius: self.width / 2;
+        on: root.pressed(9);
+    }
+    if root.xbox: Part {
+        x: 308 * root.u;
+        y: 124 * root.u;
+        width: 16 * root.u;
+        height: 16 * root.u;
+        border-radius: self.width / 2;
+        on: root.pressed(8);
+    }
+
+    // Direcional.
+    Part {
+        x: (root.dp-cx - 10) * root.u;
+        y: (root.dp-cy - 34) * root.u;
+        width: 20 * root.u;
+        height: 24 * root.u;
+        border-radius: 4 * root.u;
+        on: root.pressed(12);
+    }
+    Part {
+        x: (root.dp-cx - 10) * root.u;
+        y: (root.dp-cy + 10) * root.u;
+        width: 20 * root.u;
+        height: 24 * root.u;
+        border-radius: 4 * root.u;
+        on: root.pressed(13);
+    }
+    Part {
+        x: (root.dp-cx - 36) * root.u;
+        y: (root.dp-cy - 10) * root.u;
+        width: 24 * root.u;
+        height: 20 * root.u;
+        border-radius: 4 * root.u;
+        on: root.pressed(14);
+    }
+    Part {
+        x: (root.dp-cx + 12) * root.u;
+        y: (root.dp-cy - 10) * root.u;
+        width: 24 * root.u;
+        height: 20 * root.u;
+        border-radius: 4 * root.u;
+        on: root.pressed(15);
+    }
+
+    // Botões de face: norte, leste, oeste, sul.
+    FaceButton {
+        x: (root.fc-cx - 13) * root.u;
+        y: (root.fc-cy - 41) * root.u;
+        u: root.u;
+        glyph: 0;
+        letter: root.xbox ? "Y" : "";
+        on: root.pressed(3);
+    }
+    FaceButton {
+        x: (root.fc-cx + 15) * root.u;
+        y: (root.fc-cy - 13) * root.u;
+        u: root.u;
+        glyph: 1;
+        letter: root.xbox ? "B" : "";
+        on: root.pressed(1);
+    }
+    FaceButton {
+        x: (root.fc-cx - 41) * root.u;
+        y: (root.fc-cy - 13) * root.u;
+        u: root.u;
+        glyph: 2;
+        letter: root.xbox ? "X" : "";
+        on: root.pressed(2);
+    }
+    FaceButton {
+        x: (root.fc-cx - 13) * root.u;
+        y: (root.fc-cy + 15) * root.u;
+        u: root.u;
+        glyph: 3;
+        letter: root.xbox ? "A" : "";
+        on: root.pressed(0);
+    }
+
+    // Analógicos.
+    Stick {
+        x: (root.ls-cx - 32) * root.u;
+        y: (root.ls-cy - 32) * root.u;
+        u: root.u;
+        sx: root.lx;
+        sy: root.ly;
+        on: root.pressed(6);
+    }
+    Stick {
+        x: (root.rs-cx - 32) * root.u;
+        y: (root.rs-cy - 32) * root.u;
+        u: root.u;
+        sx: root.rx;
+        sy: root.ry;
+        on: root.pressed(7);
+    }
+}

@@ -6,10 +6,12 @@ use std::thread::JoinHandle;
 
 use axis_core::{Corrections, DeviceFamily, Pipeline, Profile};
 use axis_devices::{Controller, HidCandidate};
+use axis_protocol::SessionInfo;
 use axis_virtual::{DeviceHider, Rumble, VirtualBus, instance_id_from_path};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigStore, OWNER_PALETTE};
+use crate::live::{LiveTap, UiRegistry, to_family};
 use crate::ports::{ControllerOpener, Notifier, Scheduler};
 use crate::store::{Loaded, load_toml, write_atomic};
 use crate::worker::{SharedPad, WorkerCommand, WorkerExit, WorkerStatus, spawn_worker};
@@ -71,6 +73,7 @@ pub struct ManagerDeps {
     pub scheduler: Box<dyn Scheduler>,
     pub notifier: Box<dyn Notifier>,
     pub events: Sender<Event>,
+    pub ui: Arc<UiRegistry>,
 }
 
 /// Estado de um controle conhecido. `connected = false` significa período de graça
@@ -90,8 +93,9 @@ struct Session {
     view_only: bool,
     tx: Sender<WorkerCommand>,
     handle: Option<JoinHandle<()>>,
-    #[allow(dead_code)] // lido pela bandeja/UI nas próximas tasks
     status: Arc<Mutex<WorkerStatus>>,
+    /// Torneira ao vivo; sobrevive à reconexão dentro da graça.
+    tap: Arc<LiveTap>,
     pad: Option<SharedPad>,
     /// Geração da última desconexão ou perda de sinal (valida `GraceExpired`/`SilenceExpired`).
     generation: u64,
@@ -117,6 +121,7 @@ pub struct Manager {
     scheduler: Box<dyn Scheduler>,
     notifier: Box<dyn Notifier>,
     events: Sender<Event>,
+    ui: Arc<UiRegistry>,
     sessions: Vec<Session>,
     hidden: Vec<String>,
     /// Falso quando o estado de ocultação não pôde ser lido: nada é gravado nem ocultado.
@@ -135,6 +140,7 @@ impl Manager {
         let (hidden, hiding_enabled, notices) = load_hidden(&deps.store);
         for n in &notices {
             deps.notifier.notify("Axis", n);
+            deps.ui.push_notice(n);
         }
         Manager {
             opener: deps.opener,
@@ -144,6 +150,7 @@ impl Manager {
             scheduler: deps.scheduler,
             notifier: deps.notifier,
             events: deps.events,
+            ui: deps.ui,
             sessions: Vec::new(),
             hidden,
             hiding_enabled,
@@ -159,16 +166,59 @@ impl Manager {
     /// Reconcilia ocultações de uma execução que travou e enumera os controles conectados.
     pub fn start(&mut self) {
         if !self.unhide_everything() {
-            self.notifier.notify(
+            self.notify(
                 "Axis",
                 "Não foi possível desocultar os controles físicos; tente restaurar pelo menu.",
             );
         }
         self.scan();
+        self.publish_ui();
     }
 
     /// Devolve `false` apenas em `Quit`.
     pub fn handle(&mut self, e: Event) -> bool {
+        let keep_going = self.dispatch(e);
+        self.publish_ui();
+        keep_going
+    }
+
+    /// Avisa pela bandeja e guarda o texto para a interface.
+    fn notify(&self, title: &str, body: &str) {
+        self.notifier.notify(title, body);
+        self.ui.push_notice(body);
+    }
+
+    /// Entrega à interface o estado atual (só muda a geração se algo mudou).
+    fn publish_ui(&self) {
+        let sessions = self
+            .sessions
+            .iter()
+            .map(|s| {
+                let st = s.status.lock().unwrap_or_else(|e| e.into_inner()).status;
+                SessionInfo {
+                    id: s.id.clone(),
+                    owner: s.owner.clone(),
+                    color: s.color,
+                    family: to_family(s.family),
+                    player: s.player,
+                    connected: s.connected && s.link_up,
+                    experimental: s.experimental,
+                    view_only: s.view_only,
+                    battery: st.battery_percent,
+                    charging: st.charging,
+                }
+            })
+            .collect();
+        let taps = self
+            .sessions
+            .iter()
+            .map(|s| (s.id.clone(), s.tap.clone()))
+            .collect();
+        self.ui
+            .publish(sessions, taps, self.paused, !self.emulation_disabled);
+    }
+
+    fn dispatch(&mut self, e: Event) -> bool {
         match e {
             Event::DeviceArrived(path) => {
                 log::info!("chegada de dispositivo: {path}");
@@ -192,6 +242,9 @@ impl Manager {
                 }
             }
             Event::SetPaused(p) => {
+                if let Some(m) = pause_log(self.paused, p) {
+                    log::info!("{m}");
+                }
                 self.paused = p;
                 for s in self.sessions.iter().filter(|s| s.connected) {
                     let _ = s.tx.send(WorkerCommand::SetPaused(p));
@@ -201,7 +254,7 @@ impl Manager {
             Event::Quit => {
                 self.shutdown_all();
                 if !self.unhide_everything() {
-                    self.notifier.notify(
+                    self.notify(
                         "Axis",
                         "Não foi possível desocultar os controles físicos; isso será desfeito na próxima inicialização do Axis.",
                     );
@@ -255,11 +308,11 @@ impl Manager {
         self.shutdown_all();
         if self.unhide_everything() {
             self.emulation_disabled = true;
-            self.notifier.notify("Axis", "Controles restaurados");
+            self.notify("Axis", "Controles restaurados");
         } else {
             // Os físicos continuam ocultos: a emulação volta para não deixar o
             // usuário sem controle.
-            self.notifier.notify(
+            self.notify(
                 "Axis",
                 "Não foi possível restaurar os controles; a emulação continua.",
             );
@@ -398,7 +451,7 @@ impl Manager {
                 player: s.player,
             });
             let notice = format!("{} reconectou", s.owner);
-            self.notifier.notify("Axis", &notice);
+            self.notify("Axis", &notice);
             return;
         }
         if s.view_only || self.emulation_disabled || self.bus.is_none() {
@@ -423,7 +476,7 @@ impl Manager {
                 s.player = Some(player);
                 log::info!("sessão {session}: novo controle virtual, player {player}");
                 let notice = arrival_message(&s.owner, s.color, player);
-                self.notifier.notify("Axis", &notice);
+                self.notify("Axis", &notice);
             }
             None => {
                 // Sem virtual, o físico não pode continuar oculto.
@@ -473,7 +526,7 @@ impl Manager {
                 log::warn!("não foi possível criar o controle virtual de {id}: {e}");
                 if !self.warned_plug_failure {
                     self.warned_plug_failure = true;
-                    self.notifier.notify(
+                    self.notify(
                         "Axis",
                         &format!(
                             "Não foi possível criar o controle virtual ({e}); o controle fica só em visualização."
@@ -544,7 +597,7 @@ impl Manager {
 
     fn forward_notices(&mut self) {
         for n in self.store.take_notices() {
-            self.notifier.notify("Axis", &n);
+            self.notify("Axis", &n);
         }
     }
 
@@ -631,7 +684,7 @@ impl Manager {
         });
         let profile = self.store.load_profile(&record.active_profile);
         let pipeline = Pipeline::compile(&record.corrections, &profile).unwrap_or_else(|e| {
-            self.notifier.notify(
+            self.notify(
                 "Axis",
                 &format!(
                     "Perfil \"{}\" inválido ({e:?}); usando o padrão",
@@ -647,7 +700,7 @@ impl Manager {
             self.bus.is_none() || family == DeviceFamily::Xbox || self.emulation_disabled;
         if self.bus.is_none() && !self.warned_no_vigem {
             self.warned_no_vigem = true;
-            self.notifier.notify("Axis", NO_VIGEM_NOTICE);
+            self.notify("Axis", NO_VIGEM_NOTICE);
         }
         let mut pad: Option<SharedPad> = None;
         if let Some(i) = grace_index {
@@ -682,7 +735,7 @@ impl Manager {
                 }
                 Err(e) => {
                     log::warn!("não foi possível gravar a lista de ocultos: {e}");
-                    self.notifier.notify(
+                    self.notify(
                         "Axis",
                         &format!(
                             "Não foi possível registrar a ocultação de {}; o controle físico continua visível.",
@@ -701,6 +754,10 @@ impl Manager {
         let number = self.next_session;
         self.next_session += 1;
         let status = Arc::new(Mutex::new(WorkerStatus::default()));
+        // A torneira acompanha a sessão reaproveitada (a interface já a conhece).
+        let tap = grace_index
+            .map(|i| self.sessions[i].tap.clone())
+            .unwrap_or_else(LiveTap::new);
         let link_events = self.events.clone();
         let events = self.events.clone();
         // Xbox (XInput) não manda nada parado: silêncio não indica desligamento.
@@ -723,6 +780,7 @@ impl Manager {
                     up,
                 });
             },
+            tap.clone(),
         );
         let _ = tx.send(WorkerCommand::SetLight {
             lightbar: record.owner_color,
@@ -738,11 +796,10 @@ impl Manager {
         );
         if grace_index.is_some() && !plugged_new {
             if !error_reopen {
-                self.notifier
-                    .notify("Axis", &format!("{} reconectou", record.owner_name));
+                self.notify("Axis", &format!("{} reconectou", record.owner_name));
             }
         } else if let Some(n) = player {
-            self.notifier.notify(
+            self.notify(
                 "Axis",
                 &arrival_message(&record.owner_name, record.owner_color, n),
             );
@@ -762,6 +819,7 @@ impl Manager {
             tx,
             handle: Some(handle),
             status,
+            tap,
             pad,
             generation: 0,
             last_error_reopen: if error_reopen {
@@ -820,6 +878,15 @@ fn load_hidden(store: &ConfigStore) -> (Vec<String>, bool, Vec<String>) {
 }
 
 /// Player (1..) mostrado para o virtual.
+/// Linha do log quando a pausa muda; repetir o mesmo estado não registra nada.
+fn pause_log(was: bool, now: bool) -> Option<&'static str> {
+    match (was, now) {
+        (false, true) => Some("emulação pausada"),
+        (true, false) => Some("emulação retomada"),
+        _ => None,
+    }
+}
+
 fn player_of(pad: &SharedPad) -> u8 {
     let index = pad.lock().unwrap_or_else(|e| e.into_inner()).user_index();
     (index + 1) as u8
@@ -844,6 +911,14 @@ mod tests {
     use std::sync::mpsc::{Receiver, channel};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn pause_log_only_on_change() {
+        assert_eq!(pause_log(false, true), Some("emulação pausada"));
+        assert_eq!(pause_log(true, false), Some("emulação retomada"));
+        assert_eq!(pause_log(true, true), None);
+        assert_eq!(pause_log(false, false), None);
+    }
 
     struct TempDir(PathBuf);
     impl TempDir {
@@ -882,6 +957,7 @@ mod tests {
         scheduler: FakeScheduler,
         unhide_all_fails: Arc<std::sync::atomic::AtomicBool>,
         mgr: Manager,
+        ui: Arc<UiRegistry>,
     }
 
     fn rig(name: &str, with_bus: bool, hide_fails: bool) -> Rig {
@@ -911,6 +987,7 @@ mod tests {
         });
         let notifier = FakeNotifier::default();
         let scheduler = FakeScheduler::default();
+        let ui = UiRegistry::new();
         let (tx, rx) = channel();
         let mgr = Manager::new(ManagerDeps {
             opener: Box::new(opener.clone()),
@@ -920,6 +997,7 @@ mod tests {
             scheduler: Box::new(scheduler.clone()),
             notifier: Box::new(notifier.clone()),
             events: tx,
+            ui: ui.clone(),
         });
         Rig {
             dir,
@@ -933,6 +1011,7 @@ mod tests {
             scheduler,
             unhide_all_fails,
             mgr,
+            ui,
         }
     }
 
@@ -984,6 +1063,49 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].player, Some(1));
         assert!(s[0].connected && !s[0].view_only && !s[0].experimental);
+    }
+
+    #[test]
+    fn manager_publishes_sessions_with_battery_and_tap() {
+        let mut r = rig("ui", true, false);
+        let g0 = r.ui.snapshot().generation;
+        r.opener.add(P1, "aa:01");
+        r.mgr.handle(Event::DeviceArrived(P1.to_string()));
+        let snap = r.ui.snapshot();
+        assert!(snap.generation > g0);
+        assert_eq!(snap.sessions.len(), 1);
+        assert_eq!(snap.sessions[0].owner, "Controle 1");
+        assert_eq!(snap.sessions[0].player, Some(1));
+        assert!(snap.sessions[0].connected);
+        assert_eq!(snap.sessions[0].battery, None);
+        assert!(snap.taps.contains_key(&snap.sessions[0].id));
+        assert!(snap.emulation && !snap.paused);
+        // Os avisos do gerente também chegam à interface.
+        assert!(snap.notices.iter().any(|n| n.contains("Player 1")));
+        // A torneira da interface é a mesma da sessão: sobrevive a um evento sem mudança.
+        let tap = snap.taps[&snap.sessions[0].id].clone();
+        r.mgr.handle(Event::Rescan);
+        assert!(Arc::ptr_eq(
+            &tap,
+            &r.ui.snapshot().taps[&snap.sessions[0].id]
+        ));
+        r.mgr.handle(Event::SetPaused(true));
+        assert!(r.ui.snapshot().paused);
+    }
+
+    #[test]
+    fn start_and_restore_publish_the_real_emulation_state() {
+        let mut r = rig("uiemu", true, false);
+        r.opener.add(P1, "aa:01");
+        let g0 = r.ui.snapshot().generation;
+        r.mgr.start();
+        let snap = r.ui.snapshot();
+        assert!(snap.generation > g0, "start publica o estado");
+        assert!(snap.emulation && !snap.paused);
+        r.mgr.handle(Event::RestoreControllers);
+        let snap = r.ui.snapshot();
+        assert!(!snap.emulation, "depois de restaurar: só visualização");
+        assert!(snap.sessions.iter().all(|s| s.view_only));
     }
 
     #[test]
@@ -1232,6 +1354,19 @@ mod tests {
         assert_eq!(messages(&r).last().unwrap(), "Controle 1 reconectou");
         assert_eq!(messages(&r).len(), 2);
         assert_eq!(r.log.lock().unwrap().len(), 2, "um plug e um hide apenas");
+    }
+
+    #[test]
+    fn reconnect_within_grace_reuses_the_live_tap() {
+        let mut r = one_controller("recon-tap");
+        let tap = r.ui.snapshot().taps["aa:01"].clone();
+        disconnect(&mut r, P1);
+        assert!(!r.ui.snapshot().sessions[0].connected);
+        r.mgr.handle(Event::Rescan);
+        let snap = r.ui.snapshot();
+        assert!(snap.sessions[0].connected);
+        assert!(Arc::ptr_eq(&tap, &snap.taps["aa:01"]));
+        assert!(snap.notices.iter().any(|n| n == "Controle 1 reconectou"));
     }
 
     #[test]

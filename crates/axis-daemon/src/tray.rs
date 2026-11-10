@@ -4,8 +4,9 @@
 //! e do ícone (`Shell_NotifyIconW`). Não é uma janela só de mensagens porque esta
 //! precisa receber difusões (`TaskbarCreated`, fim de sessão) e conseguir o
 //! primeiro plano para o menu fechar direito. Tudo chega por mensagem de janela:
-//! o clique do ícone, as notificações (`WM_APP + 2`) e o fechamento interno
-//! (`WM_APP + 3`). Um `WM_CLOSE` vindo de fora (ex.: `taskkill` sem `/F`) vira
+//! o clique do ícone (botão direito: menu; duplo clique: abrir a interface), as
+//! notificações (`WM_APP + 2`) e o fechamento interno (`WM_APP + 3`). Um
+//! `WM_CLOSE` vindo de fora (ex.: `taskkill` sem `/F`) vira
 //! `Quit` no gerente; a janela só é destruída quando `main` fecha a bandeja.
 
 use std::cell::Cell;
@@ -22,13 +23,14 @@ use windows_sys::Win32::UI::Shell::{
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ENDSESSION, WM_NCCREATE,
-    WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW,
+    GetWindowLongPtrW, IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+    MSG, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+    SetForegroundWindow, SetMenuDefaultItem, SetWindowLongPtrW, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 use crate::manager::SessionView;
@@ -77,6 +79,7 @@ pub(crate) const ID_PAUSE: u32 = 1;
 pub(crate) const ID_RESTORE: u32 = 2;
 pub(crate) const ID_AUTOSTART: u32 = 3;
 pub(crate) const ID_QUIT: u32 = 4;
+pub(crate) const ID_OPEN: u32 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayCommand {
@@ -85,6 +88,8 @@ pub enum TrayCommand {
     Restore,
     ToggleAutostart,
     Quit,
+    /// Abrir a interface (ou trazê-la para frente, se já estiver aberta).
+    OpenUi,
 }
 
 /// Linha do menu de contexto (independente do Win32, para poder testar).
@@ -96,7 +101,27 @@ pub(crate) enum MenuItem {
         /// `0` = linha informativa, desabilitada.
         id: u32,
         checked: bool,
+        /// Item padrão do menu (em negrito, `MFS_DEFAULT`).
+        default: bool,
     },
+}
+
+/// O que um evento do mouse no ícone da bandeja faz.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClickAction {
+    /// Mostra o menu de contexto.
+    Menu,
+    /// Abre a interface (o mesmo que o item padrão do menu).
+    Open,
+}
+
+/// Traduz o evento do mouse recebido em `WM_TRAY` (`lParam` baixo).
+pub(crate) fn click_action(event: u32) -> Option<ClickAction> {
+    match event {
+        WM_RBUTTONUP => Some(ClickAction::Menu),
+        WM_LBUTTONDBLCLK => Some(ClickAction::Open),
+        _ => None,
+    }
 }
 
 /// Texto da linha de uma sessão no menu.
@@ -117,13 +142,23 @@ pub(crate) fn menu_items(sessions: &[SessionView], paused: bool, autostart: bool
         label,
         id: 0,
         checked: false,
+        default: false,
     };
     let action = |label: &str, id: u32, checked: bool| MenuItem::Entry {
         label: label.to_string(),
         id,
         checked,
+        default: false,
     };
-    let mut items = vec![info("Axis".to_string())];
+    let mut items = vec![
+        info("Axis".to_string()),
+        MenuItem::Entry {
+            label: "Abrir o Axis".to_string(),
+            id: ID_OPEN,
+            checked: false,
+            default: true,
+        },
+    ];
     items.extend(sessions.iter().map(|s| info(session_label(s))));
     items.push(MenuItem::Separator);
     let pause = if paused {
@@ -146,6 +181,7 @@ pub(crate) fn command_for(id: u32, paused: bool) -> Option<TrayCommand> {
         ID_RESTORE => Some(TrayCommand::Restore),
         ID_AUTOSTART => Some(TrayCommand::ToggleAutostart),
         ID_QUIT => Some(TrayCommand::Quit),
+        ID_OPEN => Some(TrayCommand::OpenUi),
         _ => None,
     }
 }
@@ -265,6 +301,8 @@ fn run(state: Box<TrayState>, ready: mpsc::Sender<isize>) {
         let instance = GetModuleHandleW(std::ptr::null());
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
+            // Duplo clique no ícone (o Shell repassa WM_LBUTTONDBLCLK em WM_TRAY).
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance,
             lpszClassName: class.as_ptr(),
@@ -372,9 +410,10 @@ unsafe extern "system" fn wnd_proc(
     };
     match msg {
         WM_TRAY => {
-            let event = (lparam as u32) & 0xFFFF;
-            if event == WM_RBUTTONUP {
-                show_menu(hwnd, state);
+            match click_action((lparam as u32) & 0xFFFF) {
+                Some(ClickAction::Menu) => show_menu(hwnd, state),
+                Some(ClickAction::Open) => run_command(state, ID_OPEN),
+                None => {}
             }
             0
         }
@@ -469,7 +508,12 @@ fn show_menu(hwnd: HWND, state: &TrayState) {
                 MenuItem::Separator => {
                     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
                 }
-                MenuItem::Entry { label, id, checked } => {
+                MenuItem::Entry {
+                    label,
+                    id,
+                    checked,
+                    default,
+                } => {
                     let mut flags = MF_STRING;
                     if *id == 0 {
                         flags |= MF_GRAYED;
@@ -479,6 +523,10 @@ fn show_menu(hwnd: HWND, state: &TrayState) {
                     }
                     let text = wide(label);
                     AppendMenuW(menu, flags, *id as usize, text.as_ptr());
+                    if *default {
+                        // Negrito (MFS_DEFAULT); 0 = `id` é um identificador, não posição.
+                        SetMenuDefaultItem(menu, *id, 0);
+                    }
                 }
             }
         }
@@ -521,6 +569,7 @@ fn run_command(state: &TrayState, id: u32) {
 mod tests {
     use super::*;
     use axis_core::DeviceFamily;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONUP, WM_MOUSEMOVE};
 
     fn view(player: Option<u8>, connected: bool, view_only: bool) -> SessionView {
         SessionView {
@@ -565,6 +614,7 @@ mod tests {
             labels,
             [
                 "Axis",
+                "Abrir o Axis",
                 "Maria — Player 2",
                 "-",
                 "Pausar emulação",
@@ -585,7 +635,40 @@ mod tests {
     }
 
     #[test]
+    fn menu_items_include_open_first() {
+        for sessions in [vec![], vec![view(Some(1), true, false)]] {
+            let items = menu_items(&sessions, false, false);
+            assert!(matches!(&items[0], MenuItem::Entry { label, id: 0, .. } if label == "Axis"));
+            assert_eq!(
+                items[1],
+                MenuItem::Entry {
+                    label: "Abrir o Axis".into(),
+                    id: ID_OPEN,
+                    checked: false,
+                    default: true,
+                }
+            );
+            // Só a abertura é o item padrão (negrito).
+            let defaults = items
+                .iter()
+                .filter(|i| matches!(i, MenuItem::Entry { default: true, .. }))
+                .count();
+            assert_eq!(defaults, 1);
+        }
+    }
+
+    #[test]
+    fn double_click_maps_to_open() {
+        assert_eq!(click_action(WM_LBUTTONDBLCLK), Some(ClickAction::Open));
+        assert_eq!(click_action(WM_RBUTTONUP), Some(ClickAction::Menu));
+        assert_eq!(click_action(WM_LBUTTONUP), None);
+        assert_eq!(click_action(WM_MOUSEMOVE), None);
+    }
+
+    #[test]
     fn command_ids_map_with_pause_state() {
+        assert_eq!(command_for(ID_OPEN, false), Some(TrayCommand::OpenUi));
+        assert_eq!(command_for(ID_OPEN, true), Some(TrayCommand::OpenUi));
         assert_eq!(command_for(ID_PAUSE, false), Some(TrayCommand::Pause));
         assert_eq!(command_for(ID_PAUSE, true), Some(TrayCommand::Resume));
         assert_eq!(command_for(ID_RESTORE, false), Some(TrayCommand::Restore));
