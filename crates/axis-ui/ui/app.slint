@@ -1,6 +1,7 @@
 import { Tokens } from "tokens.slint";
 import { AccentData, Kicker, NavItem, PadCard, PadCardData, PrimaryButton, SegmentButton, Swatch, WindowButton } from "components.slint";
-export { Tokens, PadCardData, AccentData }
+import { LiveData, Overview, OverviewHeader } from "overview.slint";
+export { Tokens, PadCardData, AccentData, LiveData, OverviewHeader }
 
 /// Tela sobre o conteúdo enquanto não há conexão com o núcleo.
 component ConnectionScreen inherits Rectangle {
@@ -153,10 +154,10 @@ component Sidebar inherits Rectangle {
         padding-top: Tokens.space-m;
         spacing: Tokens.space-xxs;
 
-        NavItem { label: "Visão geral"; key: "1"; active: true; }
-        NavItem { label: "Mapeamento"; key: "2"; enabled: false; }
-        NavItem { label: "Correção"; key: "3"; enabled: false; }
-        NavItem { label: "Perfis"; key: "4"; enabled: false; }
+        NavItem { label: "Visão geral"; active: true; }
+        NavItem { label: "Mapeamento"; enabled: false; }
+        NavItem { label: "Correção"; enabled: false; }
+        NavItem { label: "Perfis"; enabled: false; }
 
         Rectangle { height: Tokens.space-l; }
         Kicker { text: "CONTROLES"; }
@@ -227,6 +228,16 @@ export component App inherits Window {
     in property <string> selected-id;
     in property <[AccentData]> accents;
     in-out property <int> accent-index: 0;
+    // Visão geral do controle selecionado.
+    in property <bool> has-pad;
+    in property <OverviewHeader> header;
+    /// 0 DualShock 4, 1 DualSense, 2 Xbox.
+    in property <int> family;
+    in property <bool> emulating;
+    in property <bool> pad-connected;
+    in property <bool> has-live;
+    in property <string> stage-status;
+    in property <LiveData> live;
     callback start-daemon();
     callback select-pad(string);
     callback minimize();
@@ -239,6 +250,8 @@ export component App inherits Window {
     default-font-family: Tokens.font-body;
     preferred-width: 1100px;
     preferred-height: 720px;
+    min-width: 1100px;
+    min-height: 700px;
 
     VerticalLayout {
         TitleBar {
@@ -258,8 +271,17 @@ export component App inherits Window {
                     accent-index <=> root.accent-index;
                     select-pad(id) => { root.select-pad(id); }
                 }
-                // Conteúdo da tela escolhida (Visão geral: próxima tarefa).
-                Rectangle { }
+                Overview {
+                    horizontal-stretch: 1;
+                    has-pad: root.has-pad;
+                    header: root.header;
+                    family: root.family;
+                    emulating: root.emulating;
+                    connected: root.pad-connected;
+                    has-live: root.has-live;
+                    stage-status: root.stage-status;
+                    live: root.live;
+                }
             }
 
             if root.connection != 1: ConnectionScreen {

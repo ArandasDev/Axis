@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use axis_protocol::{ClientMsg, Family, SessionInfo};
+use axis_protocol::{ClientMsg, Family, LiveFrame, PadState, SessionInfo, StickStages};
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use client::{Client, UiUpdate};
@@ -28,6 +28,12 @@ struct Shell {
     /// Cartões mostrados agora; o modelo só é recriado quando mudam.
     cards: Vec<PadCard>,
     selected: Option<String>,
+    /// Última lista do núcleo (para o cabeçalho e para filtrar quadros).
+    sessions: Vec<SessionInfo>,
+    /// O núcleo tem barramento virtual (do `Connected`).
+    emulation: bool,
+    /// Já chegou um quadro do controle selecionado desde a seleção.
+    has_live: bool,
 }
 
 thread_local! {
@@ -56,6 +62,7 @@ fn main() -> Result<(), slint::PlatformError> {
         for update in demo_updates() {
             apply(&app, update, false);
         }
+        let _live = demo_live(&app);
         return app.run();
     }
 
@@ -152,8 +159,114 @@ fn set_connection(app: &App, c: Connection) {
 }
 
 fn refresh_status(app: &App) {
-    let count = SHELL.with(|s| s.borrow().cards.len());
-    app.set_status(view::status_line(app.get_paused(), count).into());
+    let (emulation, count) = SHELL.with(|s| {
+        let s = s.borrow();
+        (s.emulation, view::connected_count(&s.sessions))
+    });
+    app.set_status(view::status_line(app.get_paused(), emulation, count).into());
+}
+
+/// Cabeçalho e palco do controle selecionado (fora do caminho de 60 Hz).
+fn refresh_overview(app: &App) {
+    SHELL.with(|s| {
+        let mut s = s.borrow_mut();
+        let found = s
+            .selected
+            .as_deref()
+            .and_then(|id| s.sessions.iter().enumerate().find(|(_, x)| x.id == id));
+        let Some((index, session)) = found else {
+            app.set_has_pad(false);
+            return;
+        };
+        let h = view::header(index, session, s.emulation);
+        app.set_has_pad(true);
+        app.set_header(OverviewHeader {
+            kicker: h.kicker.into(),
+            title: h.title.into(),
+            subtitle: h.subtitle.into(),
+        });
+        app.set_family(match session.family {
+            Family::DualShock4 => 0,
+            Family::DualSense => 1,
+            Family::Xbox => 2,
+        });
+        app.set_emulating(s.emulation && !session.view_only);
+        let connected = session.connected;
+        app.set_pad_connected(connected);
+        if !connected {
+            // Reconectando: palco esmaecido e valores em neutro.
+            s.has_live = false;
+            app.set_live(neutral_live());
+        }
+        app.set_has_live(s.has_live);
+        app.set_stage_status(view::stage_status(connected, s.has_live).into());
+    });
+}
+
+/// Palco parado: analógicos no centro, gatilhos soltos, métricas sem dado.
+fn neutral_live() -> LiveData {
+    let rest = PadState::default();
+    live_data(&LiveFrame {
+        id: String::new(),
+        input: rest,
+        output: rest,
+        left: StickStages::default(),
+        right: StickStages::default(),
+        rate_hz: 0,
+        latency_p99_us: 0,
+        battery: None,
+        charging: false,
+    })
+}
+
+fn live_data(f: &LiveFrame) -> LiveData {
+    let [calibration_on, drift_on, deadzone_on, curve_on, anti_on] = view::active_stages(&f.left);
+    let (i, o) = (&f.input, &f.output);
+    LiveData {
+        lx: o.lx,
+        ly: o.ly,
+        rx: o.rx,
+        ry: o.ry,
+        l2: o.l2,
+        r2: o.r2,
+        // Só os 16 bits de botões existem; o resto é descartado.
+        buttons: (o.buttons & 0xffff) as i32,
+        in_x: i.lx,
+        in_y: i.ly,
+        out_x: o.lx,
+        out_y: o.ly,
+        l2_text: view::percent_text(o.l2).into(),
+        r2_text: view::percent_text(o.r2).into(),
+        left_text: view::stick_text(o.lx, o.ly).into(),
+        right_text: view::stick_text(o.rx, o.ry).into(),
+        in_text: view::stick_text(i.lx, i.ly).into(),
+        out_text: view::stick_text(o.lx, o.ly).into(),
+        latency: view::latency_text(f.latency_p99_us).into(),
+        rate: view::rate_text(f.rate_hz).into(),
+        battery: view::battery_text(f.battery).into(),
+        calibration_on,
+        drift_on,
+        deadzone_on,
+        curve_on,
+        anti_on,
+    }
+}
+
+/// Um quadro ao vivo: só propriedades, nada de recriar modelos.
+fn show_live(app: &App, frame: &LiveFrame) {
+    let first = SHELL.with(|s| {
+        let mut s = s.borrow_mut();
+        if !view::live_accepted(s.selected.as_deref(), &s.sessions, &frame.id) {
+            return None;
+        }
+        Some(!std::mem::replace(&mut s.has_live, true))
+    });
+    let Some(first) = first else { return };
+    app.set_live(live_data(frame));
+    if first {
+        app.set_has_live(true);
+        app.set_stage_status(view::stage_status(true, true).into());
+    }
 }
 
 /// Seleciona um controle e pede ao núcleo os quadros ao vivo dele.
@@ -162,12 +275,17 @@ fn select(app: &App, id: Option<String>) {
         let mut s = s.borrow_mut();
         let changed = s.selected != id;
         s.selected = id.clone();
+        if changed {
+            s.has_live = false;
+        }
         changed
     });
     if changed {
         app.set_selected_id(id.clone().unwrap_or_default().into());
+        app.set_live(neutral_live());
         send(ClientMsg::Inspect { id });
     }
+    refresh_overview(app);
 }
 
 fn show_sessions(app: &App, sessions: &[SessionInfo]) {
@@ -179,6 +297,7 @@ fn show_sessions(app: &App, sessions: &[SessionInfo]) {
             app.set_pads(ModelRc::from(Rc::new(VecModel::from(model))));
             s.cards = cards;
         }
+        s.sessions = sessions.to_vec();
         s.selected.clone()
     });
     select(app, view::next_selection(current.as_deref(), sessions));
@@ -197,11 +316,13 @@ fn card_data(c: &PadCard) -> PadCardData {
 
 fn apply(app: &App, update: UiUpdate, first_failure: bool) {
     match update {
-        UiUpdate::Connected { paused, .. } => {
+        UiUpdate::Connected { paused, emulation } => {
             set_connection(app, Connection::Connected);
             // O estado do núcleo é a verdade: nada de alternar localmente.
             app.set_paused(paused);
+            SHELL.with(|s| s.borrow_mut().emulation = emulation);
             refresh_status(app);
+            refresh_overview(app);
             // Conexão nova não sabe o que inspecionávamos: pede de novo.
             let selected = SHELL.with(|s| s.borrow().selected.clone());
             if selected.is_some() {
@@ -217,8 +338,9 @@ fn apply(app: &App, update: UiUpdate, first_failure: bool) {
             }
         }
         UiUpdate::Sessions(sessions) => show_sessions(app, &sessions),
-        // Quadros ao vivo e avisos: telas das próximas tarefas.
-        UiUpdate::Live(_) | UiUpdate::Notice(_) => {}
+        UiUpdate::Live(frame) => show_live(app, &frame),
+        // Avisos: tela de uma próxima tarefa.
+        UiUpdate::Notice(_) => {}
     }
 }
 
@@ -283,4 +405,83 @@ fn start_and_wait(app: &App) {
             set_connection(&app, Connection::Stopped);
         }
     });
+}
+
+/// Modo demo: quadros sintéticos a ~60 Hz para o controle selecionado, para o
+/// palco parecer vivo na captura. O temporizador vive enquanto o valor viver.
+fn demo_live(app: &App) -> slint::Timer {
+    let timer = slint::Timer::default();
+    let weak = app.as_weak();
+    let start = std::time::Instant::now();
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(16),
+        move || {
+            let Some(app) = weak.upgrade() else { return };
+            let Some(id) = SHELL.with(|s| s.borrow().selected.clone()) else {
+                return;
+            };
+            let frame = demo_frame(id, start.elapsed().as_secs_f32());
+            apply(&app, UiUpdate::Live(frame), false);
+        },
+    );
+    timer
+}
+
+/// Analógico esquerdo em círculo lento com drift corrigido e curva; direito
+/// em oito; gatilhos oscilando; um botão por segundo.
+fn demo_frame(id: String, t: f32) -> LiveFrame {
+    use std::f32::consts::TAU;
+    let a = t * TAU / 4.0;
+    let raw = [0.72 * a.cos() + 0.03, 0.72 * a.sin() - 0.02];
+    let drift = [raw[0] - 0.03, raw[1] + 0.02];
+    let r = drift[0].hypot(drift[1]).max(f32::EPSILON);
+    let k = r.powf(1.4) / r;
+    let curve = [drift[0] * k, drift[1] * k];
+    let left = StickStages {
+        raw,
+        calibrated: raw,
+        drift,
+        deadzone: drift,
+        curve,
+        anti: curve,
+    };
+    let rp = [0.5 * (1.3 * a).sin(), 0.35 * (2.6 * a).sin()];
+    let right = StickStages {
+        raw: rp,
+        calibrated: rp,
+        drift: rp,
+        deadzone: rp,
+        curve: rp,
+        anti: rp,
+    };
+    const CYCLE: [u32; 6] = [0, 1, 3, 2, 12, 15];
+    let buttons = if t.fract() < 0.35 {
+        1 << CYCLE[t as usize % CYCLE.len()]
+    } else {
+        0
+    };
+    let pad = |l: &StickStages, r: &StickStages, pick: fn(&StickStages) -> [f32; 2]| {
+        let (pl, pr) = (pick(l), pick(r));
+        PadState {
+            lx: pl[0],
+            ly: pl[1],
+            rx: pr[0],
+            ry: pr[1],
+            l2: ((t * 1.7).sin() + 1.0) / 2.0,
+            r2: (t * 0.9).sin().max(0.0),
+            buttons,
+        }
+    };
+    LiveFrame {
+        id,
+        input: pad(&left, &right, |s| s.raw),
+        output: pad(&left, &right, |s| s.anti),
+        left,
+        right,
+        rate_hz: 1000,
+        latency_p99_us: 48 + (6.0 * (t * 0.7).sin().abs()) as u32,
+        battery: Some(64),
+        charging: false,
+    }
 }

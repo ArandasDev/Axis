@@ -1,0 +1,584 @@
+import { Tokens } from "tokens.slint";
+import { Kicker } from "components.slint";
+import { ControllerArt } from "controller-art.slint";
+
+/// Cabeçalho do controle selecionado (de `view::header`).
+export struct OverviewHeader {
+    kicker: string,
+    title: string,
+    subtitle: string,
+}
+
+/// Um quadro ao vivo já convertido para a tela (de `LiveFrame`).
+export struct LiveData {
+    lx: float,
+    ly: float,
+    rx: float,
+    ry: float,
+    l2: float,
+    r2: float,
+    buttons: int,
+    in-x: float,
+    in-y: float,
+    out-x: float,
+    out-y: float,
+    l2-text: string,
+    r2-text: string,
+    left-text: string,
+    right-text: string,
+    in-text: string,
+    out-text: string,
+    latency: string,
+    rate: string,
+    battery: string,
+    calibration-on: bool,
+    drift-on: bool,
+    deadzone-on: bool,
+    curve-on: bool,
+    anti-on: bool,
+}
+
+/// Título de painel em Barlow Condensed, caixa alta.
+component PanelTitle inherits Text {
+    font-family: Tokens.font-heading;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    color: Tokens.text;
+}
+
+/// Linha pontilhada horizontal (o `Path` não tem tracejado).
+component DottedH inherits Rectangle {
+    height: 1px;
+    for i in max(0, floor(self.width / 6px)): Rectangle {
+        x: i * 6px;
+        y: 0;
+        width: 2px;
+        height: 1px;
+        background: Tokens.muted;
+    }
+}
+
+component DottedV inherits Rectangle {
+    width: 1px;
+    for i in max(0, floor(self.height / 6px)): Rectangle {
+        x: 0;
+        y: i * 6px;
+        width: 1px;
+        height: 2px;
+        background: Tokens.muted;
+    }
+}
+
+/// Chamada do palco: nome e valor, alinhados ao canto em que está.
+component Callout inherits Rectangle {
+    in property <string> title;
+    in property <string> value;
+    in property <bool> right-side;
+    /// Largura reservada ao valor, para a linha não tremer com os números.
+    in property <length> value-width;
+
+    width: max(name.preferred-width, root.value-width) + Tokens.space-s;
+    height: 34px;
+
+    VerticalLayout {
+        alignment: center;
+        name := Text {
+            text: root.title;
+            font-family: Tokens.font-heading;
+            font-size: 15px;
+            font-weight: 600;
+            color: Tokens.text;
+            horizontal-alignment: root.right-side ? right : left;
+        }
+        Text {
+            text: root.value;
+            font-size: 12px;
+            color: Tokens.muted;
+            horizontal-alignment: root.right-side ? right : left;
+        }
+    }
+}
+
+/// Pílula de etapa da cadeia do analógico.
+component Pill inherits Rectangle {
+    in property <string> label;
+    in property <bool> on;
+
+    height: 22px;
+    width: t.preferred-width + 2 * Tokens.space-s;
+    border-radius: Tokens.radius-pill;
+    border-width: 1px;
+    border-color: on ? Tokens.accent : Tokens.divider;
+    background: on ? Tokens.accent-soft : transparent;
+    accessible-role: text;
+    accessible-label: label + (on ? " (ativa)" : "");
+
+    t := Text {
+        text: root.label;
+        font-size: 11px;
+        color: root.on ? Tokens.accent : Tokens.muted;
+    }
+}
+
+/// Plano de um analógico: eixos, círculo de alcance e o ponto.
+component Plot inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <float> px;
+    in property <float> py;
+
+    spacing: Tokens.space-xs;
+
+    Rectangle {
+        height: self.width;
+        border-radius: Tokens.radius-card;
+        border-width: 1px;
+        border-color: Tokens.divider;
+
+        Rectangle {
+            width: 1px;
+            height: parent.height;
+            background: Tokens.divider;
+        }
+        Rectangle {
+            width: parent.width;
+            height: 1px;
+            background: Tokens.divider;
+        }
+        Rectangle {
+            width: parent.width * 0.86;
+            height: self.width;
+            border-radius: self.width / 2;
+            border-width: 1px;
+            border-color: Tokens.divider;
+        }
+        Rectangle {
+            x: parent.width / 2 - 4px + max(-1, min(1, root.px)) * parent.width * 0.43;
+            y: parent.height / 2 - 4px - max(-1, min(1, root.py)) * parent.height * 0.43;
+            width: 8px;
+            height: 8px;
+            border-radius: self.width / 2;
+            background: Tokens.accent;
+        }
+    }
+    Text {
+        text: root.label;
+        font-size: 11px;
+        color: Tokens.muted;
+    }
+    Text {
+        text: root.value;
+        font-size: 12px;
+        color: Tokens.text;
+    }
+}
+
+/// Uma métrica: nome à esquerda, valor à direita.
+component Metric inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+
+    Text {
+        text: root.label;
+        font-size: 12px;
+        color: Tokens.muted;
+        vertical-alignment: center;
+    }
+    Rectangle { }
+    Text {
+        text: root.value;
+        font-family: Tokens.font-heading;
+        font-size: 20px;
+        font-weight: 600;
+        color: Tokens.text;
+        vertical-alignment: center;
+    }
+}
+
+/// Barra de gatilho.
+component Bar inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value-text;
+    in property <float> value;
+
+    spacing: Tokens.space-s;
+    height: 18px;
+
+    Text {
+        text: root.label;
+        width: 22px;
+        font-size: 12px;
+        color: Tokens.muted;
+        vertical-alignment: center;
+    }
+    VerticalLayout {
+        alignment: center;
+        Rectangle {
+            height: 6px;
+            border-radius: self.height / 2;
+            background: Tokens.hover;
+            Rectangle {
+                x: 0;
+                width: parent.width * max(0, min(1, root.value));
+                height: parent.height;
+                border-radius: parent.border-radius;
+                background: Tokens.accent;
+            }
+        }
+    }
+    Text {
+        text: root.value-text;
+        width: 38px;
+        font-size: 12px;
+        color: Tokens.text;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+}
+
+/// Painel com a borda por cima (o renderizador por software apaga um ponto da
+/// borda de um painel arredondado com `clip`).
+component Panel inherits Rectangle {
+    border-radius: Tokens.radius-panel;
+    background: Tokens.surface;
+
+    @children
+
+    Rectangle {
+        border-radius: Tokens.radius-panel;
+        border-width: 1px;
+        border-color: Tokens.divider;
+    }
+}
+
+/// Palco: grade, desenho do controle ao vivo e chamadas pontilhadas.
+component Stage inherits Panel {
+    in property <int> family;
+    in property <bool> emulating;
+    in property <bool> connected;
+    in property <bool> has-live;
+    in property <string> status;
+    in property <LiveData> live;
+
+    // Grade de 24 px, recortada nos cantos arredondados.
+    Rectangle {
+        border-radius: Tokens.radius-panel;
+        clip: true;
+        for i in floor(parent.width / Tokens.space-l): Rectangle {
+            x: (i + 1) * Tokens.space-l;
+            y: 0;
+            width: 1px;
+            height: parent.height;
+            background: Tokens.grid;
+        }
+        for j in floor(parent.height / Tokens.space-l): Rectangle {
+            x: 0;
+            y: (j + 1) * Tokens.space-l;
+            width: parent.width;
+            height: 1px;
+            background: Tokens.grid;
+        }
+    }
+
+    VerticalLayout {
+        Rectangle {
+            height: 46px;
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Tokens.divider;
+            }
+            HorizontalLayout {
+                padding-left: Tokens.space-m;
+                padding-right: Tokens.space-m;
+                spacing: Tokens.space-s;
+                PanelTitle {
+                    text: "SAÍDA VIRTUAL";
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.emulating ? "Xbox 360" : "nenhuma";
+                    font-size: 13px;
+                    color: root.emulating ? Tokens.text : Tokens.muted;
+                    vertical-alignment: center;
+                }
+                if root.emulating: VerticalLayout {
+                    alignment: center;
+                    Pill {
+                        label: "XInput";
+                        on: true;
+                    }
+                }
+                Rectangle { }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: self.width / 2;
+                        background: root.has-live && root.connected ? Tokens.accent : Tokens.muted;
+                    }
+                }
+                Text {
+                    text: root.status;
+                    font-size: 12px;
+                    color: root.has-live && root.connected ? Tokens.text : Tokens.muted;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        area := Rectangle {
+            // Faixas de cima e de baixo para as chamadas.
+            property <length> band: 48px;
+            property <length> edge: Tokens.space-m;
+            property <float> k: max(0.3, min(1.35, (self.width - 2 * edge) / 560px, (self.height - 2 * band) / 340px));
+
+            opacity: root.connected ? 1 : Tokens.dimmed;
+
+            art := ControllerArt {
+                x: (parent.width - self.width) / 2;
+                y: area.band + (parent.height - 2 * area.band - self.height) / 2;
+                k: area.k;
+                family: root.family;
+                lx: root.live.lx;
+                ly: root.live.ly;
+                rx: root.live.rx;
+                ry: root.live.ry;
+                l2: root.live.l2;
+                r2: root.live.r2;
+                buttons: root.live.buttons;
+            }
+
+            // L2: canto de cima à esquerda, desce até o gatilho.
+            l2c := Callout {
+                x: area.edge;
+                y: (area.band - self.height) / 2;
+                title: root.family == 2 ? "LT" : "L2";
+                value: root.live.l2-text;
+                value-width: 32px;
+            }
+            DottedH {
+                x: l2c.x + l2c.width;
+                y: l2c.y + l2c.height / 2;
+                width: max(0, art.x + art.l2-ax - self.x);
+            }
+            DottedV {
+                x: art.x + art.l2-ax;
+                y: l2c.y + l2c.height / 2;
+                height: max(0, art.y + art.trigger-ay - self.y);
+            }
+
+            r2c := Callout {
+                x: parent.width - area.edge - self.width;
+                y: (area.band - self.height) / 2;
+                title: root.family == 2 ? "RT" : "R2";
+                value: root.live.r2-text;
+                value-width: 32px;
+                right-side: true;
+            }
+            DottedH {
+                x: art.x + art.r2-ax;
+                y: r2c.y + r2c.height / 2;
+                width: max(0, r2c.x - self.x);
+            }
+            DottedV {
+                x: art.x + art.r2-ax;
+                y: r2c.y + r2c.height / 2;
+                height: max(0, art.y + art.trigger-ay - self.y);
+            }
+
+            // Analógicos: cantos de baixo, sobem até a base de cada um.
+            lsc := Callout {
+                x: area.edge;
+                y: parent.height - area.band + (area.band - self.height) / 2;
+                title: "Analógico esq.";
+                value: root.live.left-text;
+                value-width: 80px;
+            }
+            DottedH {
+                x: lsc.x + lsc.width;
+                y: lsc.y + lsc.height / 2;
+                width: max(0, art.x + art.ls-ax - self.x);
+            }
+            DottedV {
+                x: art.x + art.ls-ax;
+                y: art.y + art.ls-ay;
+                height: max(0, lsc.y + lsc.height / 2 - self.y);
+            }
+
+            rsc := Callout {
+                x: parent.width - area.edge - self.width;
+                y: parent.height - area.band + (area.band - self.height) / 2;
+                title: "Analógico dir.";
+                value: root.live.right-text;
+                value-width: 80px;
+                right-side: true;
+            }
+            DottedH {
+                x: art.x + art.rs-ax;
+                y: rsc.y + rsc.height / 2;
+                width: max(0, rsc.x - self.x);
+            }
+            DottedV {
+                x: art.x + art.rs-ax;
+                y: art.y + art.rs-ay;
+                height: max(0, rsc.y + rsc.height / 2 - self.y);
+            }
+        }
+    }
+}
+
+/// Visão geral do controle selecionado.
+export component Overview inherits Rectangle {
+    in property <bool> has-pad;
+    in property <OverviewHeader> header;
+    in property <int> family;
+    in property <bool> emulating;
+    in property <bool> connected;
+    in property <bool> has-live;
+    in property <string> stage-status;
+    in property <LiveData> live;
+    // Coluna das métricas e os dois planos lado a lado dentro dela.
+    property <length> side-width: 280px;
+    property <length> plot-size: (side-width - 2 * Tokens.space-m - Tokens.space-sm) / 2;
+
+    if !root.has-pad: Text {
+        text: "Conecte um controle para ver a Visão geral";
+        color: Tokens.muted;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if root.has-pad: VerticalLayout {
+        padding: Tokens.space-l;
+        spacing: Tokens.space-m;
+
+        VerticalLayout {
+            spacing: Tokens.space-xs;
+            Kicker { text: root.header.kicker; }
+            Text {
+                text: root.header.title;
+                font-family: Tokens.font-heading;
+                font-size: 38px;
+                font-weight: 600;
+                color: Tokens.text;
+                overflow: elide;
+            }
+            Text {
+                text: root.header.subtitle;
+                font-size: 13px;
+                color: Tokens.muted;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Tokens.space-m;
+
+            Stage {
+                horizontal-stretch: 1;
+                family: root.family;
+                emulating: root.emulating;
+                connected: root.connected;
+                has-live: root.has-live;
+                status: root.stage-status;
+                live: root.live;
+            }
+
+            VerticalLayout {
+                width: root.side-width;
+                spacing: Tokens.space-m;
+
+                Panel {
+                    vertical-stretch: 0;
+                    VerticalLayout {
+                        padding: Tokens.space-m;
+                        spacing: Tokens.space-s;
+                        PanelTitle { text: "MÉTRICAS"; }
+                        Metric {
+                            label: "Latência (p99)";
+                            value: root.live.latency;
+                        }
+                        Metric {
+                            label: "Polling";
+                            value: root.live.rate;
+                        }
+                        Metric {
+                            label: "Bateria";
+                            value: root.live.battery;
+                        }
+                        Rectangle { height: Tokens.space-xs; }
+                        Bar {
+                            label: root.family == 2 ? "LT" : "L2";
+                            value: root.live.l2;
+                            value-text: root.live.l2-text;
+                        }
+                        Bar {
+                            label: root.family == 2 ? "RT" : "R2";
+                            value: root.live.r2;
+                            value-text: root.live.r2-text;
+                        }
+                    }
+                }
+
+                Panel {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: Tokens.space-m;
+                        spacing: Tokens.space-sm;
+                        HorizontalLayout {
+                            spacing: Tokens.space-s;
+                            alignment: start;
+                            PanelTitle { text: "SEU CONTROLE"; }
+                            VerticalLayout {
+                                alignment: center;
+                                Path {
+                                    width: 14px;
+                                    height: 8px;
+                                    viewbox-width: 14;
+                                    viewbox-height: 8;
+                                    stroke: Tokens.text;
+                                    stroke-width: 1.2px;
+                                    commands: "M 0 4 L 13 4 M 9.5 0.5 L 13 4 L 9.5 7.5";
+                                }
+                            }
+                            PanelTitle { text: "O JOGO RECEBE"; }
+                        }
+                        HorizontalLayout {
+                            spacing: Tokens.space-sm;
+                            Plot {
+                                width: root.plot-size;
+                                label: "Entrada (esq.)";
+                                value: root.live.in-text;
+                                px: root.live.in-x;
+                                py: root.live.in-y;
+                            }
+                            Plot {
+                                width: root.plot-size;
+                                label: "Saída (esq.)";
+                                value: root.live.out-text;
+                                px: root.live.out-x;
+                                py: root.live.out-y;
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: Tokens.space-xs + Tokens.space-xxs;
+                            alignment: start;
+                            Pill { label: "calibração"; on: root.live.calibration-on; }
+                            Pill { label: "drift"; on: root.live.drift-on; }
+                            Pill { label: "deadzone"; on: root.live.deadzone-on; }
+                        }
+                        HorizontalLayout {
+                            spacing: Tokens.space-xs + Tokens.space-xxs;
+                            alignment: start;
+                            Pill { label: "curva"; on: root.live.curve-on; }
+                            Pill { label: "anti"; on: root.live.anti-on; }
+                        }
+                        Rectangle { vertical-stretch: 1; }
+                    }
+                }
+            }
+        }
+    }
+}

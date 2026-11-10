@@ -53,7 +53,6 @@ export component Kicker inherits Text {
 /// Item da navegação; desabilitado mostra "em breve" e não responde.
 export component NavItem inherits Rectangle {
     in property <string> label;
-    in property <string> key;
     in property <bool> active;
     in property <bool> enabled: true;
     callback clicked();
@@ -80,8 +79,8 @@ export component NavItem inherits Rectangle {
             vertical-alignment: center;
         }
         Rectangle { }
-        Text {
-            text: root.enabled ? root.key : "em breve";
+        if !root.enabled: Text {
+            text: "em breve";
             color: Tokens.muted;
             font-size: 11px;
             vertical-alignment: center;
