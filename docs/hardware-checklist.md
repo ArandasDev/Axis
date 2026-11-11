@@ -31,7 +31,8 @@ Um controle passa a ser **verificado** (e perde o selo "experimental" na interfa
 
 **Pontos de atenção encontrados:**
 - O Windows entrega os reports Bluetooth com **128 bytes** (preenchidos). Um report reduzido `0x01` (que aparece antes do feature `0x05`, ou em clones que ficam no modo reduzido) passaria do limite de 31 bytes e mostraria **bateria 0%** a partir do preenchimento. Tratar no plano 4 (ignorar bateria no `0x01` vindo do Bluetooth).
-- Os outros dois DS4 do autor ainda não tiveram o MAC lido. Se dois clones informarem o mesmo MAC, as identidades colidem (o código só rejeita MACs todo-zero e todo-`FF`).
+- Segundo DS4 do autor lido em 2026-11-11: MAC `eb:67:4c:9a:fd:b4` (diferente do primeiro, sem colisão). O terceiro ainda não. Se dois clones informarem o mesmo MAC, as identidades colidem (o código só rejeita MACs todo-zero e todo-`FF`).
+- Kit de correção (plano 5b) verificado em 2026-11-11 com os dois DS4 por Bluetooth: drift, alcance, gatilhos, conexão e persistência após reiniciar o núcleo. Detalhes em `docs/benchmarks/repair.md`. O analógico esquerdo do DS4 `41:42:…` não volta ao centro sozinho (desgaste); o assistente o marca como desgastado.
 
 ## DualSense (experimental)
 
