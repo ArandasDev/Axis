@@ -1,7 +1,8 @@
 import { Tokens } from "tokens.slint";
-import { AccentData, Kicker, NavItem, PadCard, PadCardData, PrimaryButton, SegmentButton, Swatch, WindowButton } from "components.slint";
+import { AccentData, Kicker, NavItem, PadCard, PadCardData, PrimaryButton, SegmentButton, SegmentGroup, Swatch, WindowButton } from "components.slint";
 import { LiveData, Overview, OverviewHeader } from "overview.slint";
-export { Tokens, PadCardData, AccentData, LiveData, OverviewHeader }
+import { PlotPoint, Repair, RepairField, RepairSummary, RepairWork } from "repair.slint";
+export { Tokens, PadCardData, AccentData, LiveData, OverviewHeader, RepairSummary, RepairWork, RepairField, PlotPoint }
 
 /// Tela sobre o conteúdo enquanto não há conexão com o núcleo.
 component ConnectionScreen inherits Rectangle {
@@ -140,7 +141,10 @@ component Sidebar inherits Rectangle {
     in property <string> selected-id;
     in property <[AccentData]> accents;
     in-out property <int> accent-index;
+    /// Tela atual: 0 Visão geral, 2 Correção (1 e 3 em breve).
+    in property <int> screen;
     callback select-pad(string);
+    callback navigate(int);
 
     width: 232px;
 
@@ -155,9 +159,17 @@ component Sidebar inherits Rectangle {
         padding-top: Tokens.space-m;
         spacing: Tokens.space-xxs;
 
-        NavItem { label: "Visão geral"; active: true; }
+        NavItem {
+            label: "Visão geral";
+            active: root.screen == 0;
+            clicked => { root.navigate(0); }
+        }
         NavItem { label: "Mapeamento"; enabled: false; }
-        NavItem { label: "Correção"; enabled: false; }
+        NavItem {
+            label: "Correção";
+            active: root.screen == 2;
+            clicked => { root.navigate(2); }
+        }
         NavItem { label: "Perfis"; enabled: false; }
 
         Rectangle { height: Tokens.space-l; }
@@ -183,23 +195,16 @@ component Sidebar inherits Rectangle {
 
         Kicker { text: "APARÊNCIA"; }
         Rectangle { height: Tokens.space-s; }
-        Rectangle {
-            height: 38px;
-            border-radius: Tokens.radius-btn + Tokens.space-xs;
-            background: Tokens.hover;
-            HorizontalLayout {
-                padding: Tokens.space-xs;
-                spacing: Tokens.space-xs;
-                SegmentButton {
-                    text: "Escuro";
-                    active: Tokens.dark;
-                    clicked => { Tokens.dark = true; }
-                }
-                SegmentButton {
-                    text: "Claro";
-                    active: !Tokens.dark;
-                    clicked => { Tokens.dark = false; }
-                }
+        SegmentGroup {
+            SegmentButton {
+                text: "Escuro";
+                active: Tokens.dark;
+                clicked => { Tokens.dark = true; }
+            }
+            SegmentButton {
+                text: "Claro";
+                active: !Tokens.dark;
+                clicked => { Tokens.dark = false; }
             }
         }
         Rectangle { height: Tokens.space-sm; }
@@ -242,8 +247,27 @@ export component App inherits Window {
     in property <bool> stage-pill;
     in property <string> stage-status;
     in property <LiveData> live;
+    /// Tela atual: 0 Visão geral, 2 Correção.
+    in property <int> screen: 0;
+    // Correção do controle selecionado.
+    in property <OverviewHeader> repair-header;
+    in property <RepairSummary> repair-summary;
+    in-out property <bool> expert: false;
+    /// 0 Drift, 1 Alcance e círculo, 2 Gatilhos, 3 Conexão.
+    in property <int> wizard: 0;
+    in property <bool> right-stick: false;
+    /// 0 início, 1 medindo, 2 resultado, 3 erro.
+    in property <int> repair-step: 0;
+    in property <float> repair-progress;
+    in property <string> repair-message;
     callback start-daemon();
     callback select-pad(string);
+    callback navigate(int);
+    callback choose-wizard(int);
+    callback choose-stick(bool);
+    callback start-capture();
+    callback reset-wizard();
+    callback repair-mode-changed();
     callback minimize();
     callback toggle-maximize();
     callback close-window();
@@ -278,9 +302,29 @@ export component App inherits Window {
                     selected-id: root.selected-id;
                     accents: root.accents;
                     accent-index <=> root.accent-index;
+                    screen: root.screen;
                     select-pad(id) => { root.select-pad(id); }
+                    navigate(i) => { root.navigate(i); }
                 }
-                Overview {
+                if root.screen == 2: Repair {
+                    horizontal-stretch: 1;
+                    has-pad: root.has-pad;
+                    header: root.repair-header;
+                    connected: root.pad-connected;
+                    summary: root.repair-summary;
+                    expert <=> root.expert;
+                    wizard: root.wizard;
+                    right-stick: root.right-stick;
+                    step: root.repair-step;
+                    progress: root.repair-progress;
+                    message: root.repair-message;
+                    choose-wizard(i) => { root.choose-wizard(i); }
+                    choose-stick(right) => { root.choose-stick(right); }
+                    begin => { root.start-capture(); }
+                    reset => { root.reset-wizard(); }
+                    mode-changed => { root.repair-mode-changed(); }
+                }
+                if root.screen != 2: Overview {
                     horizontal-stretch: 1;
                     has-pad: root.has-pad;
                     header: root.header;

@@ -5,12 +5,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use axis_core::{DeviceFamily, InputState, StickTrace, Trace, Vec2};
+use axis_core::repair::{CaptureKind, Outcome, Stick};
+use axis_core::stages::calibration::SECTORS;
+use axis_core::{
+    Corrections, DeviceFamily, InputState, StickCorrection, StickTrace, Trace, TriggerCalibration,
+    Vec2,
+};
 use axis_devices::DeviceStatus;
-use axis_protocol::{Family, PadState, SessionInfo, StickStages};
+use axis_protocol::{
+    CaptureKindDto, CaptureResultDto, CaptureState, CorrectionsDto, Family, PadState, SessionInfo,
+    StickCorrectionDto, StickStages, TriggerCalDto,
+};
+
+/// Estado da captura do kit de correção; o resultado fica até a próxima
+/// `StartCapture`/`CancelCapture`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CaptureSnapshot {
+    pub kind: CaptureKind,
+    pub progress: f32,
+    pub outcome: Option<Outcome>,
+}
 
 /// Fotografia do que o worker viu e produziu no último report publicado.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LiveSample {
     pub input: InputState,
     pub output: InputState,
@@ -21,6 +38,9 @@ pub struct LiveSample {
     /// p99 da última janela de 60 s do histograma (0 antes da primeira).
     pub latency_p99_us: u32,
     pub seq: u64,
+    pub capture: Option<CaptureSnapshot>,
+    /// p99 de |intervalo − média| entre os últimos 256 reports, em µs.
+    pub jitter_us: u32,
 }
 
 /// Canal worker -> UI: desligado por padrão, o worker não paga nada por ele.
@@ -46,7 +66,10 @@ impl LiveTap {
     }
 
     pub fn latest(&self) -> LiveSample {
-        *self.sample.lock().unwrap_or_else(|e| e.into_inner())
+        self.sample
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub(crate) fn publish(&self, s: LiveSample) {
@@ -261,6 +284,126 @@ pub(crate) fn to_stages(t: &StickTrace) -> StickStages {
     }
 }
 
+fn to_stick_dto(c: &StickCorrection) -> StickCorrectionDto {
+    StickCorrectionDto {
+        center: c.center,
+        outer_radius: c.outer_radius.to_vec(),
+        drift_radius: c.drift_radius,
+    }
+}
+
+fn to_trigger_dto(t: &TriggerCalibration) -> TriggerCalDto {
+    TriggerCalDto {
+        rest: t.rest,
+        max: t.max,
+    }
+}
+
+fn from_trigger_dto(t: &TriggerCalDto) -> TriggerCalibration {
+    TriggerCalibration {
+        rest: t.rest,
+        max: t.max,
+    }
+}
+
+/// Correções do núcleo para o protocolo.
+pub(crate) fn to_corrections_dto(c: &Corrections) -> CorrectionsDto {
+    CorrectionsDto {
+        left: to_stick_dto(&c.left),
+        right: to_stick_dto(&c.right),
+        l2: to_trigger_dto(&c.l2),
+        r2: to_trigger_dto(&c.r2),
+    }
+}
+
+fn from_stick_dto(side: &str, d: &StickCorrectionDto) -> Result<StickCorrection, String> {
+    let outer_radius: [f32; SECTORS] = d
+        .outer_radius
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("alcance do analógico {side} precisa de {SECTORS} setores"))?;
+    Ok(StickCorrection {
+        center: d.center,
+        outer_radius,
+        drift_radius: d.drift_radius,
+    })
+}
+
+/// Única conversão do protocolo para o núcleo: exige exatamente `SECTORS` setores
+/// por analógico. Os limites dos valores ficam com `Corrections::validate`.
+pub(crate) fn from_corrections_dto(d: &CorrectionsDto) -> Result<Corrections, String> {
+    Ok(Corrections {
+        left: from_stick_dto("esquerdo", &d.left)?,
+        right: from_stick_dto("direito", &d.right)?,
+        l2: from_trigger_dto(&d.l2),
+        r2: from_trigger_dto(&d.r2),
+    })
+}
+
+pub(crate) fn from_capture_kind(k: CaptureKindDto) -> CaptureKind {
+    match k {
+        CaptureKindDto::DriftLeft => CaptureKind::Drift(Stick::Left),
+        CaptureKindDto::DriftRight => CaptureKind::Drift(Stick::Right),
+        CaptureKindDto::RangeLeft => CaptureKind::Range(Stick::Left),
+        CaptureKindDto::RangeRight => CaptureKind::Range(Stick::Right),
+        CaptureKindDto::Triggers => CaptureKind::Triggers,
+    }
+}
+
+fn to_capture_kind(k: CaptureKind) -> CaptureKindDto {
+    match k {
+        CaptureKind::Drift(Stick::Left) => CaptureKindDto::DriftLeft,
+        CaptureKind::Drift(Stick::Right) => CaptureKindDto::DriftRight,
+        CaptureKind::Range(Stick::Left) => CaptureKindDto::RangeLeft,
+        CaptureKind::Range(Stick::Right) => CaptureKindDto::RangeRight,
+        CaptureKind::Triggers => CaptureKindDto::Triggers,
+    }
+}
+
+fn finite_trigger(t: &TriggerCalibration) -> TriggerCalDto {
+    TriggerCalDto {
+        rest: finite(t.rest),
+        max: finite(t.max),
+    }
+}
+
+fn to_capture_result(o: &Outcome) -> CaptureResultDto {
+    match o {
+        Outcome::Drift(r) => CaptureResultDto::Drift {
+            center: pair(r.center),
+            noise: finite(r.noise),
+            radius: finite(r.radius),
+            worn: r.worn,
+        },
+        Outcome::Range(r) => CaptureResultDto::Range {
+            outer_radius: r.outer_radius.iter().map(|&v| finite(v)).collect(),
+            circularity_pct: finite(r.circularity_pct),
+        },
+        Outcome::Triggers(r) => CaptureResultDto::Triggers {
+            l2: r.l2.as_ref().map(finite_trigger),
+            r2: r.r2.as_ref().map(finite_trigger),
+            l2_presses: r.l2_presses,
+            r2_presses: r.r2_presses,
+        },
+        Outcome::Rejected(m) => CaptureResultDto::Rejected {
+            reason: (*m).to_string(),
+        },
+        Outcome::Incomplete(m) => CaptureResultDto::Incomplete {
+            reason: (*m).to_string(),
+        },
+        Outcome::Aborted => CaptureResultDto::Aborted,
+    }
+}
+
+/// Estado da captura para o protocolo (não finitos viram 0).
+pub(crate) fn to_capture_state(s: &CaptureSnapshot) -> CaptureState {
+    CaptureState {
+        kind: to_capture_kind(s.kind),
+        progress: finite(s.progress),
+        result: s.outcome.as_ref().map(to_capture_result),
+    }
+}
+
 pub(crate) fn to_family(f: DeviceFamily) -> Family {
     match f {
         DeviceFamily::DualShock4 => Family::DualShock4,
@@ -286,6 +429,9 @@ mod tests {
             view_only: false,
             battery: None,
             charging: false,
+            transport: None,
+            disconnects: 0,
+            corrections: Default::default(),
         }
     }
 
@@ -463,6 +609,171 @@ mod tests {
         assert_eq!(to_family(DeviceFamily::DualSense), Family::DualSense);
         assert_eq!(to_family(DeviceFamily::Xbox), Family::Xbox);
         assert_eq!(to_family(DeviceFamily::DualShock4), Family::DualShock4);
+    }
+
+    fn sample_corrections() -> axis_core::Corrections {
+        let mut c = axis_core::Corrections::default();
+        c.left.center = [0.02, -0.01];
+        c.left.outer_radius[3] = 0.9;
+        c.right.drift_radius = 0.05;
+        c.right.outer_radius[15] = 1.2;
+        c.l2 = axis_core::TriggerCalibration {
+            rest: 0.04,
+            max: 0.97,
+        };
+        c.r2.max = 0.8;
+        c
+    }
+
+    #[test]
+    fn corrections_round_trip_through_the_dto() {
+        let c = sample_corrections();
+        let dto = to_corrections_dto(&c);
+        assert_eq!(dto.left.center, [0.02, -0.01]);
+        assert_eq!(dto.left.outer_radius.len(), 16);
+        assert_eq!(dto.left.outer_radius[3], 0.9);
+        assert_eq!(dto.l2.rest, 0.04);
+        assert_eq!(from_corrections_dto(&dto), Ok(c));
+    }
+
+    #[test]
+    fn dto_with_wrong_sector_count_is_rejected() {
+        let mut dto = to_corrections_dto(&sample_corrections());
+        dto.left.outer_radius.pop();
+        assert_eq!(dto.left.outer_radius.len(), 15);
+        let e = from_corrections_dto(&dto).unwrap_err();
+        assert_eq!(e, "alcance do analógico esquerdo precisa de 16 setores");
+        let mut dto = to_corrections_dto(&sample_corrections());
+        dto.right.outer_radius.push(1.0);
+        let e = from_corrections_dto(&dto).unwrap_err();
+        assert_eq!(e, "alcance do analógico direito precisa de 16 setores");
+    }
+
+    #[test]
+    fn capture_snapshot_maps_to_the_protocol() {
+        use axis_core::repair::{DriftReport, RangeReport, Stick, TriggerReport};
+        use axis_protocol::{CaptureKindDto, CaptureResultDto, TriggerCalDto};
+        let snap = |kind, outcome| CaptureSnapshot {
+            kind,
+            progress: 0.5,
+            outcome,
+        };
+        let s = to_capture_state(&snap(CaptureKind::Drift(Stick::Right), None));
+        assert_eq!(
+            (s.kind, s.progress, s.result),
+            (CaptureKindDto::DriftRight, 0.5, None)
+        );
+        let s = to_capture_state(&snap(
+            CaptureKind::Drift(Stick::Left),
+            Some(Outcome::Drift(DriftReport {
+                center: Vec2 { x: 0.1, y: -0.1 },
+                noise: 0.01,
+                radius: 0.04,
+                worn: true,
+                samples: 300,
+            })),
+        ));
+        assert_eq!(s.kind, CaptureKindDto::DriftLeft);
+        assert_eq!(
+            s.result,
+            Some(CaptureResultDto::Drift {
+                center: [0.1, -0.1],
+                noise: 0.01,
+                radius: 0.04,
+                worn: true
+            })
+        );
+        let s = to_capture_state(&snap(
+            CaptureKind::Range(Stick::Left),
+            Some(Outcome::Range(RangeReport {
+                outer_radius: [0.9; 16],
+                circularity_pct: 2.5,
+            })),
+        ));
+        assert_eq!(s.kind, CaptureKindDto::RangeLeft);
+        assert_eq!(
+            s.result,
+            Some(CaptureResultDto::Range {
+                outer_radius: vec![0.9; 16],
+                circularity_pct: 2.5
+            })
+        );
+        let s = to_capture_state(&snap(
+            CaptureKind::Triggers,
+            Some(Outcome::Triggers(TriggerReport {
+                l2: Some(axis_core::TriggerCalibration {
+                    rest: 0.05,
+                    max: 0.95,
+                }),
+                r2: None,
+                l2_presses: 3,
+                r2_presses: 1,
+            })),
+        ));
+        assert_eq!(s.kind, CaptureKindDto::Triggers);
+        assert_eq!(
+            s.result,
+            Some(CaptureResultDto::Triggers {
+                l2: Some(TriggerCalDto {
+                    rest: 0.05,
+                    max: 0.95
+                }),
+                r2: None,
+                l2_presses: 3,
+                r2_presses: 1
+            })
+        );
+        let s = to_capture_state(&snap(
+            CaptureKind::Range(Stick::Right),
+            Some(Outcome::Rejected("mexeu")),
+        ));
+        assert_eq!(s.kind, CaptureKindDto::RangeRight);
+        assert_eq!(
+            s.result,
+            Some(CaptureResultDto::Rejected {
+                reason: "mexeu".into()
+            })
+        );
+        let s = to_capture_state(&snap(
+            CaptureKind::Triggers,
+            Some(Outcome::Incomplete("faltou")),
+        ));
+        assert_eq!(
+            s.result,
+            Some(CaptureResultDto::Incomplete {
+                reason: "faltou".into()
+            })
+        );
+        let mut nan = snap(CaptureKind::Triggers, Some(Outcome::Aborted));
+        nan.progress = f32::NAN;
+        let s = to_capture_state(&nan);
+        assert_eq!(
+            (s.progress, s.result),
+            (0.0, Some(CaptureResultDto::Aborted))
+        );
+    }
+
+    #[test]
+    fn capture_kind_from_the_protocol() {
+        use axis_core::repair::Stick;
+        use axis_protocol::CaptureKindDto as K;
+        assert_eq!(
+            from_capture_kind(K::DriftLeft),
+            CaptureKind::Drift(Stick::Left)
+        );
+        assert_eq!(
+            from_capture_kind(K::DriftRight),
+            CaptureKind::Drift(Stick::Right)
+        );
+        assert_eq!(
+            from_capture_kind(K::RangeLeft),
+            CaptureKind::Range(Stick::Left)
+        );
+        assert_eq!(
+            from_capture_kind(K::RangeRight),
+            CaptureKind::Range(Stick::Right)
+        );
+        assert_eq!(from_capture_kind(K::Triggers), CaptureKind::Triggers);
     }
 
     #[test]

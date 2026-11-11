@@ -1,6 +1,6 @@
 //! Textos da interface derivados do estado (puro, sem Slint).
 
-use axis_protocol::{Family, SessionInfo, StickStages};
+use axis_protocol::{Family, SessionInfo, StickStages, Transport};
 
 /// Estado da conexão com o núcleo, como a tela o mostra.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,7 +193,7 @@ pub struct Header {
 }
 
 /// `index` é a posição do controle na lista (0 → "DISPOSITIVO 01").
-/// O protocolo não informa USB/Bluetooth; o kicker mostra a família.
+/// O kicker mostra USB/Bluetooth quando o núcleo sabe; senão, a família.
 /// Pausado, o subtítulo diz com todas as letras que o jogo não recebe nada.
 pub fn header(index: usize, s: &SessionInfo, emulation: bool, paused: bool) -> Header {
     let subtitle = if !s.connected {
@@ -205,12 +205,27 @@ pub fn header(index: usize, s: &SessionInfo, emulation: bool, paused: bool) -> H
     } else {
         "Emulando Xbox 360 via XInput"
     };
+    let link = match s.transport {
+        Some(Transport::Usb) => "USB".to_string(),
+        Some(Transport::Bluetooth) => "BLUETOOTH".to_string(),
+        None => family_label(&s.family).to_uppercase(),
+    };
     Header {
-        kicker: format!(
-            "DISPOSITIVO {:02} · {}",
-            index + 1,
-            family_label(&s.family).to_uppercase()
-        ),
+        kicker: format!("DISPOSITIVO {:02} · {link}", index + 1),
+        title: title(&s.owner),
+        subtitle: subtitle.into(),
+    }
+}
+
+/// Cabeçalho da tela Correção: as correções são do controle físico.
+pub fn repair_header(s: &SessionInfo) -> Header {
+    let subtitle = if s.connected {
+        "As correções ficam neste controle e valem em qualquer perfil"
+    } else {
+        "Reconectando… a medição volta quando o controle voltar"
+    };
+    Header {
+        kicker: format!("CORREÇÃO · {}", s.owner.trim().to_uppercase()),
         title: title(&s.owner),
         subtitle: subtitle.into(),
     }
@@ -313,6 +328,9 @@ mod tests {
             view_only: false,
             battery: Some(64),
             charging: false,
+            transport: None,
+            disconnects: 0,
+            corrections: Default::default(),
         }
     }
 
@@ -542,6 +560,42 @@ mod tests {
         let h = header(9, &gone, true, false);
         assert_eq!(h.kicker, "DISPOSITIVO 10 · XBOX");
         assert_eq!(h.subtitle, "Reconectando…");
+    }
+
+    #[test]
+    fn kicker_shows_transport_when_known() {
+        let usb = SessionInfo {
+            transport: Some(Transport::Usb),
+            ..maria()
+        };
+        assert_eq!(header(0, &usb, true, false).kicker, "DISPOSITIVO 01 · USB");
+        let bt = SessionInfo {
+            transport: Some(Transport::Bluetooth),
+            ..maria()
+        };
+        assert_eq!(
+            header(1, &bt, true, false).kicker,
+            "DISPOSITIVO 02 · BLUETOOTH"
+        );
+    }
+
+    #[test]
+    fn repair_header_texts() {
+        let h = repair_header(&maria());
+        assert_eq!(h.kicker, "CORREÇÃO · MARIA");
+        assert_eq!(h.title, "Controle de Maria");
+        assert_eq!(
+            h.subtitle,
+            "As correções ficam neste controle e valem em qualquer perfil"
+        );
+        let gone = SessionInfo {
+            connected: false,
+            ..maria()
+        };
+        assert_eq!(
+            repair_header(&gone).subtitle,
+            "Reconectando… a medição volta quando o controle voltar"
+        );
     }
 
     #[test]

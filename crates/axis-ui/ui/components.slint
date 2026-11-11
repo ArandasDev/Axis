@@ -17,10 +17,44 @@ export struct AccentData {
 
 export component PrimaryButton inherits Rectangle {
     in property <string> text;
+    /// Desabilitado: apagado e sem resposta.
+    in property <bool> enabled: true;
     callback clicked();
 
     border-radius: Tokens.radius-btn;
-    background: touch.pressed ? Tokens.accent.darker(0.15) : touch.has-hover ? Tokens.accent.brighter(0.08) : Tokens.accent;
+    background: !enabled ? Tokens.hover : touch.pressed ? Tokens.accent.darker(0.15) : touch.has-hover ? Tokens.accent.brighter(0.08) : Tokens.accent;
+    min-width: label.preferred-width + 2 * Tokens.space-l;
+    height: label.preferred-height + Tokens.space-m;
+    animate background { duration: Tokens.dur-fast; }
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+
+    label := Text {
+        text: root.text;
+        color: root.enabled ? Tokens.bg : Tokens.muted;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// Botão secundário: contorno, sem preenchimento.
+export component SecondaryButton inherits Rectangle {
+    in property <string> text;
+    callback clicked();
+
+    border-radius: Tokens.radius-btn;
+    border-width: 1px;
+    border-color: Tokens.divider;
+    background: touch.pressed ? Tokens.divider : touch.has-hover ? Tokens.hover : transparent;
     min-width: label.preferred-width + 2 * Tokens.space-l;
     height: label.preferred-height + Tokens.space-m;
     animate background { duration: Tokens.dur-fast; }
@@ -30,7 +64,7 @@ export component PrimaryButton inherits Rectangle {
 
     label := Text {
         text: root.text;
-        color: Tokens.bg;
+        color: Tokens.text;
         font-weight: 600;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -39,6 +73,84 @@ export component PrimaryButton inherits Rectangle {
     touch := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
+    }
+}
+
+/// Título de painel em Barlow Condensed, caixa alta.
+export component PanelTitle inherits Text {
+    font-family: Tokens.font-heading;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    color: Tokens.text;
+}
+
+/// Painel com a borda por cima (o renderizador por software apaga um ponto da
+/// borda de um painel arredondado com `clip`).
+export component Panel inherits Rectangle {
+    border-radius: Tokens.radius-panel;
+    background: Tokens.surface;
+
+    @children
+
+    Rectangle {
+        border-radius: Tokens.radius-panel;
+        border-width: 1px;
+        border-color: Tokens.divider;
+    }
+}
+
+/// Grade de 24 px num painel inteiro, refeita a cada tamanho; as linhas
+/// horizontais partem do divisor do cabeçalho, que tem fundo sólido por cima.
+/// O `clip` do renderizador por software recorta só o retângulo, não os
+/// cantos arredondados; por isso cada linha perto de um canto é encurtada
+/// pela própria conta do arco e termina dentro da borda de 1 px do painel.
+export component GridBackdrop inherits Rectangle {
+    in property <length> header-height;
+    /// Raio do canto, em px.
+    property <float> big-r: Tokens.radius-panel / 1px;
+    /// Raio da área de dentro da borda de 1 px.
+    property <float> inner-r: root.big-r - 1;
+    property <float> w: root.width / 1px;
+    property <float> h: root.height / 1px;
+
+    width: 100%;
+    height: 100%;
+    clip: true;
+    for i in ceil(self.width / Tokens.space-l): Rectangle {
+        /// Centro da linha e o quanto ela entra na faixa de um canto.
+        property <float> c: (i + 1) * Tokens.space-l / 1px + 0.5;
+        property <float> d: min(root.inner-r, max(0, max(root.big-r - self.c, self.c - (root.w - root.big-r))));
+        property <float> inset: root.big-r - sqrt(max(0, root.inner-r * root.inner-r - self.d * self.d));
+        visible: self.c > 1 && self.c < root.w - 1 && self.d < root.inner-r;
+        x: (i + 1) * Tokens.space-l;
+        y: self.inset * 1px;
+        width: 1px;
+        height: max(0px, root.height - 2 * self.inset * 1px);
+        background: Tokens.grid;
+    }
+    for j in ceil(max(0, self.height - root.header-height) / Tokens.space-l): Rectangle {
+        property <float> c: (root.header-height + (j + 1) * Tokens.space-l) / 1px + 0.5;
+        property <float> d: min(root.inner-r, max(0, max(root.big-r - self.c, self.c - (root.h - root.big-r))));
+        property <float> inset: root.big-r - sqrt(max(0, root.inner-r * root.inner-r - self.d * self.d));
+        visible: self.c > 1 && self.c < root.h - 1 && self.d < root.inner-r;
+        x: self.inset * 1px;
+        y: root.header-height + (j + 1) * Tokens.space-l;
+        width: max(0px, root.width - 2 * self.inset * 1px);
+        height: 1px;
+        background: Tokens.grid;
+    }
+}
+
+/// Moldura de um seletor de opções (`SegmentButton` dentro).
+export component SegmentGroup inherits Rectangle {
+    height: 38px;
+    border-radius: Tokens.radius-btn + Tokens.space-xs;
+    background: Tokens.hover;
+    HorizontalLayout {
+        padding: Tokens.space-xs;
+        spacing: Tokens.space-xs;
+        @children
     }
 }
 
