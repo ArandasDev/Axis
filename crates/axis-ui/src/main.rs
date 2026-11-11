@@ -1103,7 +1103,7 @@ fn demo_corrections() -> CorrectionsDto {
 /// apertado só 2 vezes).
 fn demo_capture_state(kind: CaptureKindDto, secs: f32) -> CaptureState {
     let duration = match kind {
-        CaptureKindDto::DriftLeft | CaptureKindDto::DriftRight => 3.0,
+        CaptureKindDto::DriftLeft | CaptureKindDto::DriftRight => 4.0,
         CaptureKindDto::RangeLeft | CaptureKindDto::RangeRight => 6.0,
         CaptureKindDto::Triggers => 5.0,
     };
@@ -1312,7 +1312,7 @@ mod tests {
         use axis_protocol::{CaptureKindDto, CaptureResultDto};
         use repair_view::{WizardStep, step_for};
 
-        let early = demo_capture_state(CaptureKindDto::DriftLeft, 1.5);
+        let early = demo_capture_state(CaptureKindDto::DriftLeft, 2.0);
         assert_eq!(early.kind, CaptureKindDto::DriftLeft);
         assert!((early.progress - 0.5).abs() < 1e-6);
         assert_eq!(step_for(Some(&early), true), WizardStep::Measuring);

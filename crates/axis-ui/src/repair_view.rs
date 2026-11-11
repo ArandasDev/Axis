@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn capture_messages_are_exact() {
-        let moved = "O analógico mexeu durante a medição. Solte e tente de novo.";
+        let moved = "O analógico se moveu durante a medição. Se você não encostou nele, ele não está voltando ao centro sozinho — sinal de desgaste. Limpar ou trocar o módulo resolve de vez.";
         assert_eq!(
             capture_message(&CaptureResultDto::Rejected {
                 reason: moved.into()

@@ -11,7 +11,11 @@ const DRIFT_CAPACITY: usize = 4096;
 const RANGE_CAPACITY: usize = 0;
 const TRIGGER_CAPACITY: usize = 16384;
 
-const DRIFT_SECS: f32 = 3.0;
+/// Descartado no início: um analógico gasto leva um instante para voltar ao centro.
+const DRIFT_SETTLE_SECS: f32 = 1.0;
+/// Janela medida depois do assentamento.
+const DRIFT_MEASURE_SECS: f32 = 3.0;
+const DRIFT_SECS: f32 = DRIFT_SETTLE_SECS + DRIFT_MEASURE_SECS;
 const TIMEOUT_SECS: f32 = 30.0;
 const RANGE_TURNS: f32 = 3.0;
 const RANGE_MIN_MAGNITUDE: f32 = 0.5;
@@ -27,7 +31,7 @@ const REST_BAND: f32 = 0.1;
 const MIN_TRIGGER_SPAN: f32 = 0.3;
 const MIN_TRIGGER_PEAK: f32 = 0.6;
 
-const MSG_DRIFT_MOVED: &str = "O analógico mexeu durante a medição. Solte e tente de novo.";
+const MSG_DRIFT_MOVED: &str = "O analógico se moveu durante a medição. Se você não encostou nele, ele não está voltando ao centro sozinho — sinal de desgaste. Limpar ou trocar o módulo resolve de vez.";
 const MSG_NO_SAMPLES: &str = "Nenhuma leitura do controle durante a medição.";
 const MSG_RANGE: &str = "Faltou girar até a borda em todas as direções.";
 const MSG_TRIGGERS: &str = "Aperte cada gatilho até o fim e solte, 3 vezes.";
@@ -200,7 +204,9 @@ impl Capture {
                     self.r2.push(sample.y);
                 }
             }
-            if self.samples.len() < self.capacity {
+            let settling =
+                matches!(self.kind, CaptureKind::Drift(_)) && self.elapsed < DRIFT_SETTLE_SECS;
+            if !settling && self.samples.len() < self.capacity {
                 self.samples.push(sample);
             }
         }
@@ -462,7 +468,7 @@ mod tests {
     fn drift_capture(cx: f32, cy: f32, noise: f32, seed: u32) -> Capture {
         let mut c = Capture::new(CaptureKind::Drift(Stick::Left), Vec2::default());
         let mut rng = Lcg(seed);
-        for i in 0..=750 {
+        for i in 0..=1000 {
             let s = left(cx + rng.next() * noise, cy + rng.next() * noise);
             c.push(&s, i as f32 / HZ);
         }
@@ -481,16 +487,18 @@ mod tests {
         assert!((r.center.y + 0.03).abs() <= 0.005, "{r:?}");
         assert!((0.03..=0.06).contains(&r.radius), "{r:?}");
         assert!(!r.worn);
-        assert_eq!(r.samples, 751);
+        assert_eq!(r.samples, 751, "só 1,0 s a 4,0 s conta");
     }
 
     #[test]
-    fn drift_is_not_done_before_three_seconds() {
+    fn drift_is_not_done_before_four_seconds() {
         let mut c = Capture::new(CaptureKind::Drift(Stick::Left), Vec2::default());
         c.push(&left(0.0, 0.0), 0.0);
-        c.push(&left(0.0, 0.0), 1.5);
+        c.push(&left(0.0, 0.0), 3.5);
         assert!(!c.is_done());
-        assert!((c.progress() - 0.5).abs() < 1e-6);
+        assert!((c.progress() - 0.875).abs() < 1e-6);
+        c.push(&left(0.0, 0.0), 4.0);
+        assert!(c.is_done());
     }
 
     #[test]
@@ -505,20 +513,49 @@ mod tests {
     #[test]
     fn drift_rejects_moving_stick() {
         let mut c = Capture::new(CaptureKind::Drift(Stick::Left), Vec2::default());
-        for i in 0..=750 {
+        for i in 0..=1000 {
             let x = if i % 2 == 0 { 0.6 } else { 0.0 };
             c.push(&left(x, 0.0), i as f32 / HZ);
         }
         assert_eq!(
             c.finish(),
-            Outcome::Rejected("O analógico mexeu durante a medição. Solte e tente de novo.")
+            Outcome::Rejected(
+                "O analógico se moveu durante a medição. Se você não encostou nele, ele não está voltando ao centro sozinho — sinal de desgaste. Limpar ou trocar o módulo resolve de vez."
+            )
+        );
+    }
+
+    #[test]
+    fn drift_ignores_settling_creep_in_first_second() {
+        let mut c = Capture::new(CaptureKind::Drift(Stick::Left), Vec2::default());
+        let mut rng = Lcg(5);
+        for i in 0..=1000 {
+            let t = i as f32 / HZ;
+            let (x, y) = if t < 0.8 {
+                (0.0, -0.38 + (0.05 + 0.38) * (t / 0.8))
+            } else {
+                (0.0, 0.05)
+            };
+            c.push(&left(x + rng.next() * 0.01, y + rng.next() * 0.01), t);
+            if i == 875 {
+                assert!(!c.is_done());
+                assert!(c.progress() < 1.0);
+            }
+        }
+        assert!(c.is_done());
+        let Outcome::Drift(r) = c.finish() else {
+            panic!("esperava Drift, não Rejected");
+        };
+        assert!(
+            r.center.x.abs() <= 0.01 && (r.center.y - 0.05).abs() <= 0.01,
+            "{r:?}"
         );
     }
 
     #[test]
     fn drift_uses_the_requested_stick() {
         let mut c = Capture::new(CaptureKind::Drift(Stick::Right), Vec2::default());
-        for i in 0..=750 {
+        for i in 0..=1000 {
             let s = InputState {
                 left: Vec2 { x: 0.9, y: 0.0 },
                 right: Vec2 { x: 0.02, y: 0.01 },
@@ -825,7 +862,7 @@ mod tests {
     fn push_never_grows_beyond_capacity() {
         let mut c = Capture::new(CaptureKind::Drift(Stick::Left), Vec2::default());
         for i in 0..50_000 {
-            c.push(&left(0.01, 0.0), i as f32 * 1e-5);
+            c.push(&left(0.01, 0.0), i as f32 * 1e-4);
         }
         assert!(matches!(c.finish(), Outcome::Drift(r) if r.samples == 4096));
     }
@@ -835,7 +872,7 @@ mod tests {
         let clean = drift_capture(0.04, -0.03, 0.01, 7).finish();
         let mut c = Capture::new(CaptureKind::Drift(Stick::Left), Vec2::default());
         let mut rng = Lcg(7);
-        for i in 0..=750 {
+        for i in 0..=1000 {
             let s = left(0.04 + rng.next() * 0.01, -0.03 + rng.next() * 0.01);
             c.push(&s, i as f32 / HZ);
             if i == 300 {

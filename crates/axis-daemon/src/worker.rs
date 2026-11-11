@@ -1116,8 +1116,8 @@ mod tests {
         h.tx.send(WorkerCommand::StartCapture(drift_left()))
             .unwrap();
         wait_until(|| snapshot(&h).is_some());
-        // 776 reports a cada 4 ms = 3,1 s de tempo simulado.
-        push_reports(&h, 776, 0.04);
+        // 1026 reports a cada 4 ms = 4,1 s de tempo simulado (1 s de assentamento + 3 s).
+        push_reports(&h, 1026, 0.04);
         wait_until(|| snapshot(&h).is_some_and(|s| s.outcome.is_some()));
         let s = h.tap.latest();
         assert_eq!(s.output.left.x, 0.0, "a deadzone padrão zera 0,04 na saída");
@@ -1149,10 +1149,10 @@ mod tests {
         // Sem reports: o início da captura já sai na amostra.
         wait_until(|| snapshot(&h).is_some());
         assert_eq!(snapshot(&h).unwrap().progress, 0.0);
-        push_reports(&h, 376, 0.0); // 1,5 s
+        push_reports(&h, 501, 0.0); // 2,0 s de 4,0 s
         // A amostra pode sair um pouco depois do último report (limite de 17 ms).
         wait_until(|| {
-            h.tap.latest().reports == 376 && snapshot(&h).is_some_and(|s| s.progress >= 0.49)
+            h.tap.latest().reports == 501 && snapshot(&h).is_some_and(|s| s.progress >= 0.49)
         });
         let s = snapshot(&h).unwrap();
         assert!((s.progress - 0.5).abs() < 0.01, "{s:?}");
@@ -1207,7 +1207,7 @@ mod tests {
         h.tx.send(WorkerCommand::StartCapture(drift_left()))
             .unwrap();
         wait_until(|| snapshot(&h).is_some());
-        push_reports(&h, 776, 0.04);
+        push_reports(&h, 1026, 0.04);
         wait_until(|| snapshot(&h).is_some_and(|s| s.outcome.is_some()));
         wait_until(|| *h.links.lock().unwrap() == vec![false]);
         assert!(matches!(
@@ -1230,9 +1230,9 @@ mod tests {
         h.tx.send(WorkerCommand::StartCapture(Box::new(range)))
             .unwrap();
         wait_until(|| snapshot(&h).is_some_and(|s| s.kind == CaptureKind::Range(Stick::Left)));
-        // 3,1 s parado: o drift teria terminado; o alcance segue sem resultado.
-        push_reports(&h, 776, 0.04);
-        wait_until(|| h.tap.latest().reports == 826);
+        // 4,1 s parado: o drift teria terminado; o alcance segue sem resultado.
+        push_reports(&h, 1026, 0.04);
+        wait_until(|| h.tap.latest().reports == 1076);
         let s = snapshot(&h).unwrap();
         assert_eq!(s.kind, CaptureKind::Range(Stick::Left));
         assert_eq!((s.progress, s.outcome), (0.0, None));
@@ -1247,7 +1247,7 @@ mod tests {
         h.tx.send(WorkerCommand::StartCapture(drift_left()))
             .unwrap();
         wait_until(|| snapshot(&h).is_some());
-        push_reports(&h, 776, 0.04);
+        push_reports(&h, 1026, 0.04);
         wait_until(|| snapshot(&h).is_some_and(|s| s.outcome.is_some()));
         let Some(Outcome::Drift(r)) = snapshot(&h).and_then(|s| s.outcome) else {
             panic!("esperava Drift");
@@ -1271,8 +1271,8 @@ mod tests {
         // Sem reports novos: o cancelamento sai na leitura ociosa seguinte.
         wait_until(|| snapshot(&h).is_none());
         // A captura foi solta: 3,1 s de reports depois, nada de resultado.
-        push_reports(&h, 776, 0.04);
-        wait_until(|| h.tap.latest().reports == 826);
+        push_reports(&h, 1026, 0.04);
+        wait_until(|| h.tap.latest().reports == 1076);
         assert_eq!(snapshot(&h), None);
         h.finish();
     }
